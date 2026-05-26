@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ferryman"
+version = "0.1.0"
+description = "A security-focused scanner for OFX (Open Financial Exchange) files, built for the bug-bounty fintech surface."
+readme = "README.md"
+requires-python = ">=3.13"
+license = { text = "MIT" }
+authors = [{ name = "Bugsy Hewitt" }]
+keywords = ["ofx", "security", "scanner", "fintech", "bug-bounty", "xxe", "pii"]
+dependencies = [
+    "ofxtools>=0.9.5",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[project.urls]
+Homepage = "https://github.com/bugsyhewitt/ferryman"
+Repository = "https://github.com/bugsyhewitt/ferryman"
+
+[project.scripts]
+ferryman = "ferryman.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
