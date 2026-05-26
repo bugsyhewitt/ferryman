@@ -20,7 +20,8 @@ from pathlib import Path
 from typing import Sequence
 
 from ferryman import __version__
-from ferryman.findings import SEVERITIES
+from ferryman.findings import SEVERITIES, Finding
+from ferryman.reporting import to_h1md
 from ferryman.scanner import CHECK_CHOICES, scan_file
 
 
@@ -46,7 +47,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--format",
-        choices=("json", "text"),
+        choices=("json", "text", "h1md"),
         default="json",
         dest="output_format",
         help="output format (default: json)",
@@ -98,6 +99,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.output_format == "json":
         print(json.dumps(result, indent=2))
+    elif args.output_format == "h1md":
+        findings = [Finding(**f) for f in result["findings"]]
+        print(to_h1md(findings), end="")
     else:
         print(_render_text(result))
 
