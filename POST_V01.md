@@ -7,7 +7,14 @@ Items are ranked by: security impact for bug-bounty reporters × detection gap �
 
 ---
 
-## Rank 1 — ABA Routing Number Checksum Validation (HIGH signal, low effort)
+## Rank 1 — ABA Routing Number Checksum Validation (HIGH signal, low effort) — ✅ IMPLEMENTED (2026-05-26, Phase 2 Rotation 2)
+
+**Status:** Shipped. `_aba_checksum_valid()` added to `src/ferryman/checks/pii.py`; the
+`routing_number` (high) finding is now gated behind the ABA 3-7-1 weighted checksum. Nine-digit
+runs that fail the checksum are downgraded to `probable_routing_number` at `info` severity instead
+of crying wolf. Unit tests cover real ABA numbers, invalid 9-digit collisions (sequential, repeated,
+off-by-one, phone-shaped), malformed input, and the no-double-count guarantee against the
+account-number path. No new dependencies.
 
 **What:** The current `pii` check flags any 9-digit run as a routing number. ABA routing numbers
 have a public weighted checksum (3-7-1 weighting). Validating the checksum before emitting a

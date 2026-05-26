@@ -6,10 +6,16 @@ is free-text memos and names echoing SSNs, full account numbers, and routing
 numbers that should never travel in a statement export.
 
 Detection classes:
-- ``ssn``            : SSN-shaped strings (NNN-NN-NNNN) in free text.
-- ``account_number`` : a long account-number-shaped digit run leaking into a
-                       transaction name/memo.
-- ``routing_number`` : a 9-digit ABA routing number leaking into free text.
+- ``ssn``                     : SSN-shaped strings (NNN-NN-NNNN) in free text.
+- ``account_number``          : a long account-number-shaped digit run leaking
+                                into a transaction name/memo.
+- ``routing_number``          : a 9-digit run that passes the ABA weighted
+                                checksum -- a near-certain routing-number leak.
+- ``probable_routing_number`` : a 9-digit run that fails the ABA checksum. Most
+                                likely a coincidental digit run (zip+4, EIN-like
+                                value, order/phone number). Emitted at ``info``
+                                severity to preserve visibility without raising a
+                                high-severity false positive.
 
 All evidence is redacted before it leaves the scanner -- ferryman reports the
 presence of a leak, not the secret itself.
@@ -29,6 +35,30 @@ _SSN_RE = re.compile(r"\b\d{3}[-\s]\d{2}[-\s]\d{4}\b")
 _ROUTING_RE = re.compile(r"\b\d{9}\b")
 # Account-number-shaped run: 8+ consecutive digits in free text.
 _ACCT_RE = re.compile(r"\b\d{8,}\b")
+
+# ABA weighted-checksum coefficients, applied positionally to the 9 digits.
+_ABA_WEIGHTS = (3, 7, 1, 3, 7, 1, 3, 7, 1)
+
+
+def _aba_checksum_valid(digits: str) -> bool:
+    """Return ``True`` if a 9-digit string passes the ABA routing checksum.
+
+    The ABA (American Bankers Association) routing number checksum is a public,
+    dependency-free weighted sum over the nine digits using the repeating
+    ``3-7-1`` weighting::
+
+        (3*d1 + 7*d2 + d3 + 3*d4 + 7*d5 + d6 + 3*d7 + 7*d8 + d9) mod 10 == 0
+
+    A 9-digit run that passes this is a near-certain real routing number; one
+    that fails is almost always a coincidental digit run (zip+4, phone number,
+    order number, EIN-shaped value). Non-numeric or wrong-length input returns
+    ``False`` -- the caller has already matched exactly nine digits, but we stay
+    defensive so the helper is safe to reuse.
+    """
+    if len(digits) != 9 or not digits.isdigit():
+        return False
+    total = sum(w * int(d) for w, d in zip(_ABA_WEIGHTS, digits))
+    return total % 10 == 0
 
 
 def _redact_ssn(text: str) -> str:
@@ -67,21 +97,43 @@ def _scan_text(
         )
 
     # Routing numbers (exactly 9 digits) -- check before generic account runs.
+    # Gate the high-severity finding behind the ABA weighted checksum: a run
+    # that passes is a near-certain routing-number leak; one that fails is most
+    # likely a coincidental 9-digit value (zip+4, phone, order/EIN-shaped) and
+    # is downgraded to an informational ``probable_routing_number`` so we keep
+    # visibility without flooding reports with high-severity false positives.
     for m in _ROUTING_RE.finditer(text):
-        key = ("routing_number", m.group(0))
+        digits = m.group(0)
+        # Use a single dedupe namespace so the same 9-digit run is never both
+        # classified as a routing/probable finding and an account-number run.
+        key = ("routing_number", digits)
         if key in seen:
             continue
         seen.add(key)
-        findings.append(
-            Finding(
-                check="pii",
-                type="routing_number",
-                severity="high",
-                message="9-digit ABA routing number leaking into free text.",
-                location=location,
-                evidence=_redact_digits(m.group(0)),
+        if _aba_checksum_valid(digits):
+            findings.append(
+                Finding(
+                    check="pii",
+                    type="routing_number",
+                    severity="high",
+                    message="9-digit ABA routing number (valid checksum) "
+                    "leaking into free text.",
+                    location=location,
+                    evidence=_redact_digits(digits),
+                )
             )
-        )
+        else:
+            findings.append(
+                Finding(
+                    check="pii",
+                    type="probable_routing_number",
+                    severity="info",
+                    message="9-digit value shaped like a routing number but "
+                    "failing the ABA checksum (likely a coincidental run).",
+                    location=location,
+                    evidence=_redact_digits(digits),
+                )
+            )
 
     # Account-number-shaped runs (8+ digits), excluding ones already counted
     # as a 9-digit routing number.
