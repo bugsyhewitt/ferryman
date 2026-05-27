@@ -33,6 +33,16 @@ _ENTITY_RE = re.compile(rb"<!ENTITY", re.IGNORECASE)
 _SYSTEM_ENTITY_RE = re.compile(
     rb"<!ENTITY\s+\S+\s+SYSTEM\s+[\"'][^\"']+[\"']", re.IGNORECASE | re.DOTALL
 )
+# Capture the declared entity name and its quoted body. Used to detect the
+# Billion-Laughs nested-reference pattern (one entity's body referencing
+# another declared entity, e.g. <!ENTITY b "&a;&a;">).
+_ENTITY_DECL_RE = re.compile(
+    rb"<!ENTITY\s+(\S+)\s+[\"']([^\"']*)[\"']", re.IGNORECASE | re.DOTALL
+)
+# Minimum number of entity declarations before we treat a nested chain as a
+# Billion-Laughs DoS. Legitimate OFX defines zero custom entities; three with
+# cross-references is unambiguously hostile.
+_ENTITY_EXPANSION_THRESHOLD = 3
 _XML_DECL_RE = re.compile(rb"<\?xml\b", re.IGNORECASE)
 _SGML_MARKER_RE = re.compile(rb"OFXHEADER\s*:|DATA\s*:\s*OFXSGML", re.IGNORECASE)
 # Tag value = text between a closing '>' and the next opening '<'.
@@ -42,6 +52,34 @@ _FIELD_VALUE_RE = re.compile(rb">([^<]+)<")
 def _line_of(raw: bytes, index: int) -> int:
     """1-based line number of a byte offset, for finding locations."""
     return raw.count(b"\n", 0, index) + 1
+
+
+def _count_entities(raw: bytes) -> int:
+    """Count ``<!ENTITY`` declarations in the raw bytes.
+
+    Pure regex over bytes -- never parses the document. Case-insensitive so
+    ``<!entity`` is counted the same as ``<!ENTITY``.
+    """
+    return len(_ENTITY_RE.findall(raw))
+
+
+def _has_nested_entity_reference(raw: bytes) -> bool:
+    """True if any declared entity's body references another declared entity.
+
+    This is the Billion-Laughs signature: ``<!ENTITY b "&a;...">`` where ``a``
+    is itself a declared entity. A flat set of entities that never reference
+    one another does not expand recursively and is not flagged here.
+    """
+    decls: dict[bytes, bytes] = {}
+    for m in _ENTITY_DECL_RE.finditer(raw):
+        name, body = m.group(1), m.group(2)
+        decls[name.lower()] = body
+
+    for body in decls.values():
+        for ref in re.finditer(rb"&([^;&\s]+);", body):
+            if ref.group(1).lower() in decls:
+                return True
+    return False
 
 
 def check_malformed(raw: bytes) -> list[Finding]:
@@ -92,6 +130,31 @@ def check_malformed(raw: bytes) -> list[Finding]:
                     "not define a DTD; presence suggests a crafted file."
                 ),
                 location=f"line {_line_of(raw, dt.start())}" if dt else None,
+            )
+        )
+
+    # --- Entity-expansion (Billion Laughs) DoS ---
+    # A separately-reportable vector from XXE-for-file-read: >=3 entity
+    # declarations where at least one entity body references another declared
+    # entity (the recursive chain that explodes on expansion).
+    if (
+        _count_entities(raw) >= _ENTITY_EXPANSION_THRESHOLD
+        and _has_nested_entity_reference(raw)
+    ):
+        ent = _ENTITY_RE.search(raw)
+        findings.append(
+            Finding(
+                check="malformed",
+                type="entity_expansion",
+                severity="critical",
+                message=(
+                    "Multiple entity declarations with nested cross-references "
+                    "found -- a recursive entity-expansion (Billion Laughs) DoS "
+                    "vector. Expanding the chain exhausts parser memory. OFX has "
+                    "no legitimate use for custom entities."
+                ),
+                location=f"line {_line_of(raw, ent.start())}" if ent else None,
+                metadata={"entity_count": _count_entities(raw)},
             )
         )
 

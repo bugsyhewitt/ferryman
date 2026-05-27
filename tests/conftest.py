@@ -27,3 +27,8 @@ def clean_file() -> Path:
 @pytest.fixture
 def anomaly_file() -> Path:
     return FIXTURES / "anomaly.ofx"
+
+
+@pytest.fixture
+def entity_bomb_file() -> Path:
+    return FIXTURES / "entity-bomb.ofx"

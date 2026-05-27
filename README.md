@@ -8,7 +8,8 @@ parsers for it already exist. ferryman is **not** another parser. It is a
 scanner that treats an OFX file as an attack surface and asks three questions:
 
 - **Is this file trying to attack the parser that reads it?** XXE entity
-  declarations, SGML/XML format confusion, encoding tricks, oversized fields.
+  declarations, recursive entity-expansion (Billion Laughs) DoS chains,
+  SGML/XML format confusion, encoding tricks, oversized fields.
 - **Is this file leaking PII it should not?** SSNs, full account numbers, and
   routing numbers smuggled into free-text transaction names and memos.
 - **Is this file anomalous?** Out-of-range posting dates and other signs of
@@ -42,9 +43,9 @@ ferryman [--check {malformed,pii,anomaly,all}] [--format {json,text}] FILE
 ```
 
 - `--check` &mdash; which scan to run. Default `all`.
-  - `malformed` &mdash; parser-confusion attacks (XXE, SGML/XML confusion,
-    encoding tricks, oversized fields). Operates on raw bytes; never parses a
-    hostile file.
+  - `malformed` &mdash; parser-confusion attacks (XXE, entity-expansion
+    "Billion Laughs" DoS, SGML/XML confusion, encoding tricks, oversized
+    fields). Operates on raw bytes; never parses a hostile file.
   - `pii` &mdash; PII leaking into transaction free-text (SSN, account number,
     routing number). Evidence is always redacted before it leaves the tool.
   - `anomaly` &mdash; structurally valid but suspicious transactions
@@ -77,6 +78,42 @@ $ ferryman --check malformed --format json suspicious.ofx
   ]
 }
 ```
+
+### Entity-expansion (Billion Laughs) detection
+
+XXE-for-file-read and entity-expansion DoS are **separate** vulnerabilities and
+ferryman reports them separately. While the `xxe` finding flags external
+`SYSTEM` entities and DOCTYPE presence, the `entity_expansion` finding targets
+the recursive [Billion Laughs](https://en.wikipedia.org/wiki/Billion_laughs_attack)
+DoS chain &mdash; nested `<!ENTITY>` declarations that explode in memory when a
+parser expands them.
+
+A file is flagged `entity_expansion` (severity `critical`) when **both** hold:
+
+1. It declares **3 or more** custom entities (`<!ENTITY ...>`), and
+2. At least one entity body references **another declared entity** (the nested
+   chain, e.g. `<!ENTITY c "&b;&b;">` where `b` is itself an entity).
+
+Legitimate OFX defines zero custom entities, so flat or single declarations
+never trip this check &mdash; only an actual recursive chain does. Detection is
+pure regex over raw bytes; ferryman never hands the hostile file to an XML
+parser:
+
+```bash
+$ ferryman --check malformed --format json entity-bomb.ofx
+...
+    {
+      "check": "malformed",
+      "type": "entity_expansion",
+      "severity": "critical",
+      "message": "Multiple entity declarations with nested cross-references found -- a recursive entity-expansion (Billion Laughs) DoS vector ...",
+      "location": "line 4",
+      "metadata": { "entity_count": 3 }
+    }
+```
+
+**Remediation:** disable DTD/entity processing in the OFX/XML parser
+(`resolve_entities=False`, and reject documents containing a DOCTYPE).
 
 ## From finding to HackerOne report
 
