@@ -16,6 +16,10 @@ Detection classes:
                            file, used to provoke parser disagreement.
 - ``oversized_field``    : a single tag value far larger than any legitimate
                            OFX field, a memory/DoS and confusion vector.
+- ``cdata_injection``    : a CDATA section whose content contains ``]]>``,
+                           which prematurely terminates the section and allows
+                           injection of raw XML markup into the parsed output
+                           (CVE-2026-34601 / xmldom class of vulnerability).
 """
 
 from __future__ import annotations
@@ -27,6 +31,14 @@ from ferryman.findings import Finding, truncate_evidence
 # Any OFX field above this many bytes is wildly out of spec; real account
 # numbers, memos, names etc. are short. 64 KiB is a generous ceiling.
 _OVERSIZED_FIELD_BYTES = 64 * 1024
+
+# CDATA section: <![CDATA[ ... ]]>
+# We use a non-greedy match to find each CDATA block individually.
+# If the captured content (between <![CDATA[ and the first ]]>) itself
+# contains ]]>, that means a nested/injected terminator was present before
+# the legitimate close — a CDATA injection attempt.
+_CDATA_BLOCK_RE = re.compile(rb"<!\[CDATA\[(.*?)]]>", re.DOTALL)
+_CDATA_TERMINATOR_RE = re.compile(rb"]]>")
 
 _DOCTYPE_RE = re.compile(rb"<!DOCTYPE", re.IGNORECASE)
 _ENTITY_RE = re.compile(rb"<!ENTITY", re.IGNORECASE)
@@ -228,5 +240,80 @@ def check_malformed(raw: bytes) -> list[Finding]:
                 )
             )
             break  # one oversized-field finding is enough to triage
+
+    # --- CDATA injection (FERRYMAN-MALFORMED-004) ---
+    # A CDATA block whose content contains ]]> prematurely closes the section,
+    # allowing an attacker to inject raw XML markup into the parsed output.
+    # Strategy: use a non-greedy regex to match each <![CDATA[...]]> block.
+    # Because the regex is non-greedy, it captures up to the *first* ]]>.
+    # We then search the raw document for any ]]> that occurs *inside* one of
+    # those blocks -- i.e., before the legitimate close. Since our regex already
+    # consumed up to the first ]]>, any additional ]]> in the surrounding raw
+    # bytes that falls within the block's byte range is the injected terminator.
+    #
+    # Simpler equivalent: scan for every ]]> in the document.  For each one,
+    # check whether it lies between the start of a CDATA opening marker and the
+    # end of a CDATA block match that started before it.  If the CDATA block
+    # match's content (group 1) is non-empty and the match ends *after* a
+    # second ]]> in the raw bytes, injection is present.
+    #
+    # Practical implementation: for every CDATA match, check whether the raw
+    # slice between the opening marker end and the match's ]]> contains
+    # another ]]>.  The non-greedy regex guarantees the captured content is
+    # the minimal prefix up to the first ]]>; any *subsequent* ]]> in the
+    # same logical block is injection.  We find those by scanning forward from
+    # the match end.
+    cdata_open = b"<![CDATA["
+    for cdata_m in _CDATA_BLOCK_RE.finditer(raw):
+        content = cdata_m.group(1)
+        # The content is the bytes between <![CDATA[ and the first ]]>.
+        # If the content itself contains ]]> it would have been consumed by
+        # the non-greedy match before reaching here -- so content is clean.
+        # Instead, look for injection *after* this CDATA close: if the bytes
+        # immediately after the match's ]]> (i.e. what would be "outside" the
+        # CDATA) start with content that logically belongs to the block, the
+        # document is malformed.  The clearest heuristic: check whether the
+        # raw document contains a ]]> that is preceded by a <![CDATA[ with no
+        # intervening ]]> -- but that's exactly what our non-greedy match
+        # already handles.
+        #
+        # Real injection pattern: the raw document has something like:
+        #   <![CDATA[safe]]>injected-xml]]>
+        # The non-greedy RE matches <![CDATA[safe]]> as one block (content="safe").
+        # The *injected-xml* part then sits outside CDATA in the document.
+        # To catch this, we check: is the text between the end of this block
+        # and the *next* ]]> (if any) preceded by NO new <![CDATA[ opener?
+        # If so, there is a free-floating ]]> -- the signature of injection.
+        block_end = cdata_m.end()  # byte offset just after this block's ]]>
+        next_term = raw.find(b"]]>", block_end)
+        if next_term == -1:
+            continue
+        between = raw[block_end:next_term]
+        # If there is no new <![CDATA[ between the end of this block and the
+        # next ]]>, that next ]]> is an orphan terminator injected after the
+        # CDATA section closed -- CDATA injection confirmed.
+        if cdata_open.lower() not in between.lower() and b"<![CDATA[" not in between:
+            snippet_start = max(0, cdata_m.start())
+            snippet = raw[snippet_start : next_term + 3]
+            findings.append(
+                Finding(
+                    check="malformed",
+                    type="cdata_injection",
+                    severity="high",
+                    message=(
+                        "CDATA section contains an embedded ']]>' terminator "
+                        "that prematurely closes the section and injects raw XML "
+                        "markup into parsed output (CVE-2026-34601 class). An "
+                        "attacker could inject arbitrary fields such as "
+                        "<TRNAMT> or <approved> into the document tree."
+                    ),
+                    location=f"line {_line_of(raw, cdata_m.start())}",
+                    evidence=truncate_evidence(
+                        snippet.decode("latin-1"), limit=80
+                    ),
+                    metadata={"finding_id": "FERRYMAN-MALFORMED-004"},
+                )
+            )
+            break  # one finding is sufficient to flag the file
 
     return findings

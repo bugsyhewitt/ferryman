@@ -151,3 +151,69 @@ def test_three_flat_entities_no_cross_reference_no_entity_expansion():
     )
     findings = check_malformed(payload)
     assert all(f.type != "entity_expansion" for f in findings)
+
+
+# --- CDATA injection tests (FERRYMAN-MALFORMED-004) ---
+
+def test_cdata_injection_fixture_is_detected(cdata_injection_file):
+    """The bundled cdata-injection.ofx fixture must trigger a cdata_injection finding."""
+    findings = check_malformed(cdata_injection_file.read_bytes())
+    types = {f.type for f in findings}
+    assert "cdata_injection" in types, f"expected cdata_injection finding, got: {types}"
+
+
+def test_cdata_injection_severity_is_high(cdata_injection_file):
+    findings = check_malformed(cdata_injection_file.read_bytes())
+    inj = next(f for f in findings if f.type == "cdata_injection")
+    assert inj.severity == "high"
+    assert inj.check == "malformed"
+
+
+def test_cdata_injection_finding_id_in_metadata(cdata_injection_file):
+    findings = check_malformed(cdata_injection_file.read_bytes())
+    inj = next(f for f in findings if f.type == "cdata_injection")
+    assert inj.metadata.get("finding_id") == "FERRYMAN-MALFORMED-004"
+
+
+def test_cdata_injection_inline_payload():
+    """Inline payload: CDATA block terminated early with injected markup."""
+    payload = (
+        b'<?xml version="1.0"?>\n'
+        b"<OFX><STMTTRN>"
+        b"<MEMO><![CDATA[innocent]]><TRNAMT>-99999</TRNAMT>]]></MEMO>"
+        b"</STMTTRN></OFX>"
+    )
+    findings = check_malformed(payload)
+    assert any(f.type == "cdata_injection" for f in findings)
+
+
+def test_clean_cdata_not_flagged():
+    """A well-formed CDATA section (no embedded ]]>) must not be flagged."""
+    payload = (
+        b'<?xml version="1.0"?>\n'
+        b"<OFX><STMTTRN>"
+        b"<MEMO><![CDATA[Safe content with no injection]]></MEMO>"
+        b"</STMTTRN></OFX>"
+    )
+    findings = check_malformed(payload)
+    assert all(f.type != "cdata_injection" for f in findings)
+
+
+def test_multiple_clean_cdata_blocks_not_flagged():
+    """Multiple legitimate CDATA blocks without injection are not flagged."""
+    payload = (
+        b'<?xml version="1.0"?>\n'
+        b"<OFX>"
+        b"<NAME><![CDATA[Alice & Bob]]></NAME>"
+        b"<MEMO><![CDATA[Payment for <services>]]></MEMO>"
+        b"</OFX>"
+    )
+    findings = check_malformed(payload)
+    assert all(f.type != "cdata_injection" for f in findings)
+
+
+def test_no_cdata_no_finding():
+    """Documents with no CDATA sections at all produce no cdata_injection finding."""
+    payload = b"<OFX><NAME>Alice</NAME><TRNAMT>-42.00</TRNAMT></OFX>"
+    findings = check_malformed(payload)
+    assert all(f.type != "cdata_injection" for f in findings)

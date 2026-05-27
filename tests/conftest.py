@@ -32,3 +32,8 @@ def anomaly_file() -> Path:
 @pytest.fixture
 def entity_bomb_file() -> Path:
     return FIXTURES / "entity-bomb.ofx"
+
+
+@pytest.fixture
+def cdata_injection_file() -> Path:
+    return FIXTURES / "cdata-injection.ofx"
