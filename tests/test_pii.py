@@ -11,6 +11,7 @@ import pytest
 from ferryman.checks.pii import (
     _aba_checksum_valid,
     _iban_valid,
+    _isin_valid,
     _luhn_valid,
     check_pii,
 )
@@ -357,3 +358,102 @@ def test_iban_leak_fixture(iban_file):
 def test_clean_file_no_iban(clean_file):
     findings = check_pii(clean_file.read_bytes())
     assert "iban" not in {f.type for f in findings}
+
+
+# --- ISIN detection (ISO 6166 Luhn-check-digit gated) ---
+
+# Real, published ISINs. All carry a valid ISO 6166 check digit.
+VALID_ISINS = [
+    "US0378331005",  # Apple Inc.
+    "US5949181045",  # Microsoft Corp.
+    "GB0002634946",  # BAE Systems
+    "DE000BAY0017",  # Bayer AG
+    "FR0000131104",  # BNP Paribas
+    "AU0000XVGZA3",  # an Australian ISIN with letters in the NSIN
+]
+
+# Strings shaped like an ISIN but failing the ISO 6166 check digit, or the
+# 12-char shape -- they must NOT be reported as ISINs.
+INVALID_ISINS = [
+    "US0378331004",  # Apple ISIN with the wrong check digit
+    "GB0002634945",  # BAE ISIN with the wrong check digit
+    "XX0378331004",  # unknown country + wrong check digit
+    "US037833100",   # 11 chars -- too short
+    "US03783310059",  # 13 chars -- too long
+    "0378331005AB",  # no leading country-code letters
+]
+
+
+@pytest.mark.parametrize("isin", VALID_ISINS)
+def test_isin_accepts_real_isins(isin):
+    assert _isin_valid(isin) is True
+
+
+@pytest.mark.parametrize("isin", INVALID_ISINS)
+def test_isin_rejects_invalid(isin):
+    assert _isin_valid(isin) is False
+
+
+@pytest.mark.parametrize("bad", ["", "US", "US0378", "  ", "US0378331!05"])
+def test_isin_rejects_garbage(bad):
+    # Defensive: malformed / too-short input is never a valid ISIN.
+    assert _isin_valid(bad) is False
+
+
+def test_isin_lowercase_accepted():
+    # ISINs are case-insensitive; a lowercased value still validates.
+    assert _isin_valid("us0378331005") is True
+
+
+def test_isin_in_memo_detected():
+    findings = _scan("sold security US0378331005 today")
+    isins = [f for f in findings if f.type == "isin"]
+    assert len(isins) == 1
+    assert isins[0].severity == "high"
+    assert isins[0].check == "pii"
+    # The NSIN body / check digit never leave the scanner; only the country
+    # prefix survives for triage.
+    assert "0378331005" not in (isins[0].evidence or "")
+    assert (isins[0].evidence or "").startswith("US")
+
+
+def test_isin_not_double_counted_as_account_number():
+    # An ISIN embeds a long digit tail; it must NOT also surface as a separate
+    # account_number / routing_number / credit_card finding.
+    findings = _scan("holding US0378331005 in the account")
+    types = [f.type for f in findings]
+    assert types.count("isin") == 1
+    assert "account_number" not in types
+    assert "routing_number" not in types
+    assert "credit_card" not in types
+
+
+def test_invalid_isin_not_reported():
+    # A wrong-check-digit ISIN-shaped run must NOT be reported as an ISIN.
+    findings = _scan("ref US0378331004 logged")
+    assert "isin" not in {f.type for f in findings}
+
+
+def test_same_isin_deduped_per_field():
+    findings = _scan("US0378331005 aka us0378331005 in two casings")
+    isins = [f for f in findings if f.type == "isin"]
+    assert len(isins) == 1
+
+
+def test_isin_leak_fixture(isin_file):
+    findings = check_pii(isin_file.read_bytes())
+    isins = [f for f in findings if f.type == "isin"]
+    types = {f.type for f in findings}
+    assert "isin" in types, f"expected isin, got: {types}"
+    # The fixture leaks a US ISIN and a GB ISIN in two memos; the XX value is a
+    # wrong-check-digit decoy that must NOT be reported as an ISIN.
+    assert len(isins) == 2
+    assert all(i.severity == "high" for i in isins)
+    for i in isins:
+        # No raw NSIN digits remain in the evidence.
+        assert "X" in (i.evidence or "")
+
+
+def test_clean_file_no_isin(clean_file):
+    findings = check_pii(clean_file.read_bytes())
+    assert "isin" not in {f.type for f in findings}

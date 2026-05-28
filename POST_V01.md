@@ -407,6 +407,54 @@ EU/UK fintech bug-bounty programs (GDPR financial-data exposure).
 
 ---
 
+## Rank 12 — ISIN Leak Detection, ISO 6166 check-digit gated (HIGH signal, low effort) — ✅ IMPLEMENTED (2026-05-28, Phase 2 Rotation 13)
+
+**Status:** Shipped. `checks/pii.py` gained an `_isin_valid()` helper that gates an
+ISIN candidate behind two independent public checks: the ISO 6166 shape
+(two-letter country/issuer code + nine-character alphanumeric NSIN + one decimal
+check digit, exactly twelve characters) and the ISO 6166 check digit (expand each
+letter to its two-digit value, `A`=10&hellip;`Z`=35, then reuse the existing
+`_luhn_valid()` mod-10 check over the whole expanded string). An `_ISIN_RE`
+matcher (`[A-Z]{2}[A-Z0-9]{9}\d`, non-alphanumeric bounded) finds candidates in
+free text. In `_scan_text`, ISIN detection runs **before** the credit-card,
+routing, and account scanners, and every digit run inside a detected ISIN is
+reserved under the `account_number`/`credit_card`/`routing_number` dedupe
+namespaces so the same identifier is never double-counted. Findings are `high`
+severity; evidence is redacted to the two-letter country/issuer prefix via
+`_redact_isin()` so the NSIN body never leaves the tool. Candidates that fail the
+check digit or the 12-char shape fall through untouched to the existing
+heuristics. Crucially, an ISIN sitting in its own structured `SECID` field is
+**not** flagged (the narrow `_scan_secid` path is unchanged) &mdash; only an ISIN
+bleeding into a free-text memo/name, which discloses a customer's securities
+holdings, is reported. New fixture `tests/fixtures/isin-leak.ofx` (a US ISIN and a
+GB ISIN in two memos plus a wrong-check-digit `XX` decoy) plus 24 new tests in
+`tests/test_pii.py` cover the validator (published registry ISINs incl. an
+alphanumeric NSIN, wrong-check-digit / wrong-length / no-country rejects, garbage
+guards, lowercase acceptance), memo detection and redaction, per-field dedupe, the
+no-double-count guarantee, the invalid-ISIN no-report case, the fixture, and the
+clean-file no-ISIN guarantee. README gained an "ISIN leak detection" section and
+the PII type list was updated. No new dependencies (stdlib `re` only).
+
+**What:** The pii check covered SSN, payment card (PAN), IBAN, US account number,
+and US ABA routing number, but not the **ISIN** &mdash; the global securities
+identifier and a brokerage-account PII leak class. Like the ABA (Rank 1), Luhn
+(Rank 10), and IBAN (Rank 11) gates, the ISIN carries a public check digit
+(ISO 6166, Luhn-over-expanded-letters), so gating on shape + check digit yields a
+high-precision, zero-dependency detector. An ISIN echoed into a transaction memo
+reveals which securities a customer holds &mdash; reportable on its own in fintech
+bug-bounty programs.
+
+**Research grounding:** ISO 6166 / the ISIN check-digit algorithm (letter
+expansion + Luhn) is public domain, ~15 lines of Python and reuses the existing
+`_luhn_valid` helper. Brokerage holdings disclosure (which securities, in what
+size) is a recognised financial-privacy leak in investment-platform bug-bounty
+programs; the project already parses INVSTMTRS investment statements (Rank 4),
+making the free-text ISIN echo a natural, in-scope next detector.
+
+**Estimated tokens:** 35–50K
+
+---
+
 ## Research notes
 
 **Sources consulted:**
