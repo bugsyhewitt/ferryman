@@ -47,9 +47,11 @@ ferryman [--check {malformed,pii,anomaly,all}] [--format {json,text}] FILE
     "Billion Laughs" DoS, SGML/XML confusion, encoding tricks, oversized
     fields). Operates on raw bytes; never parses a hostile file.
   - `pii` &mdash; PII leaking into transaction free-text (SSN, account number,
-    routing number). Evidence is always redacted before it leaves the tool.
+    routing number), including investment memos and security ids. Evidence is
+    always redacted before it leaves the tool.
   - `anomaly` &mdash; structurally valid but suspicious transactions
-    (out-of-range dates).
+    (out-of-range dates; for investment statements, negative/implausible unit
+    prices and negative quantities on non-sell transactions).
   - `all` &mdash; every check.
 - `--format` &mdash; `json` (default) or human-readable `text`.
 
@@ -140,13 +142,35 @@ finding above, the report writes itself:
 > **Remediation:** Disable DTD processing / external entity resolution in the
 > OFX/XML parser (`resolve_entities=False`, `no_network=True`).
 
-## Scope (v0.1)
+### Investment (brokerage) account support
 
-In scope: scanning OFX **files** on disk, BankAccount and CreditAccount
-statements, three check families above.
+ferryman scans investment statements (`INVSTMTRS`) in addition to bank and
+credit-card statements. Brokerage exports are exactly the high-value targets
+fintech bug-bounty programs run, and they carry their own surface:
+
+- The **pii** check scans investment transaction memos (free text) and the
+  security identifier (`UNIQUEID` / CUSIP). The security id is scanned with a
+  narrower rule — SSN-shaped values and over-long digit runs only — so a
+  legitimate 9-digit numeric CUSIP is never flagged as a routing number.
+- The **anomaly** check flags investment transactions with a **negative unit
+  price** (`negative_unit_price`, high — a security cannot trade below zero), a
+  **negative quantity on a non-sell transaction** (`negative_units`, high —
+  only a sale legitimately reduces a holding), and an **implausibly large unit
+  price** (`implausible_unit_price`, medium — an out-of-range / overflow probe).
+
+```bash
+$ ferryman --check all --format text brokerage.ofx
+  [CRITICAL] pii/ssn @ statement[0].transaction[0].memo: SSN-shaped value found in a free-text field.
+  [HIGH] anomaly/negative_unit_price @ statement[0].transaction[0].unitprice: Investment transaction has a negative unit price ...
+```
+
+## Scope
+
+In scope: scanning OFX **files** on disk; BankAccount, CreditAccount, and
+investment (`INVSTMTRS`) statements; the three check families above.
 
 Out of scope: live/streaming bank-API scanning, downloading from financial
-institutions, investment-account support, HackerOne submission automation.
+institutions, HackerOne submission automation.
 
 ## Development
 

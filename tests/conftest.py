@@ -37,3 +37,21 @@ def entity_bomb_file() -> Path:
 @pytest.fixture
 def cdata_injection_file() -> Path:
     return FIXTURES / "cdata-injection.ofx"
+
+
+@pytest.fixture
+def investment_file() -> Path:
+    """A clean investment (INVSTMTRS) statement: a buy and a sell, no leaks."""
+    return FIXTURES / "investment.ofx"
+
+
+@pytest.fixture
+def investment_pii_file() -> Path:
+    """Investment statement leaking an SSN and carrying anomalous amounts."""
+    return FIXTURES / "investment-pii.ofx"
+
+
+@pytest.fixture
+def investment_secid_leak_file() -> Path:
+    """Investment statement with an SSN smuggled into the security id."""
+    return FIXTURES / "investment-secid-leak.ofx"

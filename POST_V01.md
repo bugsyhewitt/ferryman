@@ -93,7 +93,23 @@ OFX v2 processors use. It is fresh surface area.
 
 ---
 
-## Rank 4 — Investment Account (INVSTMTRS) Statement Support in PII + Anomaly Checks (coverage gap, medium effort)
+## Rank 4 — Investment Account (INVSTMTRS) Statement Support in PII + Anomaly Checks (coverage gap, medium effort) — ✅ IMPLEMENTED (2026-05-28, Phase 2 Rotation 5)
+
+**Status:** Shipped. `parsing.py` now detects investment statements (by
+`INVSTMTRS` class name) in `ofx.statements` and flattens their `INVTRANLIST`
+transactions into the shared `Transaction` model — mapping the trade date onto
+`dtposted`, `TOTAL` onto `amount`, and populating new investment-only fields
+(`is_investment`, `units`, `unitprice`, `secid`); the broker id is carried in
+`bankid`. The pii check scans investment memos via the existing free-text path
+and the security id (`UNIQUEID`/CUSIP) via a narrower `_scan_secid` rule (SSN
+shape + 10-digit-or-longer runs only) so a legitimate numeric CUSIP never trips
+the routing-number heuristic. The anomaly check adds `negative_unit_price`
+(high), `negative_units` on non-sell types (high), and `implausible_unit_price`
+(medium), with defensive `Decimal` parsing that rejects NaN/Inf. New fixtures
+`investment.ofx`, `investment-pii.ofx`, `investment-secid-leak.ofx` and a
+`tests/test_investment.py` module (12 tests) cover clean statements, leaks,
+anomalies, the CUSIP false-positive guard, bank-statement regression, and
+garbage-amount safety. No new dependencies.
 
 **What:** `parsing.py` only iterates `ofx.statements`, which covers bank and credit-card
 statement types. OFX investment accounts use `INVSTMTRS` responses, which `ofxtools` exposes
