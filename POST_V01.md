@@ -252,7 +252,21 @@ layer. Useful when demonstrating a widespread PII leak across many exported file
 
 ---
 
-## Rank 8 — Exit Code Non-Zero on Findings Found (usability + CI integration, trivial effort)
+## Rank 8 — Exit Code Non-Zero on Findings Found (usability + CI integration, trivial effort) — ✅ IMPLEMENTED (2026-05-28, Phase 2 Rotation 9)
+
+**Status:** Shipped. `cli.py` gained an opt-in `--fail-on SEVERITY` flag
+(choices = the five `SEVERITIES`) plus a `_meets_threshold()` helper. When set,
+the scan still emits its full json/text/h1md output, then returns exit code `1`
+if any finding (across all files in a batch run) is at or above the chosen
+severity; otherwise it returns `0`. Without the flag the prior contract is
+preserved exactly — a completed scan always exits `0` regardless of findings —
+so every existing pipeline and test is unchanged. The exit-code map is now `0`
+clean/under-threshold, `1` threshold met, `2` usage error, `3` unreadable input.
+Eight new CLI tests in `tests/test_cli.py` cover the help listing, the
+zero-exit-without-flag guarantee, threshold-met and threshold-not-met cases,
+`--fail-on info` tripping on any finding, the clean-file zero exit, multi-file
+gating, and format-independence. README usage section gained a "Gating a
+pipeline on findings" subsection. No new dependencies.
 
 **What:** Currently ferryman always exits `0` if the scan completed (regardless of findings).
 This means `ferryman --check all statement.ofx && upload statement.ofx` will always upload, even

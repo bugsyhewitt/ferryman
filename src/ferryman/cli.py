@@ -12,8 +12,17 @@ multi-file invocations wrap per-file results in a {"files": [...]} envelope for
 JSON, a per-file summary for text, and a single combined report (with file
 attribution in each finding's location) for h1md.]
 
+[Worker decision (POST_V01 Rank 8): --fail-on SEVERITY makes ferryman return a
+non-zero exit code when findings at or above the given severity are present, so
+security-conscious pipelines can gate on it (e.g. `ferryman --fail-on high
+stmt.ofx && upload stmt.ofx`). The flag is opt-in: without it, a completed scan
+still exits 0 regardless of findings, preserving every existing pipeline and
+test. Output (json/text/h1md) is always emitted in full first; the exit code is
+the only thing the flag changes.]
+
 Exit codes:
-    0  scan(s) completed (whether or not findings were emitted)
+    0  scan(s) completed and no --fail-on threshold was met
+    1  --fail-on was set and a finding met or exceeded that severity
     2  usage / argument error (argparse default)
     3  an input file could not be read, or --dir matched no files
 """
@@ -68,6 +77,16 @@ def build_parser() -> argparse.ArgumentParser:
         default="json",
         dest="output_format",
         help="output format (default: json)",
+    )
+    parser.add_argument(
+        "--fail-on",
+        choices=SEVERITIES,
+        default=None,
+        dest="fail_on",
+        help=(
+            "exit non-zero (1) if any finding is at or above this severity "
+            "(default: always exit 0 on a completed scan)"
+        ),
     )
     parser.add_argument(
         "--version",
@@ -153,6 +172,20 @@ def _collect_inputs(args: argparse.Namespace) -> tuple[list[Path], str | None]:
     return paths, None
 
 
+def _meets_threshold(results: list[dict], threshold: str) -> bool:
+    """True if any finding across all results is at or above ``threshold``.
+
+    Unknown severity strings sort below ``info`` and never trip the gate.
+    """
+    rank = {sev: i for i, sev in enumerate(SEVERITIES)}
+    floor = rank[threshold]
+    for result in results:
+        for finding in result["findings"]:
+            if rank.get(finding["severity"], -1) >= floor:
+                return True
+    return False
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -181,6 +214,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     else:
         _emit_multi(results, args.output_format)
 
+    if args.fail_on is not None and _meets_threshold(results, args.fail_on):
+        return 1
     return 0
 
 
