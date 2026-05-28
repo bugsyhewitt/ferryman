@@ -53,7 +53,7 @@ ferryman [--check {malformed,pii,anomaly,all}] [--format {json,text,h1md,sarif}]
     injection / encoding mismatch, encoding tricks, oversized fields). Operates
     on raw bytes; never parses a hostile file.
   - `pii` &mdash; PII leaking into transaction free-text (SSN, payment-card
-    number, account number, routing number), including investment memos and
+    number, IBAN, account number, routing number), including investment memos and
     security ids. Evidence is always redacted before it leaves the tool.
   - `anomaly` &mdash; structurally valid but suspicious transactions
     (out-of-range dates; zero, sign-contradicting, or out-of-range transaction
@@ -322,6 +322,39 @@ $ ferryman --check pii --format text leak.ofx
 
 **Remediation:** never write a full PAN into a statement export; mask all but the
 last four digits (`**** **** **** 1111`) at the source, per PCI-DSS.
+
+### IBAN leak detection
+
+International Bank Account Numbers (IBANs) are the European/global equivalent of a
+US account + routing number rolled into one string &mdash; a direct, high-value
+PII leak. The **pii** check flags an `iban` finding (severity `high`) when a
+free-text field contains a string that clears **all three** public
+[ISO&nbsp;13616](https://en.wikipedia.org/wiki/International_Bank_Account_Number)
+gates:
+
+1. **shape** &mdash; two-letter country code, two check digits, then an
+   alphanumeric account body, written contiguously or in the conventional
+   space-separated groups of four;
+2. **country length** &mdash; the total length matches the registered length for
+   the declared country (a `DE` IBAN is always 22 characters, a `GB` IBAN 22, a
+   `NO` IBAN 15&hellip;); and
+3. **mod-97 checksum** &mdash; the rearranged, letter-to-number-mapped value is
+   `== 1 (mod 97)`.
+
+Gating on country + length + mod-97 mirrors the ABA-checksum and Luhn gates: a run
+that clears all three is a near-certain real IBAN, while a coincidental
+alphanumeric blob fails one of them with overwhelming probability and is left to
+the existing heuristics. The raw account body never leaves the tool &mdash;
+evidence is redacted to the country code plus masked digits (`DEXX XXXX
+XXXX...`).
+
+```bash
+$ ferryman --check pii --format text leak.ofx
+  [HIGH] pii/iban @ statement[0].transaction[0].memo: International Bank Account Number (IBAN, valid country/length/mod-97 checksum) leaking into a free-text field.
+```
+
+**Remediation:** never echo a full IBAN into a statement export or transaction
+memo; mask all but the country code and the last few characters at the source.
 
 ## From finding to HackerOne report
 

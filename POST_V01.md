@@ -364,6 +364,49 @@ bug-bounty programs. PCI-DSS prohibits storing/transmitting an unmasked PAN.
 
 ---
 
+## Rank 11 — IBAN Leak Detection, mod-97 / country-length gated (HIGH signal, low effort) — ✅ IMPLEMENTED (2026-05-28, Phase 2 Rotation 12)
+
+**Status:** Shipped. `checks/pii.py` gained an `_iban_valid()` helper that gates an
+IBAN candidate behind three independent public checks: ISO 13616 shape (two-letter
+country code + two check digits + alphanumeric BBAN), the registered per-country
+total length (`_IBAN_LENGTHS`, with a generic 15–34 fallback for countries not yet
+in the table), and the mod-97 checksum (rearrange-and-remainder). An `_IBAN_RE`
+matcher accepts both the contiguous form (`DE89370400440532013000`) and the
+human-readable space-grouped form (`DE89 3704 0044 0532 0130 00`); a
+`_trim_to_valid_iban()` post-step resolves the grouped form's tendency to
+over-capture trailing words by dropping trailing space-separated tokens until the
+remaining prefix validates. In `_scan_text`, IBAN detection runs **before** the
+credit-card, routing, and account scanners, and every digit run inside a detected
+IBAN is reserved under the `account_number`/`credit_card`/`routing_number` dedupe
+namespaces so the same leak is never double-counted. Findings are `high` severity;
+evidence is redacted to the country code plus masked digits via `_redact_iban()`
+so the account body never leaves the tool. Candidates that fail any gate fall
+through untouched to the existing heuristics. New fixture
+`tests/fixtures/iban-leak.ofx` (two valid IBANs + a bad-checksum `XX` decoy +
+an order-number) plus 29 new tests in `tests/test_pii.py` cover the validator
+(published registry IBANs, wrong-check-digit / wrong-length / unknown-country /
+no-country rejects, garbage guards, lowercase+spaced acceptance), contiguous and
+spaced detection, per-field dedupe, the no-double-count guarantee, the
+"don't swallow a following account number" guard, the invalid-IBAN no-report
+case, the fixture, and the clean-file no-IBAN guarantee. README gained an
+"IBAN leak detection" section. No new dependencies (stdlib `re` only).
+
+**What:** The pii check covered SSN, payment card (PAN), US account number, and
+US ABA routing number, but not the **IBAN** — the European/global bank-account
+identifier and a top international fintech PII leak class. Like the ABA (Rank 1)
+and Luhn (Rank 10) gates, the IBAN carries a public checksum (mod-97) plus a
+per-country fixed length, so gating on country + length + checksum yields a
+high-precision, zero-dependency detector.
+
+**Research grounding:** ISO 13616 / ISO 7064 mod-97-10 is public domain, ~15 lines
+of Python. IBANs appear in SEPA transaction memos and counterparty fields; an
+export that echoes a full IBAN into free text is a reportable PII disclosure in
+EU/UK fintech bug-bounty programs (GDPR financial-data exposure).
+
+**Estimated tokens:** 35–50K
+
+---
+
 ## Research notes
 
 **Sources consulted:**

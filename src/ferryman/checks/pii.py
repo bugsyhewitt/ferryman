@@ -11,6 +11,10 @@ Detection classes:
                                 space/dash grouping) that passes the Luhn
                                 checksum -- a near-certain payment-card (PAN)
                                 leak, PCI-DSS sensitive.
+- ``iban``                    : an International Bank Account Number (ISO 13616)
+                                whose country code, length, and mod-97 check
+                                digits all validate -- a near-certain
+                                international bank-account leak.
 - ``account_number``          : a long account-number-shaped digit run leaking
                                 into a transaction name/memo.
 - ``routing_number``          : a 9-digit run that passes the ABA weighted
@@ -62,6 +66,50 @@ _CARD_MAX_LEN = 19
 # ABA weighted-checksum coefficients, applied positionally to the 9 digits.
 _ABA_WEIGHTS = (3, 7, 1, 3, 7, 1, 3, 7, 1)
 
+# IBAN (ISO 13616) candidate. Two presentations are accepted:
+#   - contiguous: a single 15-34 char run (e.g. DE89370400440532013000); and
+#   - grouped:    space-separated blocks of up to four alphanumerics, the
+#                 human-readable form (e.g. DE89 3704 0044 0532 0130 00).
+# Both start with two letters (country code) and two digits (check digits). The
+# run is bounded by a non-alphanumeric lookaround so an IBAN embedded in a longer
+# blob is not partially matched. The grouped form requires each space to be
+# *inside* a block sequence -- a trailing space followed by a normal word will
+# not be swallowed, because a group is a run of alnum, not a single char. The
+# caller strips spaces and validates country/length/mod-97 before reporting.
+_IBAN_RE = re.compile(
+    r"(?<![A-Za-z0-9])"
+    r"[A-Za-z]{2}\d{2}"
+    r"(?:"
+    r"[A-Za-z0-9]{11,30}"            # contiguous BBAN
+    r"|"
+    r"[A-Za-z0-9]{0,2}(?: [A-Za-z0-9]{1,4}){2,8}"  # grouped (blocks of <=4)
+    r")"
+    r"(?![A-Za-z0-9])"
+)
+# Per-country total IBAN length (ISO 13616 registry). The mod-97 checksum alone
+# does not prove an IBAN is real; pairing it with the registered length for the
+# declared country code makes a coincidental alphanumeric run vanishingly
+# unlikely to validate. Countries omitted here are simply not length-checked
+# beyond the generic 15-34 range, so the registry can grow without code changes
+# while still gating on country + checksum.
+_IBAN_LENGTHS = {
+    "AD": 24, "AE": 23, "AL": 28, "AT": 20, "AZ": 28, "BA": 20, "BE": 16,
+    "BG": 22, "BH": 22, "BR": 29, "BY": 28, "CH": 21, "CR": 22, "CY": 28,
+    "CZ": 24, "DE": 22, "DK": 18, "DO": 28, "EE": 20, "EG": 29, "ES": 24,
+    "FI": 18, "FO": 18, "FR": 27, "GB": 22, "GE": 22, "GI": 23, "GL": 18,
+    "GR": 27, "GT": 28, "HR": 21, "HU": 28, "IE": 22, "IL": 23, "IQ": 23,
+    "IS": 26, "IT": 27, "JO": 30, "KW": 30, "KZ": 20, "LB": 28, "LC": 32,
+    "LI": 21, "LT": 20, "LU": 20, "LV": 21, "LY": 25, "MC": 27, "MD": 24,
+    "ME": 22, "MK": 19, "MR": 27, "MT": 31, "MU": 30, "NL": 18, "NO": 15,
+    "PK": 24, "PL": 28, "PS": 29, "PT": 25, "QA": 29, "RO": 24, "RS": 22,
+    "SA": 24, "SC": 31, "SE": 24, "SI": 19, "SK": 24, "SM": 27, "ST": 25,
+    "SV": 28, "TL": 23, "TN": 24, "TR": 26, "UA": 29, "VA": 22, "VG": 24,
+    "XK": 20,
+}
+# Generic ISO 13616 bounds for country codes not in the registry table.
+_IBAN_MIN_LEN = 15
+_IBAN_MAX_LEN = 34
+
 
 def _luhn_valid(digits: str) -> bool:
     """Return ``True`` if a digit string passes the Luhn (mod-10) checksum.
@@ -112,12 +160,95 @@ def _aba_checksum_valid(digits: str) -> bool:
     return total % 10 == 0
 
 
+def _iban_valid(candidate: str) -> bool:
+    """Return ``True`` if a string is a structurally valid IBAN (ISO 13616).
+
+    Three independent gates, all public and dependency-free:
+
+    1. **Shape** -- after stripping spaces, the value is 15-34 characters: two
+       letters (country code), two digits (check digits), then an alphanumeric
+       BBAN.
+    2. **Country length** -- if the declared country code is in the ISO 13616
+       registry, the total length must match exactly (e.g. a ``DE`` IBAN is
+       always 22 characters). Unknown country codes fall back to the generic
+       15-34 bound, so the registry can grow without code changes.
+    3. **Mod-97 checksum** -- move the first four characters to the end, map each
+       letter to a two-digit number (``A``=10 ... ``Z``=35), and the resulting
+       integer must be ``== 1 (mod 97)``.
+
+    A run that clears all three is a near-certain real IBAN; a coincidental
+    alphanumeric blob fails one of them with overwhelming probability. Any
+    malformed input returns ``False`` so the helper is safe to reuse.
+    """
+    iban = candidate.replace(" ", "").upper()
+    if not (_IBAN_MIN_LEN <= len(iban) <= _IBAN_MAX_LEN):
+        return False
+    if not (iban[:2].isalpha() and iban[2:4].isdigit()):
+        return False
+    if not iban[4:].isalnum():
+        return False
+    country = iban[:2]
+    expected = _IBAN_LENGTHS.get(country)
+    if expected is not None and len(iban) != expected:
+        return False
+    # Rearrange: move the first four chars (country code + check digits) to the
+    # end, then translate letters to numbers and take the value mod 97.
+    rearranged = iban[4:] + iban[:4]
+    digits = "".join(
+        str(ord(ch) - 55) if ch.isalpha() else ch for ch in rearranged
+    )
+    return int(digits) % 97 == 1
+
+
+def _trim_to_valid_iban(candidate: str) -> str | None:
+    """Return the longest valid IBAN prefix of a captured run, or ``None``.
+
+    The grouped-IBAN regex can over-capture trailing space-separated words
+    (``"DE89 3704 ... 0130 00 on file"``) because short words look like IBAN
+    blocks. We resolve the ambiguity at validation time: try the whole run, then
+    progressively drop trailing space-separated tokens until the remainder
+    validates (country code + registered length + mod-97). The first length-aware
+    validating prefix is the real IBAN. Contiguous (space-free) candidates are
+    validated directly. Returns the validating string (original spacing kept) or
+    ``None`` if no prefix is a valid IBAN.
+    """
+    if " " not in candidate:
+        return candidate if _iban_valid(candidate) else None
+    tokens = candidate.split(" ")
+    for end in range(len(tokens), 0, -1):
+        prefix = " ".join(tokens[:end])
+        if _iban_valid(prefix):
+            return prefix
+    return None
+
+
 def _redact_ssn(text: str) -> str:
     return _SSN_RE.sub("XXX-XX-XXXX", text)
 
 
 def _redact_digits(text: str) -> str:
     return re.sub(r"\d", "X", text)
+
+
+def _redact_iban(iban: str) -> str:
+    """Redact an IBAN, preserving only the country code for triage.
+
+    The two-letter country code identifies the jurisdiction (useful for a
+    report) while the check digits and the entire BBAN -- the part that is the
+    actual account secret -- are masked. Spaces in the original presentation are
+    preserved so the masked shape still reads as an IBAN.
+    """
+    out = []
+    seen_alnum = 0
+    for ch in iban:
+        if ch == " ":
+            out.append(" ")
+        elif ch.isalnum():
+            seen_alnum += 1
+            out.append(ch if seen_alnum <= 2 else "X")
+        else:
+            out.append(ch)
+    return "".join(out)
 
 
 def _scan_text(
@@ -144,6 +275,39 @@ def _scan_text(
                 message="SSN-shaped value found in a free-text field.",
                 location=location,
                 evidence=_redact_ssn(m.group(0)),
+            )
+        )
+
+    # IBANs (ISO 13616) -- check before the credit-card and account-number runs.
+    # An IBAN is an alphanumeric run, so it can embed long digit sequences that
+    # the card / account / routing scanners would otherwise misclassify. We gate
+    # on the country code, the registered length, AND the mod-97 checksum, so a
+    # coincidental alphanumeric blob is vanishingly unlikely to be reported.
+    for m in _IBAN_RE.finditer(text):
+        candidate = _trim_to_valid_iban(m.group(0))
+        if candidate is None:
+            continue
+        compact = candidate.replace(" ", "").upper()
+        key = ("iban", compact)
+        if key in seen:
+            continue
+        seen.add(key)
+        # Reserve every digit run inside the IBAN under the account/card/routing
+        # namespaces so the scanners below never re-report a slice of the same
+        # leak as a separate finding.
+        for run in re.findall(r"\d+", compact):
+            seen.add(("account_number", run))
+            seen.add(("credit_card", run))
+            seen.add(("routing_number", run))
+        findings.append(
+            Finding(
+                check="pii",
+                type="iban",
+                severity="high",
+                message="International Bank Account Number (IBAN, valid "
+                "country/length/mod-97 checksum) leaking into a free-text field.",
+                location=location,
+                evidence=_redact_iban(candidate),
             )
         )
 
