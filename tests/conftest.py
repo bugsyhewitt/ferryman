@@ -30,6 +30,12 @@ def anomaly_file() -> Path:
 
 
 @pytest.fixture
+def anomalous_amount_file() -> Path:
+    """A bank statement carrying zero, sign-flipped, and out-of-range amounts."""
+    return FIXTURES / "anomalous-amount.ofx"
+
+
+@pytest.fixture
 def entity_bomb_file() -> Path:
     return FIXTURES / "entity-bomb.ofx"
 

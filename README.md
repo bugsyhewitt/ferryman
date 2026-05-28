@@ -13,8 +13,9 @@ scanner that treats an OFX file as an attack surface and asks three questions:
   injection / encoding mismatch, encoding tricks, oversized fields.
 - **Is this file leaking PII it should not?** SSNs, full account numbers, and
   routing numbers smuggled into free-text transaction names and memos.
-- **Is this file anomalous?** Out-of-range posting dates and other signs of
-  tampering or a backend that accepts garbage.
+- **Is this file anomalous?** Out-of-range posting dates, zero / sign-flipped /
+  out-of-range transaction amounts, and other signs of tampering or a backend
+  that accepts garbage.
 
 Findings come out as structured JSON, ready to drop into a HackerOne report.
 
@@ -52,8 +53,9 @@ ferryman [--check {malformed,pii,anomaly,all}] [--format {json,text}] FILE
     routing number), including investment memos and security ids. Evidence is
     always redacted before it leaves the tool.
   - `anomaly` &mdash; structurally valid but suspicious transactions
-    (out-of-range dates; for investment statements, negative/implausible unit
-    prices and negative quantities on non-sell transactions).
+    (out-of-range dates; zero, sign-contradicting, or out-of-range transaction
+    amounts; for investment statements, negative/implausible unit prices and
+    negative quantities on non-sell transactions).
   - `all` &mdash; every check.
 - `--format` &mdash; `json` (default) or human-readable `text`.
 
@@ -150,6 +152,38 @@ $ ferryman --check malformed --format text crafted-v1.ofx
 **Remediation:** parse the OFX v1 header block exactly once, reject any
 `OFXHEADER:` occurrence in the body, and validate `ENCODING`/`CHARSET` against
 the OFX-allowed set before decoding.
+
+### Transaction amount anomalies
+
+OFX transaction amounts (`TRNAMT`) are decimal strings, and a crafted file can
+smuggle business-logic / negative-balance probes into them. The **anomaly**
+check flags three `anomalous_amount` cases on bank and credit-card transactions:
+
+- **Zero amount** (severity `high`) &mdash; a posted transaction that moves no
+  money. A no-op posting that a backend nonetheless accepts is a business-logic
+  anomaly.
+- **Sign contradicts type** (severity `medium`) &mdash; a *positive* amount on a
+  debit-type transaction (`DEBIT`, `PAYMENT`, `FEE`, …) or a *negative* amount on
+  a credit-type transaction (`CREDIT`, `DEP`, `INT`, …). OFX's sign convention is
+  debits-negative / credits-positive, so a flipped sign can invert a charge into
+  a credit (or vice versa) downstream.
+- **Out-of-range magnitude** (severity `medium`) &mdash; an absolute amount above
+  $10,000,000, beyond any plausible retail-banking transaction; a classic
+  out-of-range / overflow probe.
+
+Normal postings &mdash; a `-42.00` debit or a `+1500.00` credit &mdash; respect
+the sign convention and are never flagged. Non-finite values (`NaN`, `Inf`) are
+left to the `malformed` check, which owns the "this field is garbage" verdict.
+
+```bash
+$ ferryman --check anomaly --format text crafted-amounts.ofx
+  [HIGH] anomaly/anomalous_amount @ statement[0].transaction[0].amount (fitid 0001): Transaction of type DEBIT has a zero amount ...
+  [MEDIUM] anomaly/anomalous_amount @ statement[0].transaction[1].amount (fitid 0002): Transaction of type DEBIT carries a positive amount, contradicting the OFX sign convention ...
+```
+
+**Remediation:** validate `TRNAMT` against the declared transaction type's sign
+convention, reject zero-value postings, and bound the per-transaction magnitude
+before applying the amount to a balance.
 
 ## From finding to HackerOne report
 
