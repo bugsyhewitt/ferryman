@@ -25,6 +25,12 @@ def clean_file() -> Path:
 
 
 @pytest.fixture
+def credit_card_file() -> Path:
+    """A bank statement leaking Luhn-valid payment-card numbers in free text."""
+    return FIXTURES / "credit-card-leak.ofx"
+
+
+@pytest.fixture
 def anomaly_file() -> Path:
     return FIXTURES / "anomaly.ofx"
 

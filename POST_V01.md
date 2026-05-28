@@ -326,6 +326,44 @@ rather than just a script. GitHub Actions has first-class SARIF upload support.
 
 ---
 
+## Rank 10 — Payment-Card (PAN) Leak Detection, Luhn-gated (HIGH signal, low effort) — ✅ IMPLEMENTED (2026-05-28, Phase 2 Rotation 11)
+
+**Status:** Shipped. `checks/pii.py` gained a `_luhn_valid()` helper (the public,
+dependency-free mod-10 check digit every card network uses) and a `_CARD_RE`
+matcher for 13–19 digit runs allowing the conventional space/hyphen grouping
+(`4111 1111 1111 1111`, `4111-1111-1111-1111`, or unspaced). In `_scan_text`,
+card detection runs **before** the generic account-number scan: a run that
+passes Luhn and falls in the 13–19 digit length window is reported as
+`credit_card` (severity `critical`, PCI-DSS sensitive), with the compact digits
+reserved in the dedupe set under both the `credit_card` and `account_number`
+namespaces so the same PAN is never double-counted as a plain account number and
+the same card written two ways collapses to one finding per field. Runs that fail
+Luhn, or that fall outside the length window (e.g. a 12-digit order number), fall
+through untouched to the existing `account_number` / `routing_number` scanners.
+Evidence is redacted to the card's shape (`XXXX XXXX XXXX XXXX`) so the raw PAN
+never leaves the tool. The 13-digit card floor sits above the 9-digit routing
+window, so there is no overlap with the ABA path. New fixture
+`tests/fixtures/credit-card-leak.ofx` plus seventeen new tests in
+`tests/test_pii.py` cover the Luhn helper (network test PANs, near-miss and
+sequential rejects, non-numeric guards), spaced/dashed/unspaced detection,
+per-field dedupe, the Luhn-fail and short-run fall-through to account_number, the
+fixture, and the clean-file no-card guarantee. README gained a "Payment-card
+(PAN) leak detection" section. No new dependencies.
+
+**What:** The pii check covered SSN, account number, and routing number but not
+payment-card numbers — a top fintech PII / PCI-DSS leak class. Card numbers carry
+the public Luhn checksum, so gating on it (exactly as Rank 1 gated routing
+numbers on the ABA checksum) yields a high-precision, zero-dependency detector.
+
+**Research grounding:** Luhn (ISO/IEC 7812) is public domain, ~12 lines of
+Python. Fintech PII breach case studies (2025) confirm full PANs in transaction
+exports / API responses are a common, high-severity leak class in active
+bug-bounty programs. PCI-DSS prohibits storing/transmitting an unmasked PAN.
+
+**Estimated tokens:** 30–45K
+
+---
+
 ## Research notes
 
 **Sources consulted:**

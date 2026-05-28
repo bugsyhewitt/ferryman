@@ -7,6 +7,10 @@ numbers that should never travel in a statement export.
 
 Detection classes:
 - ``ssn``                     : SSN-shaped strings (NNN-NN-NNNN) in free text.
+- ``credit_card``             : a 13-19 digit run (allowing the conventional
+                                space/dash grouping) that passes the Luhn
+                                checksum -- a near-certain payment-card (PAN)
+                                leak, PCI-DSS sensitive.
 - ``account_number``          : a long account-number-shaped digit run leaking
                                 into a transaction name/memo.
 - ``routing_number``          : a 9-digit run that passes the ABA weighted
@@ -41,8 +45,50 @@ _ROUTING_RE = re.compile(r"\b\d{9}\b")
 # Account-number-shaped run: 8+ consecutive digits in free text.
 _ACCT_RE = re.compile(r"\b\d{8,}\b")
 
+# Credit-card / PAN candidate: a 13-19 digit number, optionally written in the
+# conventional groups of digits separated by a single space or hyphen
+# (e.g. "4111 1111 1111 1111" or "4111-1111-1111-1111"). We bound the run with a
+# non-digit lookaround so a card embedded in a longer digit blob is not partially
+# matched. The full match may contain separators; the caller strips them before
+# validating with Luhn.
+_CARD_RE = re.compile(
+    r"(?<![\d-])(?:\d[ -]?){12,18}\d(?![\d-])"
+)
+# Valid PAN lengths after stripping separators. Real card networks issue
+# 13-19 digit numbers; we accept that whole range and let Luhn do the gating.
+_CARD_MIN_LEN = 13
+_CARD_MAX_LEN = 19
+
 # ABA weighted-checksum coefficients, applied positionally to the 9 digits.
 _ABA_WEIGHTS = (3, 7, 1, 3, 7, 1, 3, 7, 1)
+
+
+def _luhn_valid(digits: str) -> bool:
+    """Return ``True`` if a digit string passes the Luhn (mod-10) checksum.
+
+    Luhn is the public, dependency-free check digit algorithm used by every
+    major payment-card network (Visa, Mastercard, Amex, Discover, ...). Starting
+    from the rightmost digit and moving left, every second digit is doubled
+    (subtracting 9 if the result exceeds 9); the total of all digits must be a
+    multiple of ten::
+
+        sum(luhn_transform(d_i)) mod 10 == 0
+
+    A 13-19 digit run that passes Luhn is a near-certain real PAN; one that fails
+    is almost always a coincidental digit run (an order number, a long account
+    id). Non-numeric input returns ``False`` so the helper is safe to reuse.
+    """
+    if not digits.isdigit():
+        return False
+    total = 0
+    for i, ch in enumerate(reversed(digits)):
+        d = int(ch)
+        if i % 2 == 1:
+            d *= 2
+            if d > 9:
+                d -= 9
+        total += d
+    return total % 10 == 0
 
 
 def _aba_checksum_valid(digits: str) -> bool:
@@ -98,6 +144,43 @@ def _scan_text(
                 message="SSN-shaped value found in a free-text field.",
                 location=location,
                 evidence=_redact_ssn(m.group(0)),
+            )
+        )
+
+    # Credit-card / PAN numbers -- check before the generic account-number run
+    # so a Luhn-valid card is reported as the (critical) PCI-DSS leak it is, not
+    # downgraded to a plain account-number finding. A card may be written with
+    # the conventional space/dash grouping, so we strip separators before
+    # validating the Luhn checksum and recording the run for dedupe. Runs that
+    # fail Luhn are left untouched here and fall through to the account-number /
+    # routing-number scanners below.
+    for m in _CARD_RE.finditer(text):
+        compact = re.sub(r"[ -]", "", m.group(0))
+        if not (_CARD_MIN_LEN <= len(compact) <= _CARD_MAX_LEN):
+            continue
+        if not _luhn_valid(compact):
+            continue
+        # Dedupe on the compact digits so the same card written two different
+        # ways (spaced vs unspaced) is reported once, and so the account-number
+        # scanner below skips a run it has already claimed.
+        key = ("credit_card", compact)
+        if key in seen:
+            continue
+        seen.add(key)
+        # Also reserve the compact digits under the account_number namespace so
+        # the 8+-digit scanner never re-reports the same run as an account
+        # number (it matches on contiguous digits, which the card may contain
+        # when written without separators).
+        seen.add(("account_number", compact))
+        findings.append(
+            Finding(
+                check="pii",
+                type="credit_card",
+                severity="critical",
+                message="Payment-card number (passing the Luhn checksum) "
+                "leaking into a free-text field -- PCI-DSS sensitive.",
+                location=location,
+                evidence=_redact_digits(m.group(0)),
             )
         )
 
