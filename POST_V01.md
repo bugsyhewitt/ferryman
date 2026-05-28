@@ -172,7 +172,22 @@ injection has no existing detection in ferryman.
 
 ---
 
-## Rank 6 — Negative/Zero Transaction Amount Anomaly (medium signal, low effort)
+## Rank 6 — Negative/Zero Transaction Amount Anomaly (medium signal, low effort) — ✅ IMPLEMENTED (2026-05-28, Phase 2 Rotation 7)
+
+**Status:** Shipped. The anomaly check now inspects `tx.amount` for bank and
+credit-card transactions via `_check_transaction_amount()` in
+`checks/anomaly.py`. It emits a single `anomalous_amount` type covering three
+cases: a **zero** amount (`high` — a posting that moves no money), a **sign that
+contradicts the declared OFX type** (`medium` — a positive DEBIT/PAYMENT/FEE or a
+negative CREDIT/DEP/INT, using the new `_DEBIT_TYPES` / `_CREDIT_TYPES` sets), and
+an **out-of-range magnitude** above the `_MAX_TXN_AMOUNT` ($10M) ceiling
+(`medium`). Normal postings that respect the debits-negative / credits-positive
+convention are never flagged, and non-finite (`NaN`/`Inf`) or unparseable amounts
+are left to the malformed check via the existing `_decimal_or_none` guard.
+Investment transactions keep their dedicated price/quantity path. New fixture
+`tests/fixtures/anomalous-amount.ofx` plus eleven unit tests in
+`tests/test_anomaly.py` cover all cases, the false-positive guards, and the
+no-regression promise on the clean fixture. No new dependencies.
 
 **What:** OFX transaction amounts are decimal strings in `<TRNAMT>`. A crafted file can contain
 `-0.00`, `NaN`, `Inf`, or extremely large/small values (e.g., `99999999999.99`). These may
