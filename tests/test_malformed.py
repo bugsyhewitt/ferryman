@@ -217,3 +217,121 @@ def test_no_cdata_no_finding():
     payload = b"<OFX><NAME>Alice</NAME><TRNAMT>-42.00</TRNAMT></OFX>"
     findings = check_malformed(payload)
     assert all(f.type != "cdata_injection" for f in findings)
+
+
+# --- OFX v1 SGML header injection / encoding mismatch (Rank 5) ---
+
+_V1_HEADER = (
+    b"OFXHEADER:100\n"
+    b"DATA:OFXSGML\n"
+    b"VERSION:102\n"
+    b"SECURITY:NONE\n"
+    b"ENCODING:USASCII\n"
+    b"CHARSET:1252\n"
+    b"COMPRESSION:NONE\n"
+    b"OLDFILEUID:NONE\n"
+    b"NEWFILEUID:NONE\n"
+)
+
+
+def test_clean_v1_file_has_no_header_findings(clean_file):
+    """The bundled clean v1 fixture must not trip header_injection/encoding_mismatch."""
+    findings = check_malformed(clean_file.read_bytes())
+    types = {f.type for f in findings}
+    assert "header_injection" not in types
+    assert "encoding_mismatch" not in types
+
+
+def test_clean_v1_inline_header_no_findings():
+    payload = _V1_HEADER + b"\n<OFX><BANKACCTFROM><ACCTID>9876</ACCTID></BANKACCTFROM></OFX>"
+    findings = check_malformed(payload)
+    types = {f.type for f in findings}
+    assert "header_injection" not in types
+    assert "encoding_mismatch" not in types
+
+
+def test_second_header_block_in_body_is_header_injection():
+    # A second OFXHEADER: block smuggled into the SGML body.
+    payload = (
+        _V1_HEADER
+        + b"\n<OFX>\n"
+        + b"OFXHEADER:100\nVERSION:102\nENCODING:UTF-8\n\n"
+        + b"<BANKACCTFROM><ACCTID>9876</ACCTID></BANKACCTFROM></OFX>"
+    )
+    findings = check_malformed(payload)
+    types = {f.type for f in findings}
+    assert "header_injection" in types, f"got: {types}"
+    inj = next(f for f in findings if f.type == "header_injection")
+    assert inj.severity == "high"
+    assert inj.check == "malformed"
+
+
+def test_disallowed_encoding_value_is_encoding_mismatch():
+    payload = (
+        b"OFXHEADER:100\n"
+        b"DATA:OFXSGML\n"
+        b"VERSION:102\n"
+        b"ENCODING:WINDOWS-1252\n"  # not in the allowed set
+        b"CHARSET:1252\n"
+        b"\n<OFX></OFX>"
+    )
+    findings = check_malformed(payload)
+    mism = [f for f in findings if f.type == "encoding_mismatch"]
+    assert mism, "expected an encoding_mismatch finding"
+    assert mism[0].severity == "medium"
+
+
+def test_allowed_encodings_not_flagged():
+    for enc in (b"USASCII", b"UTF-8", b"UNICODE"):
+        payload = (
+            b"OFXHEADER:100\nDATA:OFXSGML\nVERSION:102\n"
+            b"ENCODING:" + enc + b"\nCHARSET:1252\n\n<OFX></OFX>"
+        )
+        findings = check_malformed(payload)
+        assert all(
+            f.type != "encoding_mismatch" for f in findings
+        ), f"{enc!r} should be allowed"
+
+
+def test_odd_charset_is_encoding_mismatch():
+    payload = (
+        b"OFXHEADER:100\nDATA:OFXSGML\nVERSION:102\n"
+        b"ENCODING:USASCII\nCHARSET:UTF-7\n\n<OFX></OFX>"
+    )
+    findings = check_malformed(payload)
+    assert any(f.type == "encoding_mismatch" for f in findings)
+
+
+def test_numeric_charset_not_flagged():
+    payload = (
+        b"OFXHEADER:100\nDATA:OFXSGML\nVERSION:102\n"
+        b"ENCODING:USASCII\nCHARSET:1252\n\n<OFX></OFX>"
+    )
+    findings = check_malformed(payload)
+    assert all(f.type != "encoding_mismatch" for f in findings)
+
+
+def test_control_byte_in_header_is_encoding_mismatch():
+    payload = (
+        b"OFXHEADER:100\nDATA:OFXSGML\n"
+        b"VERSION:\x01102\n"  # control byte smuggled into a header value
+        b"ENCODING:USASCII\n\n<OFX></OFX>"
+    )
+    findings = check_malformed(payload)
+    mism = [f for f in findings if f.type == "encoding_mismatch"]
+    assert mism, "expected an encoding_mismatch finding for control byte"
+    assert mism[0].metadata.get("byte_value") == 1
+
+
+def test_v2_xml_file_not_treated_as_v1_header():
+    # An OFX v2 (pure XML) document has no SGML header block -- the v1 header
+    # checks must not fire on it.
+    payload = (
+        b'<?xml version="1.0" encoding="UTF-8"?>\n'
+        b'<?OFX OFXHEADER="200" VERSION="211"?>\n'
+        b"<OFX><BANKACCTFROM><ACCTID>9876</ACCTID></BANKACCTFROM></OFX>"
+    )
+    findings = check_malformed(payload)
+    types = {f.type for f in findings}
+    assert "header_injection" not in types
+    assert "encoding_mismatch" not in types
