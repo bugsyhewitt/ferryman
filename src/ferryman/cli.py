@@ -20,6 +20,13 @@ still exits 0 regardless of findings, preserving every existing pipeline and
 test. Output (json/text/h1md) is always emitted in full first; the exit code is
 the only thing the flag changes.]
 
+[Worker decision (POST_V01 Rank 9): --format sarif emits a SARIF 2.1.0 document
+so ferryman findings drop natively into GitHub's Security tab, the VS Code
+Problems panel, and SARIF-consuming SAST dashboards. Like h1md, sarif uses the
+combined-with-file-attribution shape in multi-file mode (findings carry their
+source file in the location/properties) since SARIF is a single-run document.
+The json/text/h1md paths are untouched.]
+
 Exit codes:
     0  scan(s) completed and no --fail-on threshold was met
     1  --fail-on was set and a finding met or exceeded that severity
@@ -38,6 +45,7 @@ from typing import Sequence
 from ferryman import __version__
 from ferryman.findings import SEVERITIES, Finding
 from ferryman.reporting import to_h1md
+from ferryman.sarif import to_sarif
 from ferryman.scanner import CHECK_CHOICES, scan_file
 
 # Glob pattern used to discover OFX files inside a --dir directory.
@@ -73,7 +81,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--format",
-        choices=("json", "text", "h1md"),
+        choices=("json", "text", "h1md", "sarif"),
         default="json",
         dest="output_format",
         help="output format (default: json)",
@@ -225,6 +233,9 @@ def _emit_single(result: dict, output_format: str) -> None:
     elif output_format == "h1md":
         findings = [Finding(**f) for f in result["findings"]]
         print(to_h1md(findings), end="")
+    elif output_format == "sarif":
+        findings = [Finding(**f) for f in result["findings"]]
+        print(to_sarif(findings))
     else:
         print(_render_text(result))
 
@@ -244,6 +255,11 @@ def _emit_multi(results: list[dict], output_format: str) -> None:
         for result in results:
             findings.extend(_attribute_findings(result))
         print(to_h1md(findings), end="")
+    elif output_format == "sarif":
+        findings = []
+        for result in results:
+            findings.extend(_attribute_findings(result))
+        print(to_sarif(findings))
     else:
         print(_render_multi_text(results))
 

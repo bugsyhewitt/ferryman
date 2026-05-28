@@ -41,7 +41,7 @@ ferryman --check all --format json statement.ofx
 Options:
 
 ```
-ferryman [--check {malformed,pii,anomaly,all}] [--format {json,text,h1md}]
+ferryman [--check {malformed,pii,anomaly,all}] [--format {json,text,h1md,sarif}]
          [--fail-on {info,low,medium,high,critical}] [--dir DIR]
          FILE [FILE ...]
 ```
@@ -59,8 +59,9 @@ ferryman [--check {malformed,pii,anomaly,all}] [--format {json,text,h1md}]
     amounts; for investment statements, negative/implausible unit prices and
     negative quantities on non-sell transactions).
   - `all` &mdash; every check.
-- `--format` &mdash; `json` (default), human-readable `text`, or `h1md`
-  (HackerOne-flavored markdown).
+- `--format` &mdash; `json` (default), human-readable `text`, `h1md`
+  (HackerOne-flavored markdown), or `sarif` (SARIF 2.1.0 for GitHub Code
+  Scanning, VS Code, and SAST dashboards &mdash; see below).
 - `--dir DIR` &mdash; scan every `*.ofx` file in `DIR` (non-recursive). Can be
   combined with positional `FILE` arguments.
 - `--fail-on SEVERITY` &mdash; exit non-zero (`1`) when any finding is at or
@@ -97,6 +98,39 @@ In a CI step, a non-zero exit fails the job:
 
 The full report is still printed in every case &mdash; `--fail-on` changes only
 the exit code, never the output.
+
+### SARIF output for GitHub Code Scanning and IDEs
+
+`--format sarif` emits a [SARIF 2.1.0](https://sarifweb.azurewebsites.net/)
+document &mdash; the standard interchange format for static-analysis results.
+This lets ferryman findings surface natively in the GitHub **Security** tab, the
+VS Code **Problems** panel, and SARIF-consuming SAST dashboards, alongside
+professional security tooling.
+
+```bash
+ferryman --check all --format sarif statement.ofx > ferryman.sarif
+```
+
+In a GitHub Actions workflow, upload the file with the official action:
+
+```yaml
+- name: Scan OFX exports
+  run: ferryman --check all --format sarif --dir ./exports/ > ferryman.sarif
+- name: Upload to code scanning
+  uses: github/codeql-action/upload-sarif@v3
+  with:
+    sarif_file: ferryman.sarif
+```
+
+Mapping details: each `<check>/<type>` becomes a SARIF rule (`malformed/xxe`,
+`pii/ssn`, ...). ferryman's five severities collapse to SARIF's coarser `level`
+(`critical`/`high` &rarr; `error`, `medium` &rarr; `warning`, `low`/`info`
+&rarr; `note`), but the exact ferryman severity is preserved in
+`properties.severity` and reflected in the numeric `rank` so consumers order
+findings the way ferryman does. When a finding carries a parseable line (the
+malformed check does), a SARIF `region` with `startLine` is attached so the
+result links to the right line. In multi-file / `--dir` mode every result's
+`artifactLocation.uri` carries its source file.
 
 ### Batch scanning many files
 

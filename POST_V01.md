@@ -284,7 +284,28 @@ if ferryman found critical XXE. Security-conscious pipelines expect non-zero exi
 
 ---
 
-## Rank 9 — SARIF Output Format (ecosystem integration, medium effort)
+## Rank 9 — SARIF Output Format (ecosystem integration, medium effort) — ✅ IMPLEMENTED (2026-05-28, Phase 2 Rotation 10)
+
+**Status:** Shipped. A new `src/ferryman/sarif.py` module (sibling to the h1md
+`reporting.py` adapter) renders findings to a SARIF 2.1.0 document, wired into
+the CLI as `--format sarif`. The envelope carries `$schema`, `version`, and a
+single `runs[0]` with a `tool.driver` (name/version/informationUri + one
+`reportingDescriptor` rule per distinct `<check>/<type>` id) and a `results`
+array. Severity maps to SARIF's coarse `level` (critical/high &rarr; `error`,
+medium &rarr; `warning`, low/info &rarr; `note`) while the exact ferryman
+severity is preserved in `properties.severity` and a numeric `rank` (0–100) so
+consumers order findings ferryman's way. Free-form locations carrying a
+`line N` token (the malformed check) gain a SARIF `region` with `startLine`
+(and the evidence snippet); other locators are preserved in
+`properties.location`. Multi-file / `--dir` runs reuse the existing file
+attribution so each result's `artifactLocation.uri` is its source file. The
+json/text/h1md paths are byte-identical to before. Thirteen new tests in
+`tests/test_sarif.py` cover the empty envelope, result/rule counts, the full
+severity-to-level/rank mapping, line-region parsing, the no-line default
+artifact + locator preservation, file-attributed URIs, and the CLI single-file,
+multi-file, clean-file, result-count-vs-json, and `--fail-on` interactions.
+README gained a "SARIF output for GitHub Code Scanning and IDEs" section with a
+GitHub Actions `upload-sarif` snippet. Zero new dependencies (stdlib `json`).
 
 **What:** SARIF (Static Analysis Results Interchange Format) is the standard output format for
 security scanners in GitHub Actions, VS Code, and many CI platforms. Adding `--format sarif` would
