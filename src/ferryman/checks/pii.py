@@ -17,6 +17,11 @@ Detection classes:
                                 severity to preserve visibility without raising a
                                 high-severity false positive.
 
+For investment (INVSTMTRS) statements the same free-text scan runs over the
+transaction memo, and the security identifier (``UNIQUEID`` / CUSIP) is scanned
+with a narrower rule -- SSN-shaped values and over-long digit runs only -- so a
+legitimate 9-digit numeric CUSIP is never mistaken for a routing number.
+
 All evidence is redacted before it leaves the scanner -- ferryman reports the
 presence of a leak, not the secret itself.
 """
@@ -156,6 +161,64 @@ def _scan_text(
         )
 
 
+def _scan_secid(
+    secid: str | None,
+    *,
+    location: str,
+    findings: list[Finding],
+    seen: set[tuple[str, str]],
+) -> None:
+    """Scan an investment security id for leaked PII.
+
+    A security identifier is a CUSIP (9 alphanumeric chars) or ISIN (12 chars).
+    Both are *expected* to be short, fixed-length codes, so we deliberately do
+    NOT run the generic free-text scanner here -- a perfectly normal 9-digit
+    numeric CUSIP would otherwise trip the routing-number heuristic on every
+    investment statement. Instead we only flag the two patterns that are
+    unambiguous leaks in this field:
+
+    - an SSN-shaped value (``NNN-NN-NNNN``) -- structurally impossible for a real
+      security id, so any match is a leak; and
+    - a digit run of 10 or more characters -- longer than any CUSIP/ISIN, so it
+      is an account-number-shaped value smuggled into the security id.
+    """
+    if not secid:
+        return
+
+    for m in _SSN_RE.finditer(secid):
+        key = ("ssn", m.group(0))
+        if key in seen:
+            continue
+        seen.add(key)
+        findings.append(
+            Finding(
+                check="pii",
+                type="ssn",
+                severity="critical",
+                message="SSN-shaped value found in an investment security id.",
+                location=location,
+                evidence=_redact_ssn(m.group(0)),
+            )
+        )
+
+    for m in re.finditer(r"\b\d{10,}\b", secid):
+        key = ("account_number", m.group(0))
+        if key in seen:
+            continue
+        seen.add(key)
+        findings.append(
+            Finding(
+                check="pii",
+                type="account_number",
+                severity="high",
+                message="Account-number-shaped digit run leaking into an "
+                "investment security id.",
+                location=location,
+                evidence=_redact_digits(m.group(0)),
+            )
+        )
+
+
 def check_pii(raw: bytes) -> list[Finding]:
     """Scan well-formed OFX bytes for PII exposure in free-text fields."""
     findings: list[Finding] = []
@@ -177,5 +240,17 @@ def check_pii(raw: bytes) -> list[Finding]:
                 findings=findings,
                 seen=seen,
             )
+            # Investment transactions expose a security identifier (CUSIP/ISIN
+            # via UNIQUEID). A legitimate CUSIP is a 9-character alphanumeric
+            # code, but a backend that echoes an SSN- or account-shaped value
+            # into the security id is leaking PII through a field a bank/credit
+            # statement does not even have -- so we scan it too.
+            if tx.is_investment and tx.secid:
+                _scan_secid(
+                    tx.secid,
+                    location=f"{base}.secid{fitid}",
+                    findings=findings,
+                    seen=seen,
+                )
 
     return findings
