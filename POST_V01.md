@@ -211,7 +211,26 @@ balance exploits).
 
 ---
 
-## Rank 7 — Scan Multiple Files (Glob / Directory Input) via CLI (usability, medium effort)
+## Rank 7 — Scan Multiple Files (Glob / Directory Input) via CLI (usability, medium effort) — ✅ IMPLEMENTED (2026-05-28, Phase 2 Rotation 8)
+
+**Status:** Shipped. `cli.py` now accepts multiple positional `FILE` arguments
+(`nargs="*"`, so shell globs expand naturally) plus a `--dir DIR` flag that
+scans every `*.ofx` file in `DIR` (non-recursive, sorted for deterministic
+ordering); positional files and `--dir` matches merge. A **single-file**
+invocation keeps the exact prior json/text/h1md output shape (no envelope), so
+every existing pipeline and test is byte-identical. A **multi-file** invocation
+(more than one file, or any use of `--dir`) wraps the results: json emits a
+`{"tool", "version", "files": [<per-file result>...], "summary": {"file_count",
+"total"}}` envelope where each `files` entry is the canonical single-file shape;
+text prints a batch header plus the compact per-file summary; h1md renders one
+combined HackerOne report with the source file folded into each finding's
+`location` (`<file>: <loc>`) to preserve attribution. New error paths return
+exit `3`: no input given, `--dir` not a directory, `--dir` matched no `*.ofx`,
+or any listed file unreadable. Eleven new CLI tests in `tests/test_cli.py` cover
+the json envelope, text and h1md batch output, `--dir` discovery and the
+`.ofx`-only filter, the single-match-still-envelope guarantee for `--dir`,
+positional+`--dir` merge, and all four error paths. README usage section
+updated. No new dependencies.
 
 **What:** The CLI accepts exactly one file. Bug-bounty researchers typically receive a dump of
 many OFX files from a target and want to batch-scan. Adding `ferryman --check all *.ofx` or

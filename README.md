@@ -41,7 +41,8 @@ ferryman --check all --format json statement.ofx
 Options:
 
 ```
-ferryman [--check {malformed,pii,anomaly,all}] [--format {json,text}] FILE
+ferryman [--check {malformed,pii,anomaly,all}] [--format {json,text,h1md}]
+         [--dir DIR] FILE [FILE ...]
 ```
 
 - `--check` &mdash; which scan to run. Default `all`.
@@ -57,9 +58,54 @@ ferryman [--check {malformed,pii,anomaly,all}] [--format {json,text}] FILE
     amounts; for investment statements, negative/implausible unit prices and
     negative quantities on non-sell transactions).
   - `all` &mdash; every check.
-- `--format` &mdash; `json` (default) or human-readable `text`.
+- `--format` &mdash; `json` (default), human-readable `text`, or `h1md`
+  (HackerOne-flavored markdown).
+- `--dir DIR` &mdash; scan every `*.ofx` file in `DIR` (non-recursive). Can be
+  combined with positional `FILE` arguments.
 
-Exit codes: `0` scan completed, `2` usage error, `3` file could not be read.
+Exit codes: `0` scan(s) completed, `2` usage error, `3` a file could not be
+read (or `--dir` matched no files).
+
+### Batch scanning many files
+
+Bug-bounty researchers typically receive a dump of many OFX files from a target.
+ferryman accepts multiple files (shell globs expand naturally) or a whole
+directory:
+
+```bash
+ferryman --check all *.ofx                    # every OFX in the cwd
+ferryman --check all --dir ./statements/      # every *.ofx in a directory
+ferryman --check all a.ofx b.ofx --dir ./more # positional files + a directory
+```
+
+A **single-file** invocation keeps the exact JSON/text/h1md shape documented
+below (no envelope), so existing pipelines are unchanged. A **multi-file**
+invocation (more than one file, or any use of `--dir`) wraps the per-file
+results:
+
+- `--format json` returns a `{"files": [ {<per-file result>}, ... ]}` envelope
+  with a top-level `summary` carrying `file_count` and the combined `total`.
+  Each entry under `files` is the same shape a single-file scan produces.
+- `--format text` prints a one-line batch header followed by the compact
+  per-file summary for each scanned file.
+- `--format h1md` renders one combined HackerOne report, with the source file
+  folded into each finding's `location` (e.g. `statements/a.ofx: line 4`) so
+  attribution survives the merge.
+
+```bash
+$ ferryman --check all --format json --dir ./statements/
+{
+  "tool": "ferryman",
+  "version": "0.1.0",
+  "files": [
+    { "tool": "ferryman", "file": "statements/a.ofx", "check": "all",
+      "summary": { "total": 1, ... }, "findings": [ ... ] },
+    { "tool": "ferryman", "file": "statements/b.ofx", "check": "all",
+      "summary": { "total": 0, ... }, "findings": [] }
+  ],
+  "summary": { "file_count": 2, "total": 1 }
+}
+```
 
 ### Example: scan an XXE attempt
 

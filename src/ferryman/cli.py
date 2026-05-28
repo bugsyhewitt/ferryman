@@ -5,10 +5,17 @@
 straight into HackerOne report pipelines; --format text gives a readable
 triage view.]
 
+[Worker decision (POST_V01 Rank 7): the CLI now accepts multiple FILE arguments
+and a --dir flag for batch scanning. Single-file invocations keep their exact
+prior output shape (no envelope) so existing pipelines and tests are unchanged;
+multi-file invocations wrap per-file results in a {"files": [...]} envelope for
+JSON, a per-file summary for text, and a single combined report (with file
+attribution in each finding's location) for h1md.]
+
 Exit codes:
-    0  scan completed (whether or not findings were emitted)
+    0  scan(s) completed (whether or not findings were emitted)
     2  usage / argument error (argparse default)
-    3  the input file could not be read
+    3  an input file could not be read, or --dir matched no files
 """
 
 from __future__ import annotations
@@ -24,6 +31,9 @@ from ferryman.findings import SEVERITIES, Finding
 from ferryman.reporting import to_h1md
 from ferryman.scanner import CHECK_CHOICES, scan_file
 
+# Glob pattern used to discover OFX files inside a --dir directory.
+_DIR_GLOB = "*.ofx"
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -35,9 +45,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "input",
+        "inputs",
         metavar="FILE",
-        help="path to the OFX file to scan",
+        nargs="*",
+        help="path(s) to the OFX file(s) to scan (shell globs expand here)",
+    )
+    parser.add_argument(
+        "--dir",
+        metavar="DIR",
+        dest="directory",
+        help=f"scan every {_DIR_GLOB} file in DIR (non-recursive)",
     )
     parser.add_argument(
         "--check",
@@ -82,30 +99,118 @@ def _render_text(result: dict) -> str:
     return "\n".join(lines)
 
 
+def _render_multi_text(results: list[dict]) -> str:
+    """Render a compact per-file summary for batch scans."""
+    lines: list[str] = []
+    total = sum(r["summary"]["total"] for r in results)
+    lines.append(
+        f"ferryman {__version__} -- {len(results)} file(s), {total} finding(s) total"
+    )
+    for result in results:
+        lines.append("")
+        lines.append(_render_text(result))
+    return "\n".join(lines)
+
+
+def _attribute_findings(result: dict) -> list[Finding]:
+    """Rebuild Findings from a result, prefixing the file into each location.
+
+    For the combined h1md report we lose the per-file JSON envelope, so we fold
+    the source file into every finding's location field to preserve attribution.
+    """
+    file = result["file"]
+    attributed: list[Finding] = []
+    for f in result["findings"]:
+        data = dict(f)
+        loc = data.get("location")
+        data["location"] = f"{file}: {loc}" if loc else file
+        attributed.append(Finding(**data))
+    return attributed
+
+
+def _collect_inputs(args: argparse.Namespace) -> tuple[list[Path], str | None]:
+    """Resolve the list of files to scan from positional args and/or --dir.
+
+    Returns (paths, error). On error, paths is empty and error is a message.
+    """
+    paths: list[Path] = [Path(p) for p in args.inputs]
+
+    if args.directory is not None:
+        directory = Path(args.directory)
+        if not directory.is_dir():
+            return [], f"ferryman: not a directory: {args.directory}"
+        # Sorted for deterministic output ordering across runs.
+        paths.extend(sorted(directory.glob(_DIR_GLOB)))
+
+    if not paths:
+        if args.directory is not None:
+            return [], (
+                f"ferryman: no {_DIR_GLOB} files found in directory: "
+                f"{args.directory}"
+            )
+        return [], "ferryman: no input file given (provide a FILE or --dir DIR)"
+
+    return paths, None
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    path = Path(args.input)
-    if not path.is_file():
-        print(f"ferryman: cannot read file: {args.input}", file=sys.stderr)
+    paths, error = _collect_inputs(args)
+    if error is not None:
+        print(error, file=sys.stderr)
         return 3
 
-    try:
-        result = scan_file(path, args.check)
-    except OSError as exc:
-        print(f"ferryman: error reading {args.input}: {exc}", file=sys.stderr)
-        return 3
+    multi = len(paths) > 1 or args.directory is not None
 
-    if args.output_format == "json":
+    results: list[dict] = []
+    for path in paths:
+        if not path.is_file():
+            print(f"ferryman: cannot read file: {path}", file=sys.stderr)
+            return 3
+        try:
+            results.append(scan_file(path, args.check))
+        except OSError as exc:
+            print(f"ferryman: error reading {path}: {exc}", file=sys.stderr)
+            return 3
+
+    if not multi:
+        # Single-file mode: byte-identical to the pre-batch behaviour.
+        _emit_single(results[0], args.output_format)
+    else:
+        _emit_multi(results, args.output_format)
+
+    return 0
+
+
+def _emit_single(result: dict, output_format: str) -> None:
+    if output_format == "json":
         print(json.dumps(result, indent=2))
-    elif args.output_format == "h1md":
+    elif output_format == "h1md":
         findings = [Finding(**f) for f in result["findings"]]
         print(to_h1md(findings), end="")
     else:
         print(_render_text(result))
 
-    return 0
+
+def _emit_multi(results: list[dict], output_format: str) -> None:
+    if output_format == "json":
+        total = sum(r["summary"]["total"] for r in results)
+        envelope = {
+            "tool": "ferryman",
+            "version": __version__,
+            "files": results,
+            "summary": {"file_count": len(results), "total": total},
+        }
+        print(json.dumps(envelope, indent=2))
+    elif output_format == "h1md":
+        findings: list[Finding] = []
+        for result in results:
+            findings.extend(_attribute_findings(result))
+        print(to_h1md(findings), end="")
+    else:
+        print(_render_multi_text(results))
 
 
 if __name__ == "__main__":  # pragma: no cover

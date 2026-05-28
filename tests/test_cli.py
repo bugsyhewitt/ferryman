@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -73,3 +74,123 @@ def test_default_format_is_json(capsys, xxe_file):
     assert code == 0
     # Should parse as JSON by default.
     json.loads(out)
+
+
+def test_help_lists_dir_flag(capsys):
+    with pytest.raises(SystemExit):
+        main(["--help"])
+    out = capsys.readouterr().out
+    assert "--dir" in out
+    # The FILE metavar should now accept multiple paths.
+    assert "FILE" in out
+
+
+# --- Multi-file (POST_V01 Rank 7) ----------------------------------------
+
+
+def test_no_input_errors(capsys):
+    code, _ = run_cli(capsys, ["--check", "all"])
+    assert code == 3
+
+
+def test_multi_file_json_envelope(capsys, xxe_file, pii_file):
+    code, out = run_cli(
+        capsys, ["--check", "all", "--format", "json", str(xxe_file), str(pii_file)]
+    )
+    assert code == 0
+    data = json.loads(out)
+    # Multi-file mode wraps results in a {"files": [...]} envelope.
+    assert "files" in data
+    assert "findings" not in data  # not the single-file shape
+    assert data["summary"]["file_count"] == 2
+    assert len(data["files"]) == 2
+    files = {entry["file"] for entry in data["files"]}
+    assert str(xxe_file) in files and str(pii_file) in files
+    # Envelope total equals the sum of per-file totals.
+    per_file = sum(e["summary"]["total"] for e in data["files"])
+    assert data["summary"]["total"] == per_file
+    # Each per-file entry keeps the canonical single-file shape.
+    for entry in data["files"]:
+        assert entry["tool"] == "ferryman"
+        assert "findings" in entry and "summary" in entry
+
+
+def test_multi_file_text_per_file_summary(capsys, xxe_file, pii_file):
+    code, out = run_cli(
+        capsys, ["--check", "all", "--format", "text", str(xxe_file), str(pii_file)]
+    )
+    assert code == 0
+    assert "2 file(s)" in out
+    assert str(xxe_file) in out and str(pii_file) in out
+    assert "malformed/xxe" in out
+
+
+def test_multi_file_h1md_attributes_file(capsys, xxe_file, pii_file):
+    code, out = run_cli(
+        capsys, ["--check", "all", "--format", "h1md", str(xxe_file), str(pii_file)]
+    )
+    assert code == 0
+    assert out.startswith("# ferryman OFX findings")
+    # File attribution is folded into the location field of each finding.
+    assert str(xxe_file) in out
+    assert str(pii_file) in out
+
+
+def test_dir_mode_scans_all_ofx(capsys, tmp_path, xxe_file, pii_file):
+    # Copy two real fixtures plus a non-OFX file into a scratch directory.
+    (tmp_path / "a.ofx").write_bytes(xxe_file.read_bytes())
+    (tmp_path / "b.ofx").write_bytes(pii_file.read_bytes())
+    (tmp_path / "ignore.txt").write_text("not ofx")
+    code, out = run_cli(
+        capsys, ["--check", "all", "--format", "json", "--dir", str(tmp_path)]
+    )
+    assert code == 0
+    data = json.loads(out)
+    # Only the two .ofx files are scanned; the .txt is ignored.
+    assert data["summary"]["file_count"] == 2
+    scanned = {Path(e["file"]).name for e in data["files"]}
+    assert scanned == {"a.ofx", "b.ofx"}
+
+
+def test_dir_mode_is_always_envelope_even_for_one_file(capsys, tmp_path, xxe_file):
+    # A directory with a single match still uses the multi-file envelope,
+    # so scripts that pass --dir get a stable shape regardless of count.
+    (tmp_path / "only.ofx").write_bytes(xxe_file.read_bytes())
+    code, out = run_cli(
+        capsys, ["--check", "all", "--format", "json", "--dir", str(tmp_path)]
+    )
+    assert code == 0
+    data = json.loads(out)
+    assert "files" in data
+    assert data["summary"]["file_count"] == 1
+
+
+def test_dir_not_a_directory_errors(capsys, xxe_file):
+    code, _ = run_cli(capsys, ["--check", "all", "--dir", str(xxe_file)])
+    assert code == 3
+
+
+def test_empty_dir_errors(capsys, tmp_path):
+    code, _ = run_cli(capsys, ["--check", "all", "--dir", str(tmp_path)])
+    assert code == 3
+
+
+def test_multi_file_missing_one_errors(capsys, xxe_file):
+    code, _ = run_cli(
+        capsys, ["--check", "all", str(xxe_file), "does-not-exist.ofx"]
+    )
+    assert code == 3
+
+
+def test_dir_plus_positional_combine(capsys, tmp_path, xxe_file, pii_file):
+    (tmp_path / "in_dir.ofx").write_bytes(pii_file.read_bytes())
+    code, out = run_cli(
+        capsys,
+        ["--check", "all", "--format", "json", str(xxe_file), "--dir", str(tmp_path)],
+    )
+    assert code == 0
+    data = json.loads(out)
+    # Positional FILE plus --dir matches are merged.
+    assert data["summary"]["file_count"] == 2
+    names = {Path(e["file"]).name for e in data["files"]}
+    assert "in_dir.ofx" in names
