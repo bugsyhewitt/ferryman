@@ -48,6 +48,12 @@ def anomalous_amount_file() -> Path:
 
 
 @pytest.fixture
+def isin_file() -> Path:
+    """An investment statement leaking valid ISINs (ISO 6166) in free text."""
+    return FIXTURES / "isin-leak.ofx"
+
+
+@pytest.fixture
 def entity_bomb_file() -> Path:
     return FIXTURES / "entity-bomb.ofx"
 

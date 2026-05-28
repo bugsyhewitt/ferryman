@@ -53,8 +53,8 @@ ferryman [--check {malformed,pii,anomaly,all}] [--format {json,text,h1md,sarif}]
     injection / encoding mismatch, encoding tricks, oversized fields). Operates
     on raw bytes; never parses a hostile file.
   - `pii` &mdash; PII leaking into transaction free-text (SSN, payment-card
-    number, IBAN, account number, routing number), including investment memos and
-    security ids. Evidence is always redacted before it leaves the tool.
+    number, IBAN, ISIN, account number, routing number), including investment
+    memos and security ids. Evidence is always redacted before it leaves the tool.
   - `anomaly` &mdash; structurally valid but suspicious transactions
     (out-of-range dates; zero, sign-contradicting, or out-of-range transaction
     amounts; for investment statements, negative/implausible unit prices and
@@ -355,6 +355,41 @@ $ ferryman --check pii --format text leak.ofx
 
 **Remediation:** never echo a full IBAN into a statement export or transaction
 memo; mask all but the country code and the last few characters at the source.
+
+### ISIN leak detection
+
+An [ISIN](https://en.wikipedia.org/wiki/International_Securities_Identification_Number)
+(International Securities Identification Number, ISO&nbsp;6166) uniquely identifies a
+security &mdash; the value that legitimately belongs in an OFX investment `SECID`.
+When an ISIN instead leaks into a free-text **memo or transaction name**, it
+discloses exactly which securities a customer holds &mdash; a brokerage-account
+privacy leak that is reportable on its own in fintech bug-bounty programs. The
+**pii** check flags an `isin` finding (severity `high`) when a free-text field
+contains a string that clears **both** public gates:
+
+1. **shape** &mdash; exactly twelve characters: a two-letter country code (or `XS`
+   for international issues), a nine-character alphanumeric NSIN, and one trailing
+   decimal check digit;
+2. **check digit** &mdash; expanding each letter to its two-digit value
+   (`A`=10&hellip;`Z`=35) and applying the [Luhn](https://en.wikipedia.org/wiki/Luhn_algorithm)
+   (mod-10) checksum over the whole expanded string yields zero.
+
+Gating on the ISO&nbsp;6166 check digit mirrors the ABA, Luhn, and IBAN gates: a run
+that clears both is a near-certain real ISIN, while a coincidental alphanumeric
+blob fails the check digit with overwhelming probability and is left to the
+existing heuristics. The NSIN body and check digit never leave the tool &mdash;
+evidence is redacted to the two-letter country/issuer prefix (`USXXXXXXXXXX`). An
+ISIN sitting in its own `SECID` field is *not* flagged; only one bleeding into
+free text is.
+
+```bash
+$ ferryman --check pii --format text leak.ofx
+  [HIGH] pii/isin @ statement[0].transaction[0].memo: International Securities Identification Number (ISIN, valid ISO 6166 check digit) leaking into a free-text field.
+```
+
+**Remediation:** never echo a security's ISIN into a statement memo or
+transaction name; keep security identifiers in the structured `SECID` field where
+they belong.
 
 ## From finding to HackerOne report
 

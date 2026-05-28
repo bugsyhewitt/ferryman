@@ -15,6 +15,10 @@ Detection classes:
                                 whose country code, length, and mod-97 check
                                 digits all validate -- a near-certain
                                 international bank-account leak.
+- ``isin``                    : an International Securities Identification Number
+                                (ISO 6166) -- a 12-char country-code + NSIN +
+                                Luhn check digit -- whose check digit validates,
+                                a near-certain securities-holding leak.
 - ``account_number``          : a long account-number-shaped digit run leaking
                                 into a transaction name/memo.
 - ``routing_number``          : a 9-digit run that passes the ABA weighted
@@ -109,6 +113,15 @@ _IBAN_LENGTHS = {
 # Generic ISO 13616 bounds for country codes not in the registry table.
 _IBAN_MIN_LEN = 15
 _IBAN_MAX_LEN = 34
+
+# ISIN (ISO 6166) candidate: a 12-character run of two letters (country / "XS"
+# for international issues), nine alphanumeric NSIN characters, and one trailing
+# Luhn check digit. The run is bounded by a non-alphanumeric lookaround so an
+# ISIN embedded in a longer alphanumeric blob is not partially matched. The
+# caller validates the ISO 6166 check digit before reporting.
+_ISIN_RE = re.compile(r"(?<![A-Za-z0-9])[A-Z]{2}[A-Z0-9]{9}\d(?![A-Za-z0-9])")
+# ISINs are always exactly 12 characters.
+_ISIN_LEN = 12
 
 
 def _luhn_valid(digits: str) -> bool:
@@ -222,6 +235,48 @@ def _trim_to_valid_iban(candidate: str) -> str | None:
     return None
 
 
+def _isin_valid(candidate: str) -> bool:
+    """Return ``True`` if a string is a structurally valid ISIN (ISO 6166).
+
+    An ISIN (International Securities Identification Number) is the global
+    identifier for a security -- the value that legitimately lives in an OFX
+    investment ``SECID``. Its public, dependency-free check is::
+
+        1. Shape  -- exactly 12 characters: two letters (ISO 3166 country code,
+           or ``XS`` for international issues), nine alphanumeric NSIN
+           characters, and one trailing decimal check digit.
+        2. Check digit -- expand every letter to its two-digit value
+           (``A``=10 ... ``Z``=35), concatenate to a pure digit string, then
+           verify the whole string (check digit included) passes the Luhn
+           (mod-10) checksum.
+
+    A run that clears both gates is a near-certain real ISIN; a coincidental
+    alphanumeric blob fails the check digit with overwhelming probability. Any
+    malformed input returns ``False`` so the helper is safe to reuse.
+    """
+    isin = candidate.strip().upper()
+    if len(isin) != _ISIN_LEN:
+        return False
+    if not (isin[:2].isalpha() and isin[2:11].isalnum() and isin[11].isdigit()):
+        return False
+    # Expand letters to numbers, then Luhn over the whole (including check digit).
+    digits = "".join(
+        str(ord(ch) - 55) if ch.isalpha() else ch for ch in isin
+    )
+    return _luhn_valid(digits)
+
+
+def _redact_isin(isin: str) -> str:
+    """Redact an ISIN, preserving only the two-letter country/issuer prefix.
+
+    The leading two letters identify the jurisdiction (useful for a report)
+    while the NSIN body and check digit -- the part that pins the holding to a
+    specific security -- are masked.
+    """
+    isin = isin.upper()
+    return isin[:2] + "X" * (len(isin) - 2)
+
+
 def _redact_ssn(text: str) -> str:
     return _SSN_RE.sub("XXX-XX-XXXX", text)
 
@@ -308,6 +363,39 @@ def _scan_text(
                 "country/length/mod-97 checksum) leaking into a free-text field.",
                 location=location,
                 evidence=_redact_iban(candidate),
+            )
+        )
+
+    # ISINs (ISO 6166) -- check before the credit-card and account-number runs.
+    # An ISIN is a 12-char alphanumeric run that can embed a long digit tail the
+    # account / card scanners would otherwise misclassify. We gate on the exact
+    # 12-char shape AND the ISO 6166 Luhn check digit, so a coincidental
+    # alphanumeric blob is vanishingly unlikely to be reported.
+    for m in _ISIN_RE.finditer(text):
+        candidate = m.group(0)
+        if not _isin_valid(candidate):
+            continue
+        compact = candidate.upper()
+        key = ("isin", compact)
+        if key in seen:
+            continue
+        seen.add(key)
+        # Reserve any digit run inside the ISIN under the account/card/routing
+        # namespaces so the scanners below never re-report a slice of the same
+        # identifier as a separate finding.
+        for run in re.findall(r"\d+", compact):
+            seen.add(("account_number", run))
+            seen.add(("credit_card", run))
+            seen.add(("routing_number", run))
+        findings.append(
+            Finding(
+                check="pii",
+                type="isin",
+                severity="high",
+                message="International Securities Identification Number (ISIN, "
+                "valid ISO 6166 check digit) leaking into a free-text field.",
+                location=location,
+                evidence=_redact_isin(compact),
             )
         )
 
