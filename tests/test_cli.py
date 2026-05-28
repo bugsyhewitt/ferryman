@@ -194,3 +194,93 @@ def test_dir_plus_positional_combine(capsys, tmp_path, xxe_file, pii_file):
     assert data["summary"]["file_count"] == 2
     names = {Path(e["file"]).name for e in data["files"]}
     assert "in_dir.ofx" in names
+
+
+# --- Exit-code gating: --fail-on (POST_V01 Rank 8) -----------------------
+
+
+def test_help_lists_fail_on_flag(capsys):
+    with pytest.raises(SystemExit):
+        main(["--help"])
+    out = capsys.readouterr().out
+    assert "--fail-on" in out
+
+
+def test_no_fail_on_always_exits_zero_even_with_findings(capsys, xxe_file):
+    # Without --fail-on, a completed scan exits 0 regardless of findings,
+    # preserving the pre-Rank-8 contract.
+    code, out = run_cli(capsys, ["--check", "all", "--format", "json", str(xxe_file)])
+    assert code == 0
+    data = json.loads(out)
+    assert data["summary"]["total"] > 0  # the file genuinely has findings
+
+
+def test_fail_on_returns_one_when_threshold_met(capsys, xxe_file):
+    # The xxe fixture emits a high/critical malformed finding, so a high
+    # threshold must trip the gate -> exit 1.
+    code, out = run_cli(
+        capsys, ["--check", "all", "--format", "json", "--fail-on", "high", str(xxe_file)]
+    )
+    assert code == 1
+    # Output is still emitted in full -- only the exit code changed.
+    data = json.loads(out)
+    assert data["summary"]["total"] > 0
+
+
+def test_fail_on_critical_not_met_on_lower_findings(capsys, anomaly_file):
+    # Pick a threshold above every finding's severity in the file: gate must
+    # not trip, so we still exit 0.
+    code, out = run_cli(
+        capsys, ["--check", "all", "--format", "json", str(anomaly_file)]
+    )
+    assert code == 0
+    findings = json.loads(out)["findings"]
+    order = {s: i for i, s in enumerate(["info", "low", "medium", "high", "critical"])}
+    top = max((order[f["severity"]] for f in findings), default=-1)
+    # Choose a threshold strictly above the file's highest finding severity.
+    higher = ["info", "low", "medium", "high", "critical"][min(top + 1, 4)]
+    if top == 4:
+        pytest.skip("fixture already carries a critical finding")
+    code, _ = run_cli(
+        capsys, ["--check", "all", "--fail-on", higher, str(anomaly_file)]
+    )
+    assert code == 0
+
+
+def test_fail_on_info_trips_on_any_finding(capsys, pii_file):
+    # info is the lowest severity, so --fail-on info trips whenever there is
+    # at least one finding of any kind.
+    code, _ = run_cli(
+        capsys, ["--check", "all", "--fail-on", "info", str(pii_file)]
+    )
+    assert code == 1
+
+
+def test_fail_on_clean_file_exits_zero(capsys, clean_file):
+    # A clean file produces no findings, so even --fail-on info exits 0.
+    code, out = run_cli(
+        capsys, ["--check", "all", "--format", "json", "--fail-on", "info", str(clean_file)]
+    )
+    assert code == 0
+    assert json.loads(out)["summary"]["total"] == 0
+
+
+def test_fail_on_works_in_multi_file_mode(capsys, clean_file, xxe_file):
+    # A clean file and a malicious file together: the gate trips on the
+    # malicious one even though the clean one contributes nothing.
+    code, out = run_cli(
+        capsys,
+        ["--check", "all", "--format", "json", "--fail-on", "high", str(clean_file), str(xxe_file)],
+    )
+    assert code == 1
+    data = json.loads(out)
+    assert "files" in data  # full multi-file envelope still emitted
+
+
+def test_fail_on_text_format_still_gates(capsys, xxe_file):
+    # Exit-code gating is independent of output format.
+    code, out = run_cli(
+        capsys, ["--check", "all", "--format", "text", "--fail-on", "high", str(xxe_file)]
+    )
+    assert code == 1
+    assert "malformed/xxe" in out

@@ -42,7 +42,8 @@ Options:
 
 ```
 ferryman [--check {malformed,pii,anomaly,all}] [--format {json,text,h1md}]
-         [--dir DIR] FILE [FILE ...]
+         [--fail-on {info,low,medium,high,critical}] [--dir DIR]
+         FILE [FILE ...]
 ```
 
 - `--check` &mdash; which scan to run. Default `all`.
@@ -62,9 +63,40 @@ ferryman [--check {malformed,pii,anomaly,all}] [--format {json,text,h1md}]
   (HackerOne-flavored markdown).
 - `--dir DIR` &mdash; scan every `*.ofx` file in `DIR` (non-recursive). Can be
   combined with positional `FILE` arguments.
+- `--fail-on SEVERITY` &mdash; exit non-zero (`1`) when any finding is at or
+  above `SEVERITY` (`info`, `low`, `medium`, `high`, or `critical`). Opt-in: a
+  completed scan still exits `0` without this flag. Lets CI/CD pipelines gate on
+  findings (see below).
 
-Exit codes: `0` scan(s) completed, `2` usage error, `3` a file could not be
-read (or `--dir` matched no files).
+Exit codes: `0` scan(s) completed and no `--fail-on` threshold met, `1`
+`--fail-on` was set and a finding met or exceeded that severity, `2` usage
+error, `3` a file could not be read (or `--dir` matched no files).
+
+### Gating a pipeline on findings
+
+By default ferryman exits `0` on any completed scan, so chaining it before an
+upload would let a critical XXE through:
+
+```bash
+ferryman --check all statement.ofx && upload statement.ofx   # always uploads
+```
+
+`--fail-on` turns the scan into a gate. With `--fail-on high`, the chain only
+proceeds when the file has no `high` or `critical` findings:
+
+```bash
+ferryman --check all --fail-on high statement.ofx && upload statement.ofx
+```
+
+In a CI step, a non-zero exit fails the job:
+
+```yaml
+- name: Scan exported OFX for leaks and parser attacks
+  run: ferryman --check all --fail-on medium --dir ./exports/
+```
+
+The full report is still printed in every case &mdash; `--fail-on` changes only
+the exit code, never the output.
 
 ### Batch scanning many files
 
