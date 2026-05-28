@@ -136,7 +136,19 @@ value targets fintech bug-bounty programs run.
 
 ---
 
-## Rank 5 — OFX v1 SGML Header Injection Detection (medium signal, low effort)
+## Rank 5 — OFX v1 SGML Header Injection Detection (medium signal, low effort) — ✅ IMPLEMENTED (2026-05-28, Phase 2 Rotation 6)
+
+**Status:** Shipped. `checks/malformed.py` gained `_is_ofx_v1()`, `_split_header()`,
+and `_check_v1_header()`. For OFX v1 documents (those opening with `OFXHEADER:`),
+the check now: (a) flags a second `OFXHEADER:` block found in the body after the
+header/body separator as `header_injection` (high); (b) flags an `ENCODING` value
+outside `{USASCII, UTF-8, UNICODE}` or an unexpected non-numeric `CHARSET` as
+`encoding_mismatch` (medium); (c) flags non-printable control bytes inside the
+header section as `encoding_mismatch` (medium). v2 pure-XML files are excluded by
+the `_is_ofx_v1` guard, so no false positives there. Nine new unit tests cover the
+clean fixture, inline clean v1 headers, injected second header, disallowed and
+allowed encodings, odd/numeric charsets, control bytes, and the v2 exclusion. No
+new fixture file and no new dependencies.
 
 **What:** OFX v1 uses a plaintext header block (OFXHEADER, DATA, VERSION, ENCODING, CHARSET...)
 before the SGML body, separated by a blank line. A crafted file can smuggle a second header block

@@ -9,7 +9,8 @@ scanner that treats an OFX file as an attack surface and asks three questions:
 
 - **Is this file trying to attack the parser that reads it?** XXE entity
   declarations, recursive entity-expansion (Billion Laughs) DoS chains,
-  SGML/XML format confusion, encoding tricks, oversized fields.
+  CDATA-terminator injection, SGML/XML format confusion, OFX v1 header
+  injection / encoding mismatch, encoding tricks, oversized fields.
 - **Is this file leaking PII it should not?** SSNs, full account numbers, and
   routing numbers smuggled into free-text transaction names and memos.
 - **Is this file anomalous?** Out-of-range posting dates and other signs of
@@ -44,8 +45,9 @@ ferryman [--check {malformed,pii,anomaly,all}] [--format {json,text}] FILE
 
 - `--check` &mdash; which scan to run. Default `all`.
   - `malformed` &mdash; parser-confusion attacks (XXE, entity-expansion
-    "Billion Laughs" DoS, SGML/XML confusion, encoding tricks, oversized
-    fields). Operates on raw bytes; never parses a hostile file.
+    "Billion Laughs" DoS, CDATA injection, SGML/XML confusion, OFX v1 header
+    injection / encoding mismatch, encoding tricks, oversized fields). Operates
+    on raw bytes; never parses a hostile file.
   - `pii` &mdash; PII leaking into transaction free-text (SSN, account number,
     routing number), including investment memos and security ids. Evidence is
     always redacted before it leaves the tool.
@@ -116,6 +118,38 @@ $ ferryman --check malformed --format json entity-bomb.ofx
 
 **Remediation:** disable DTD/entity processing in the OFX/XML parser
 (`resolve_entities=False`, and reject documents containing a DOCTYPE).
+
+### OFX v1 SGML header injection / encoding mismatch
+
+OFX v1 files open with a plaintext header block (`OFXHEADER:`, `DATA:`,
+`VERSION:`, `ENCODING:`, `CHARSET:` …) terminated by a blank line, then the
+SGML body. ferryman scans that header block on the raw bytes for three
+parser-confusion vectors:
+
+- **`header_injection`** (severity `high`) &mdash; a **second** `OFXHEADER:`
+  block smuggled into the document body after the legitimate header/body
+  separator. A parser that re-reads headers can be steered to a different
+  encoding or version mid-stream &mdash; a header-injection / smuggling vector.
+- **`encoding_mismatch`** (severity `medium`) &mdash; an `ENCODING` value
+  outside the OFX-allowed set (`USASCII`, `UTF-8`, `UNICODE`) or a `CHARSET`
+  that is neither a numeric code page (e.g. `1252`) nor a recognised name.
+  A mismatched declaration provokes parser disagreement over how to decode the
+  body (e.g. declaring `UTF-8` over Windows-1252 bytes).
+- **`encoding_mismatch`** (severity `medium`) &mdash; a non-printable control
+  byte inside the header section, where only `KEY:VALUE` plaintext lines belong.
+
+These checks only fire on OFX v1 documents (those that open with `OFXHEADER:`);
+pure-XML OFX v2 files are not affected.
+
+```bash
+$ ferryman --check malformed --format text crafted-v1.ofx
+  [HIGH] malformed/header_injection @ line 12: A second OFX v1 SGML header block (OFXHEADER:) appears inside the document body ...
+  [MEDIUM] malformed/encoding_mismatch @ line 5: OFX v1 ENCODING header declares 'WINDOWS-1252', which is outside the OFX-allowed set ...
+```
+
+**Remediation:** parse the OFX v1 header block exactly once, reject any
+`OFXHEADER:` occurrence in the body, and validate `ENCODING`/`CHARSET` against
+the OFX-allowed set before decoding.
 
 ## From finding to HackerOne report
 

@@ -20,6 +20,11 @@ Detection classes:
                            which prematurely terminates the section and allows
                            injection of raw XML markup into the parsed output
                            (CVE-2026-34601 / xmldom class of vulnerability).
+- ``header_injection``   : a second OFX v1 SGML header block smuggled into the
+                           document after the legitimate header/body separator.
+- ``encoding_mismatch``  : an OFX v1 header declaring an ENCODING/CHARSET value
+                           outside the OFX-allowed set, or carrying non-printable
+                           bytes in the header section -- a parser-confusion vector.
 """
 
 from __future__ import annotations
@@ -60,6 +65,19 @@ _SGML_MARKER_RE = re.compile(rb"OFXHEADER\s*:|DATA\s*:\s*OFXSGML", re.IGNORECASE
 # Tag value = text between a closing '>' and the next opening '<'.
 _FIELD_VALUE_RE = re.compile(rb">([^<]+)<")
 
+# --- OFX v1 SGML header-block detection ---
+# An OFX v1 file opens with a plaintext header block of ``KEY:VALUE`` lines,
+# then a blank line, then the SGML body. The first header key is OFXHEADER.
+_OFXHEADER_RE = re.compile(rb"^OFXHEADER\s*:", re.IGNORECASE | re.MULTILINE)
+# A header line: KEY:VALUE with an all-caps/alpha key.
+_HEADER_LINE_RE = re.compile(
+    rb"^([A-Za-z][A-Za-z0-9_]*)[ \t]*:[ \t]*(.*?)[ \t]*$", re.MULTILINE
+)
+# OFX v1 permits only these ENCODING values; CHARSET is a code-page number
+# (e.g. 1252, NONE) or USASCII. Anything else is suspicious.
+_ALLOWED_ENCODINGS = {b"USASCII", b"UTF-8", b"UNICODE"}
+_ALLOWED_CHARSETS = {b"1252", b"NONE", b"ISO-8859-1", b"CSUNICODE", b"NONE"}
+
 
 def _line_of(raw: bytes, index: int) -> int:
     """1-based line number of a byte offset, for finding locations."""
@@ -92,6 +110,146 @@ def _has_nested_entity_reference(raw: bytes) -> bool:
             if ref.group(1).lower() in decls:
                 return True
     return False
+
+
+def _is_ofx_v1(raw: bytes) -> bool:
+    """True if the document opens with an OFX v1 SGML header block.
+
+    We look only at the leading bytes: a v1 file starts (after any whitespace)
+    with the ``OFXHEADER:`` line. v2 files begin with an XML prolog or
+    ``<OFX>`` directly. This is a cheap structural check, never a parse.
+    """
+    head = raw[:512].lstrip()
+    return bool(re.match(rb"OFXHEADER\s*:", head, re.IGNORECASE))
+
+
+def _split_header(raw: bytes) -> tuple[bytes, int]:
+    """Return (header_block_bytes, body_offset) for an OFX v1 document.
+
+    The header block is everything before the first blank line (``\\n\\n`` or
+    ``\\r\\n\\r\\n``). ``body_offset`` is the byte index where the SGML body
+    begins. If no separator is found, the whole document is treated as header
+    and ``body_offset`` is ``len(raw)``.
+    """
+    for sep in (b"\r\n\r\n", b"\n\n"):
+        idx = raw.find(sep)
+        if idx != -1:
+            return raw[:idx], idx + len(sep)
+    return raw, len(raw)
+
+
+def _check_v1_header(raw: bytes) -> list[Finding]:
+    """Detect OFX v1 SGML header-injection and encoding-mismatch attacks.
+
+    Three sub-detections (Rank 5 of POST_V01.md):
+      (a) a second ``OFXHEADER:`` block smuggled into the body after the
+          header/body separator -> ``header_injection`` (high).
+      (b) an ENCODING/CHARSET value outside the OFX-allowed set
+          -> ``encoding_mismatch`` (medium).
+      (c) non-printable control bytes inside the header section
+          -> ``encoding_mismatch`` (medium).
+    """
+    if not _is_ofx_v1(raw):
+        return []
+
+    findings: list[Finding] = []
+    header, body_offset = _split_header(raw)
+    body = raw[body_offset:]
+
+    # (a) Second header block smuggled into the body. A legitimate v1 file has
+    # exactly one OFXHEADER: line, in the leading header block. Any OFXHEADER:
+    # occurrence in the body is an injected second header.
+    body_header = _OFXHEADER_RE.search(body)
+    if body_header is not None:
+        abs_idx = body_offset + body_header.start()
+        findings.append(
+            Finding(
+                check="malformed",
+                type="header_injection",
+                severity="high",
+                message=(
+                    "A second OFX v1 SGML header block (OFXHEADER:) appears "
+                    "inside the document body, after the header/body separator. "
+                    "A parser that re-reads headers can be steered to a different "
+                    "encoding or version mid-stream -- a header-injection / "
+                    "request-smuggling vector."
+                ),
+                location=f"line {_line_of(raw, abs_idx)}",
+                evidence=truncate_evidence(
+                    body[body_header.start() : body_header.start() + 40].decode(
+                        "latin-1"
+                    )
+                ),
+            )
+        )
+
+    # (c) Non-printable control bytes in the header section. The header is
+    # plaintext KEY:VALUE lines; the only legitimate control characters are
+    # CR and LF. NUL is handled separately as encoding_trick; here we catch the
+    # broader control-byte class confined to the header (a desync attempt).
+    for i, b in enumerate(header):
+        if b < 0x20 and b not in (0x09, 0x0A, 0x0D):
+            findings.append(
+                Finding(
+                    check="malformed",
+                    type="encoding_mismatch",
+                    severity="medium",
+                    message=(
+                        "Non-printable control byte found inside the OFX v1 "
+                        "header section. Headers are plaintext KEY:VALUE lines; "
+                        "control bytes here are an encoding-confusion attempt to "
+                        "desync parsers."
+                    ),
+                    location=f"byte {i} (line {_line_of(raw, i)})",
+                    metadata={"byte_value": b},
+                )
+            )
+            break
+
+    # (b) ENCODING / CHARSET value outside the OFX-allowed set. Parse the
+    # header lines structurally (no semantic parse of the document).
+    for m in _HEADER_LINE_RE.finditer(header):
+        key = m.group(1).upper()
+        value = m.group(2).strip()
+        if key == b"ENCODING" and value and value.upper() not in _ALLOWED_ENCODINGS:
+            findings.append(
+                Finding(
+                    check="malformed",
+                    type="encoding_mismatch",
+                    severity="medium",
+                    message=(
+                        f"OFX v1 ENCODING header declares '{value.decode('latin-1')}', "
+                        "which is outside the OFX-allowed set (USASCII, UTF-8, "
+                        "UNICODE). A mismatched encoding declaration provokes "
+                        "parser disagreement over how to decode the body."
+                    ),
+                    location=f"line {_line_of(raw, m.start())}",
+                    evidence=truncate_evidence(m.group(0).decode("latin-1")),
+                )
+            )
+        elif (
+            key == b"CHARSET"
+            and value
+            and value.upper() not in _ALLOWED_CHARSETS
+            and not value.isdigit()
+        ):
+            findings.append(
+                Finding(
+                    check="malformed",
+                    type="encoding_mismatch",
+                    severity="medium",
+                    message=(
+                        f"OFX v1 CHARSET header declares '{value.decode('latin-1')}', "
+                        "an unexpected value. Legitimate OFX uses a numeric code "
+                        "page (e.g. 1252) or NONE; an odd CHARSET is a parser-"
+                        "confusion vector."
+                    ),
+                    location=f"line {_line_of(raw, m.start())}",
+                    evidence=truncate_evidence(m.group(0).decode("latin-1")),
+                )
+            )
+
+    return findings
 
 
 def check_malformed(raw: bytes) -> list[Finding]:
@@ -315,5 +473,8 @@ def check_malformed(raw: bytes) -> list[Finding]:
                 )
             )
             break  # one finding is sufficient to flag the file
+
+    # --- OFX v1 SGML header injection / encoding mismatch (Rank 5) ---
+    findings.extend(_check_v1_header(raw))
 
     return findings
