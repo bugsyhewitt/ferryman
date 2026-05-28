@@ -8,7 +8,12 @@ from __future__ import annotations
 
 import pytest
 
-from ferryman.checks.pii import _aba_checksum_valid, _luhn_valid, check_pii
+from ferryman.checks.pii import (
+    _aba_checksum_valid,
+    _iban_valid,
+    _luhn_valid,
+    check_pii,
+)
 
 # Real, in-circulation ABA routing numbers (public information). Each must
 # pass the weighted 3-7-1 checksum.
@@ -230,3 +235,125 @@ def test_credit_card_leak_fixture(credit_card_file):
 def test_clean_file_no_credit_card(clean_file):
     findings = check_pii(clean_file.read_bytes())
     assert "credit_card" not in {f.type for f in findings}
+
+
+# --- IBAN detection (mod-97, country/length gated) ---
+
+# Published example / test IBANs from the ISO 13616 registry. All valid.
+VALID_IBANS = [
+    "DE89370400440532013000",         # Germany (22)
+    "GB82WEST12345698765432",         # United Kingdom (22)
+    "FR1420041010050500013M02606",    # France (27, alphanumeric BBAN)
+    "NL91ABNA0417164300",             # Netherlands (18)
+    "BE68539007547034",               # Belgium (16)
+    "CH9300762011623852957",          # Switzerland (21)
+    "NO9386011117947",                # Norway (15, shortest)
+    "MT84MALT011000012345MTLCAST001S",  # Malta (31, near longest)
+]
+
+# Strings shaped like an IBAN but failing one of the three gates -- they must
+# NOT be reported as IBANs.
+INVALID_IBANS = [
+    "DE89370400440532013001",   # valid shape/length, wrong mod-97 check digit
+    "GB00WEST12345698765432",   # check digits 00 -- fails mod-97
+    "DE8937040044053201300",    # one char short for DE -- length gate
+    "DE893704004405320130000",  # one char long for DE -- length gate
+    "XX001234567890123456",     # unknown country + bad checksum
+    "1234567890123456789",      # no country code at all
+]
+
+
+@pytest.mark.parametrize("iban", VALID_IBANS)
+def test_iban_accepts_real_ibans(iban):
+    assert _iban_valid(iban) is True
+
+
+@pytest.mark.parametrize("iban", INVALID_IBANS)
+def test_iban_rejects_invalid(iban):
+    assert _iban_valid(iban) is False
+
+
+@pytest.mark.parametrize("bad", ["", "DE", "DE89", "  ", "DE89ABC", "de89!!!!"])
+def test_iban_rejects_garbage(bad):
+    # Defensive: malformed / too-short input is never a valid IBAN.
+    assert _iban_valid(bad) is False
+
+
+def test_iban_lowercase_and_spaced_accepted():
+    # IBANs are case-insensitive and often presented in groups of four.
+    assert _iban_valid("de89 3704 0044 0532 0130 00") is True
+
+
+def test_iban_unspaced_detected():
+    findings = _scan("wire to DE89370400440532013000 please")
+    ibans = [f for f in findings if f.type == "iban"]
+    assert len(ibans) == 1
+    assert ibans[0].severity == "high"
+    assert ibans[0].check == "pii"
+    # The raw account portion never leaves the scanner.
+    assert "370400440532013000" not in (ibans[0].evidence or "")
+    # The country code survives for triage.
+    assert (ibans[0].evidence or "").startswith("DE")
+
+
+def test_iban_spaced_detected():
+    findings = _scan("counterparty DE89 3704 0044 0532 0130 00 on file")
+    ibans = [f for f in findings if f.type == "iban"]
+    assert len(ibans) == 1
+    assert ibans[0].severity == "high"
+    # Spaced presentation keeps its grouping but redacts the digits.
+    assert "3704" not in (ibans[0].evidence or "")
+
+
+def test_iban_not_double_counted_as_account_number():
+    # A valid IBAN embeds long digit runs; they must NOT also surface as a
+    # separate account_number / routing_number / credit_card finding.
+    findings = _scan("IBAN DE89370400440532013000 here")
+    types = [f.type for f in findings]
+    assert types.count("iban") == 1
+    assert "account_number" not in types
+    assert "routing_number" not in types
+    assert "credit_card" not in types
+
+
+def test_invalid_iban_not_reported():
+    # A bad-checksum IBAN-shaped run must NOT be reported as an IBAN. (Its digit
+    # run is glued to the country-code letters, so it is not a word-bounded
+    # account-number run either -- the existing account heuristic is unaffected.)
+    findings = _scan("ref DE89370400440532013001 logged")
+    types = {f.type for f in findings}
+    assert "iban" not in types
+
+
+def test_iban_does_not_swallow_following_account_number():
+    # A spaced IBAN followed by a separate account-number run: the trailing run
+    # is not absorbed into the IBAN and still surfaces on its own.
+    findings = _scan("DE89 3704 0044 0532 0130 00 then acct 12345678 ok")
+    types = [f.type for f in findings]
+    assert types.count("iban") == 1
+    assert "account_number" in types
+
+
+def test_same_iban_deduped_per_field():
+    findings = _scan("DE89370400440532013000 aka de89 3704 0044 0532 0130 00")
+    ibans = [f for f in findings if f.type == "iban"]
+    assert len(ibans) == 1
+
+
+def test_iban_leak_fixture(iban_file):
+    findings = check_pii(iban_file.read_bytes())
+    ibans = [f for f in findings if f.type == "iban"]
+    types = {f.type for f in findings}
+    assert "iban" in types, f"expected iban, got: {types}"
+    # The fixture leaks a German IBAN (spaced) and a UK IBAN; the XX value is a
+    # bad-checksum decoy that must NOT be reported as an IBAN.
+    assert len(ibans) == 2
+    assert all(i.severity == "high" for i in ibans)
+    for i in ibans:
+        # No raw account digits remain in the evidence.
+        assert "X" in (i.evidence or "")
+
+
+def test_clean_file_no_iban(clean_file):
+    findings = check_pii(clean_file.read_bytes())
+    assert "iban" not in {f.type for f in findings}
