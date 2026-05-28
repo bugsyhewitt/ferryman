@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from ferryman.checks.pii import _aba_checksum_valid, check_pii
+from ferryman.checks.pii import _aba_checksum_valid, _luhn_valid, check_pii
 
 # Real, in-circulation ABA routing numbers (public information). Each must
 # pass the weighted 3-7-1 checksum.
@@ -123,3 +123,110 @@ def test_nine_digit_run_not_double_counted_as_account_number():
 def test_clean_file_no_pii(clean_file):
     findings = check_pii(clean_file.read_bytes())
     assert findings == [], f"clean file should have no PII findings, got: {findings}"
+
+
+# --- Credit-card / PAN detection (Luhn-gated) ---
+
+# Well-known network test PANs -- all pass the Luhn checksum.
+VALID_PANS = [
+    "4111111111111111",  # Visa test number (16)
+    "4012888888881881",  # Visa test number (16)
+    "5500005555555559",  # Mastercard test number (16)
+    "5105105105105100",  # Mastercard test number (16)
+    "340000000000009",   # Amex test number (15)
+    "6011000000000004",  # Discover test number (16)
+    "4222222222222",     # Visa test number (13)
+]
+
+# 13-19 digit runs that FAIL Luhn -- coincidental long digit blobs a memo might
+# carry (order ids, padded account numbers) that must not be called a card.
+INVALID_PANS = [
+    "4111111111111112",  # one off a real Visa test PAN
+    "1234567890123456",  # sequential 16-digit run
+    "0000000000000001",  # arbitrary 16-digit run
+]
+
+
+@pytest.mark.parametrize("pan", VALID_PANS)
+def test_luhn_accepts_real_card_numbers(pan):
+    assert _luhn_valid(pan) is True
+
+
+@pytest.mark.parametrize("pan", INVALID_PANS)
+def test_luhn_rejects_non_card_runs(pan):
+    assert _luhn_valid(pan) is False
+
+
+@pytest.mark.parametrize("bad", ["", "abc", "41111111111111a", "4111 1111"])
+def test_luhn_rejects_non_numeric(bad):
+    # Defensive: separators / letters are never valid -- the caller strips
+    # separators before calling, so this guards reuse of the helper.
+    assert _luhn_valid(bad) is False
+
+
+def test_credit_card_unspaced_detected():
+    findings = _scan("refund to card 4111111111111111 today")
+    cards = [f for f in findings if f.type == "credit_card"]
+    assert len(cards) == 1
+    assert cards[0].severity == "critical"
+    assert cards[0].check == "pii"
+    # The raw PAN never leaves the scanner.
+    assert "4111111111111111" not in (cards[0].evidence or "")
+    # A Luhn-valid card must NOT also be reported as a plain account number.
+    assert "account_number" not in {f.type for f in findings}
+
+
+def test_credit_card_spaced_and_dashed_detected():
+    for text in (
+        "card 4111 1111 1111 1111 on file",
+        "card 4111-1111-1111-1111 on file",
+    ):
+        cards = [f for f in _scan(text) if f.type == "credit_card"]
+        assert len(cards) == 1, f"expected one card for {text!r}"
+        assert cards[0].severity == "critical"
+        # Evidence keeps the separators visible but redacts the digits.
+        assert "1111" not in (cards[0].evidence or "")
+
+
+def test_same_card_two_formats_deduped_per_field():
+    # The same PAN written spaced and unspaced in one field is one finding.
+    findings = _scan("card 4111 1111 1111 1111 aka 4111111111111111")
+    cards = [f for f in findings if f.type == "credit_card"]
+    assert len(cards) == 1
+
+
+def test_luhn_failing_run_falls_through_to_account_number():
+    # A 16-digit run that fails Luhn is not a card; it still surfaces as an
+    # account-number-shaped leak (the existing 8+-digit heuristic).
+    findings = _scan("ref 1234567890123456 logged")
+    types = {f.type for f in findings}
+    assert "credit_card" not in types
+    assert "account_number" in types
+
+
+def test_short_run_not_treated_as_card():
+    # A 12-digit run is below the 13-digit card floor -- account number only.
+    findings = _scan("order 123456789012 confirmed")
+    types = {f.type for f in findings}
+    assert "credit_card" not in types
+    assert "account_number" in types
+
+
+def test_credit_card_leak_fixture(credit_card_file):
+    findings = check_pii(credit_card_file.read_bytes())
+    types = {f.type for f in findings}
+    assert "credit_card" in types, f"expected credit_card, got: {types}"
+    cards = [f for f in findings if f.type == "credit_card"]
+    # Two transactions leak Luhn-valid PANs (one spaced+dashed across name/memo
+    # that dedupes to one, plus the Mastercard test number in the second tx).
+    assert all(c.severity == "critical" for c in cards)
+    for c in cards:
+        # No raw card digits anywhere in the evidence.
+        assert not any(ch.isdigit() for ch in (c.evidence or "")) or "X" in (
+            c.evidence or ""
+        )
+
+
+def test_clean_file_no_credit_card(clean_file):
+    findings = check_pii(clean_file.read_bytes())
+    assert "credit_card" not in {f.type for f in findings}

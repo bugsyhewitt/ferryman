@@ -11,8 +11,9 @@ scanner that treats an OFX file as an attack surface and asks three questions:
   declarations, recursive entity-expansion (Billion Laughs) DoS chains,
   CDATA-terminator injection, SGML/XML format confusion, OFX v1 header
   injection / encoding mismatch, encoding tricks, oversized fields.
-- **Is this file leaking PII it should not?** SSNs, full account numbers, and
-  routing numbers smuggled into free-text transaction names and memos.
+- **Is this file leaking PII it should not?** SSNs, payment-card numbers
+  (PANs), full account numbers, and routing numbers smuggled into free-text
+  transaction names and memos.
 - **Is this file anomalous?** Out-of-range posting dates, zero / sign-flipped /
   out-of-range transaction amounts, and other signs of tampering or a backend
   that accepts garbage.
@@ -51,9 +52,9 @@ ferryman [--check {malformed,pii,anomaly,all}] [--format {json,text,h1md,sarif}]
     "Billion Laughs" DoS, CDATA injection, SGML/XML confusion, OFX v1 header
     injection / encoding mismatch, encoding tricks, oversized fields). Operates
     on raw bytes; never parses a hostile file.
-  - `pii` &mdash; PII leaking into transaction free-text (SSN, account number,
-    routing number), including investment memos and security ids. Evidence is
-    always redacted before it leaves the tool.
+  - `pii` &mdash; PII leaking into transaction free-text (SSN, payment-card
+    number, account number, routing number), including investment memos and
+    security ids. Evidence is always redacted before it leaves the tool.
   - `anomaly` &mdash; structurally valid but suspicious transactions
     (out-of-range dates; zero, sign-contradicting, or out-of-range transaction
     amounts; for investment statements, negative/implausible unit prices and
@@ -296,6 +297,31 @@ $ ferryman --check anomaly --format text crafted-amounts.ofx
 **Remediation:** validate `TRNAMT` against the declared transaction type's sign
 convention, reject zero-value postings, and bound the per-transaction magnitude
 before applying the amount to a balance.
+
+### Payment-card (PAN) leak detection
+
+A statement export should never carry a customer's full payment-card number, yet
+a backend that echoes order or billing data into a transaction memo can leak one.
+The **pii** check flags a `credit_card` finding (severity `critical`, PCI-DSS
+sensitive) when a free-text field contains a **13&ndash;19 digit** run &mdash;
+written plainly or in the conventional groups separated by spaces or hyphens
+&mdash; that passes the [Luhn](https://en.wikipedia.org/wiki/Luhn_algorithm)
+mod-10 checksum every major card network uses.
+
+Gating on Luhn mirrors the ABA-checksum gate on routing numbers: a 16-digit run
+that passes Luhn is a near-certain real PAN, while one that fails is almost
+always a coincidental digit blob (a long order id or padded account number) and
+falls through to the existing `account_number` heuristic instead of crying
+"credit card." As always, the raw number never leaves the tool &mdash; evidence
+is redacted to the card's shape (`XXXX XXXX XXXX XXXX`).
+
+```bash
+$ ferryman --check pii --format text leak.ofx
+  [CRITICAL] pii/credit_card @ statement[0].transaction[0].name (fitid 0001): Payment-card number (passing the Luhn checksum) leaking into a free-text field -- PCI-DSS sensitive.
+```
+
+**Remediation:** never write a full PAN into a statement export; mask all but the
+last four digits (`**** **** **** 1111`) at the source, per PCI-DSS.
 
 ## From finding to HackerOne report
 
