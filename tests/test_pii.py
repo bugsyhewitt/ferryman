@@ -25,6 +25,7 @@ from ferryman.checks.pii import (
     _kr_rrn_valid,
     _lei_valid,
     _luhn_valid,
+    _no_fnr_valid,
     _redact_email,
     _sedol_valid,
     _th_natid_valid,
@@ -2867,3 +2868,186 @@ def test_tr_tckn_leak_fixture(tr_tckn_file):
 def test_clean_file_no_tr_tckn(clean_file):
     findings = check_pii(clean_file.read_bytes())
     assert "tr_tckn" not in {f.type for f in findings}
+
+
+# --- Norwegian fødselsnummer (national identity number) ---------------------
+
+# Each VALID_NO_FNR value is a structurally complete 11-digit fødselsnummer:
+# a real DDMMYY birth date, an individual / century-encoding number, and two
+# trailing mod-11 weighted check digits that both verify (these are synthetic,
+# fictitious numbers constructed only to satisfy the public dual checksum, not
+# real fødselsnummer of identified people). INVALID_NO_FNR collects near-miss
+# tokens that must fail the validator.
+VALID_NO_FNR = [
+    "11037543251",  # DDMMYY=11/03/75, ind=432, k1=5, k2=1
+    "15059011089",  # DDMMYY=15/05/90, ind=110, k1=8, k2=9
+    "23046032179",  # DDMMYY=23/04/60, ind=321, k1=7, k2=9
+    "01010100050",  # DDMMYY=01/01/01, ind=000, k1=5, k2=0 (leading zero OK)
+    "11037510035",  # DDMMYY=11/03/75, ind=100, k1=3, k2=5
+]
+
+INVALID_NO_FNR = [
+    "11037543252",  # wrong k2 (expected 1, given 2)
+    "11037543241",  # wrong k1 (expected 5, given 4)
+    "00000000000",  # zero day AND zero month -- date fails
+    "32010100000",  # day=32 -- impossible date
+    "01130100000",  # month=13 -- impossible date
+    "12345678950",  # synthetic TCKN -- date 12/34 fails, dual mod-11 too
+    "98765432150",  # synthetic TCKN -- month 76 fails
+    "11111111111",  # repeated digit -- both checksums fail
+]
+
+
+@pytest.mark.parametrize("code", VALID_NO_FNR)
+def test_no_fnr_accepts_real_structure(code):
+    assert _no_fnr_valid(code) is True
+
+
+@pytest.mark.parametrize("code", INVALID_NO_FNR)
+def test_no_fnr_rejects_invalid(code):
+    assert _no_fnr_valid(code) is False
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "",
+        "  ",
+        "1103754325",       # 10 digits -- too short
+        "110375432510",     # 12 digits -- too long
+        "1103754325a",      # non-digit character
+        "11-03-75-43251",   # hyphenated -- not the canonical contiguous form
+        "abcdefghijk",      # all letters
+    ],
+)
+def test_no_fnr_rejects_garbage(bad):
+    # Defensive: empty / wrong-length / non-numeric input is never a valid
+    # fødselsnummer.
+    assert _no_fnr_valid(bad) is False
+
+
+def test_no_fnr_in_memo_detected():
+    findings = _scan("Verified holder fnr 11037543251 on file")
+    codes = [f for f in findings if f.type == "no_fnr"]
+    assert len(codes) == 1
+    assert codes[0].severity == "high"
+    assert codes[0].check == "pii"
+    # Only the birth-month pair survives for triage; the rest is masked.
+    assert codes[0].evidence == "XX03XXXXXXX"
+
+
+def test_no_fnr_redaction_masks_identity():
+    findings = _scan("Co-signer 23046032179 logged")
+    codes = [f for f in findings if f.type == "no_fnr"]
+    assert len(codes) == 1
+    assert codes[0].evidence == "XX04XXXXXXX"
+    # The full number, the day digits, year digits, individual number, and
+    # both check digits never leave the tool.
+    assert "23046032179" not in codes[0].evidence
+    assert "230460" not in codes[0].evidence
+    assert "32179" not in codes[0].evidence
+
+
+def test_no_fnr_wrong_check_digit_not_reported_as_fnr():
+    # An 11-digit token with a wrong check digit fails the gate and is NOT a
+    # fødselsnummer finding; the contiguous run still falls through to the
+    # account-number scanner, which is the correct downgraded classification.
+    findings = _scan("decoy reference 11037543252 ignored")
+    types = {f.type for f in findings}
+    assert "no_fnr" not in types
+    assert "account_number" in types
+
+
+def test_no_fnr_bad_date_not_reported():
+    # A token whose embedded birth date is impossible is never a live
+    # fødselsnummer; the validator rejects it and the run falls through to
+    # the account-number scanner.
+    findings = _scan("decoy reference 32130100000 ignored")
+    assert "no_fnr" not in {f.type for f in findings}
+
+
+def test_no_fnr_does_not_collide_with_digit_scanners():
+    # Like the TCKN, the 11-digit fødselsnummer run would otherwise be
+    # claimed by the account-number scanner. The reservation guarantees it is
+    # reported once, as a fødselsnummer, and never also as an account number
+    # or a card or a routing number. (The card scanner's 13-digit floor sits
+    # above the 11-digit window, so no card collision is possible.)
+    findings = _scan("paid holder 11037543251 today")
+    types = [f.type for f in findings]
+    assert types.count("no_fnr") == 1
+    assert "account_number" not in types
+    assert "credit_card" not in types
+    assert "routing_number" not in types
+
+
+def test_no_fnr_does_not_collide_with_tckn():
+    # The Norwegian scan runs BEFORE the Turkish scan; a fødselsnummer is
+    # never re-reported as a TCKN. (The two dual-checksum gates are
+    # independent, so a random 11-digit run passing both is astronomical,
+    # but the reservation keeps the no-double-counting guarantee explicit.)
+    findings = _scan("holder 11037543251 today")
+    types = [f.type for f in findings]
+    assert "no_fnr" in types
+    assert "tr_tckn" not in types
+
+
+def test_no_fnr_does_not_break_tckn():
+    # A real TCKN must still be reported as a TCKN; the Norwegian scan above
+    # it must not accidentally swallow it.
+    findings = _scan("paid holder 12345678950 today")
+    types = [f.type for f in findings]
+    assert "tr_tckn" in types
+    assert "no_fnr" not in types
+
+
+def test_no_fnr_does_not_collide_with_hyphenated_detectors():
+    # The fødselsnummer is a contiguous 11-digit run; the hyphenated detectors
+    # all key off a hyphenated presentation, so neither side mis-classifies
+    # the other.
+    assert "no_fnr" not in {f.type for f in _scan("ssn 123-45-6789 here")}
+    assert "no_fnr" not in {f.type for f in _scan("rrn 900101-1123459 here")}
+    assert "no_fnr" not in {f.type for f in _scan("cpf 111.444.777-35 here")}
+
+
+def test_no_fnr_does_not_break_other_identifiers():
+    # The fødselsnummer scan must not interfere with other identifiers on
+    # their own.
+    card_findings = _scan("card 4111111111111111 today")
+    assert [f.type for f in card_findings] == ["credit_card"]
+    routing_findings = _scan("routing 121000248 today")
+    assert any(f.type == "routing_number" for f in routing_findings)
+
+
+def test_same_no_fnr_deduped_per_field():
+    findings = _scan(
+        "fnr 11037543251 and again 11037543251 in one memo"
+    )
+    codes = [f for f in findings if f.type == "no_fnr"]
+    assert len(codes) == 1
+
+
+def test_no_fnr_leak_fixture(no_fnr_file):
+    findings = check_pii(no_fnr_file.read_bytes())
+    codes = [f for f in findings if f.type == "no_fnr"]
+    types = {f.type for f in findings}
+    assert "no_fnr" in types, f"expected no_fnr, got: {types}"
+    # The fixture leaks two valid fødselsnummer in memos; the wrong-check-digit
+    # decoy (11037543252) must NOT be reported as a fødselsnummer. The decoy
+    # still falls through to the generic account-number scanner -- that is
+    # correct and the promised downgrade behaviour.
+    assert len(codes) == 2
+    assert all(c.severity == "high" for c in codes)
+    for c in codes:
+        assert c.evidence.startswith("XX")
+        assert c.evidence.endswith("XXXXXXX")
+        assert c.type == "no_fnr"
+    # The reservation guarantees the two valid fødselsnummer are never also
+    # reported as account numbers or as TCKNs.
+    month_pairs = {c.evidence[2:4] for c in codes}
+    assert month_pairs == {"03", "04"}
+    assert "tr_tckn" not in types
+
+
+def test_clean_file_no_no_fnr(clean_file):
+    findings = check_pii(clean_file.read_bytes())
+    assert "no_fnr" not in {f.type for f in findings}

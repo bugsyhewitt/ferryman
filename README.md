@@ -19,7 +19,8 @@ scanner that treats an OFX file as an attack surface and asks three questions:
   Mexican CLABE numbers, South Korean Giro numbers, Thai national IDs
   (PromptPay proxy ids), Brazilian CPFs (Pix keys), Mexican CURPs (population
   identity keys), South Korean RRNs (resident-registration identity numbers),
-  Turkish TCKNs (national identification numbers), full
+  Turkish TCKNs (national identification numbers), Norwegian fødselsnummer
+  (national identity numbers), full
   account numbers, and routing numbers smuggled into free-text transaction names
   and memos.
 - **Is this file anomalous?** Out-of-range posting dates, zero / sign-flipped /
@@ -64,7 +65,7 @@ ferryman [--check {malformed,pii,anomaly,all}] [--format {json,text,h1md,sarif}]
     ITIN, payment-card number, IBAN, ISIN, CUSIP, SEDOL, LEI, BIC/SWIFT, UK sort
     code, Canadian routing number, Australian BSB code, Indian IFSC code, Mexican
     CLABE, South Korean Giro number, Thai national ID, Brazilian CPF, Mexican
-    CURP, South Korean RRN, Turkish TCKN, account
+    CURP, South Korean RRN, Turkish TCKN, Norwegian fødselsnummer, account
     number, routing number), including investment memos and security ids.
     Evidence is always redacted before it leaves the tool.
   - `anomaly` &mdash; structurally valid but suspicious transactions
@@ -1106,6 +1107,64 @@ $ ferryman --check pii --format text leak.ofx
 
 **Remediation:** never echo a customer's TCKN into a statement memo or
 transaction name; keep national identification numbers in structured,
+access-controlled fields rather than free text.
+
+### Norwegian fødselsnummer leak detection
+
+A [Norwegian fødselsnummer](https://en.wikipedia.org/wiki/National_identification_number#Norway)
+is the 11-digit national identification number every Norwegian resident is
+issued &mdash; the master personal identifier keying banking, tax, healthcare,
+and government services. Like the Turkish TCKN, the South Korean RRN, the
+Mexican CURP, and the Brazilian CPF it is **identity** PII: a fødselsnummer
+echoed into free text discloses a named individual (and their exact birth
+date), not merely an account. Like the TCKN it has **no separator** in its
+canonical printed form: it is a contiguous 11-digit run `DDMMYYIIIIIKK` &mdash;
+a six-digit birth date, a three-digit individual / century-encoding number,
+and two trailing public mod-11 weighted check digits. A fødselsnummer echoed
+into a free-text **memo or transaction name** is a direct Norwegian
+identity-PII leak. The **pii** check flags a `no_fnr` finding (severity
+`high`) when a free-text token clears three public, dependency-free gates:
+
+1. **shape** &mdash; exactly 11 decimal digits.
+2. **real embedded birth date** &mdash; `DDMMYY` must parse as a valid
+   day-of-month and month-of-year (`01 <= DD <= 31`, `01 <= MM <= 12`). The
+   detector accepts the standard 1-31 / 1-12 ranges and does NOT enforce the
+   H-number / D-number birth-date offsets (a known Norwegian convention where
+   `+40` is added to `DD` for D-numbers or to `MM` for H-numbers) &mdash;
+   accepting only the canonical date is the higher-precision choice and
+   matches what an everyday Norwegian statement memo contains.
+3. **dual mod-11 weighted check digits** &mdash; the public fødselsnummer
+   algorithm derives both the tenth and the eleventh digits from the first
+   nine and the first ten respectively:
+   * `k1 = (11 - sum(d[i] * W1[i] for i in 0..8) mod 11) mod 11`, with
+     weights `W1 = (3,7,6,1,8,9,4,5,2)`.
+   * `k2 = (11 - sum(d[i] * W2[i] for i in 0..9) mod 11) mod 11`, with
+     weights `W2 = (5,4,3,2,7,6,5,4,3,2)`.
+
+   Both must match. The algorithm has no representation for a check digit of
+   `10`, so a candidate whose computed `k1` or `k2` is `10` is rejected
+   outright. Two independent mod-11 constraints on top of the date gate give
+   roughly a 1/1500 random-token pass rate &mdash; a tighter precision lever
+   than the TCKN's ~1/100 dual mod-10.
+
+Because the canonical fødselsnummer form is contiguous the detector cannot
+key off a distinctive structural shape the way the hyphenated UK sort code /
+Canadian routing / Thai national ID detectors do. The TCKN and CLABE solve
+the same problem by running before the generic account-number scanner and
+reserving the matched run; the Norwegian scan follows that pattern, and runs
+before the TCKN scan so the more structurally-constrained identifier claims
+the run first. The card scanner's 13-digit floor sits above the 11-digit
+window, so the two never overlap. Evidence is redacted to the two birth-month
+digits (`XX03XXXXXXX`); the day digits, year digits, individual number, and
+both check digits never leave the tool.
+
+```bash
+$ ferryman --check pii --format text leak.ofx
+  [HIGH] pii/no_fnr @ statement[0].transaction[0].memo: Norwegian fødselsnummer (valid 11-digit DDMMYYIIIIIKK structure, embedded birth date, and two mod-11 check digits) leaking into a free-text field -- discloses a named individual's identity and birth date.
+```
+
+**Remediation:** never echo a customer's fødselsnummer into a statement memo
+or transaction name; keep national identity numbers in structured,
 access-controlled fields rather than free text.
 
 ## From finding to HackerOne report

@@ -1411,6 +1411,99 @@ services, so a free-text TCKN echo is a reportable Turkish PII disclosure.
 
 ---
 
+## Rank 29 — Norwegian Fødselsnummer Leak Detection, 11-digit DDMMYYIIIIIKK structure + embedded birth date + dual mod-11 check-digit gated (HIGH signal, low effort) — ✅ IMPLEMENTED (2026-05-29, Phase 2 Rotation 31)
+
+**Pivot note:** Ranks 1–28 were all shipped. The R29 rotation brief named the
+**Argentine DNI** as the planned next national-ID candidate, with the
+**Norwegian fødselsnummer**, **Swedish personnummer**, and **Danish CPR** as
+fall-back alternatives — explicitly because the Argentine DNI was flagged for
+the same precision concern that deferred earlier checksum-less candidates. A
+fresh read of `checks/pii.py` confirmed none of `no_fnr`, `personnummer`, or
+`cpr` was present. The choice came down to ferryman's dominant precision
+criterion — **checksum distinctiveness**:
+
+- **Argentine DNI was rejected on the precision bar** (re-confirming the R28
+  deferral). A DNI is a 7–8-digit number with **no self-contained checksum**
+  — it can only be validated against RENAPER, an external registry. Its only
+  gates would be a length window on a contiguous digit run, which collides
+  head-on with the generic account-number scanner (`\d{8,}`) and gives no
+  arithmetic precision lever, the same low-distinctiveness problem that got
+  the Japanese Zengin code, the bare South African branch code, the Indonesian
+  NIK, the Russian INN, the Polish PESEL, and the Argentine DNI itself
+  rejected in earlier rotations.
+- **Danish CPR was rejected.** The historical mod-11 checksum was abolished
+  by Det Centrale Personregister in 2007 because the 10-digit space ran out
+  of checksum-valid numbers for the densest birth-date / sex combinations;
+  many CPRs issued after 2007 do **not** pass the mod-11 algorithm, so gating
+  on it would silently miss a meaningful slice of real leaks (false
+  *negatives*, which is worse than a false positive for a security tool).
+- **Swedish personnummer was rejected** as the weaker of the remaining two.
+  Its single Luhn check digit plus an embedded `YYMMDD` date is real
+  precision (about 1/100 random-token pass rate), but it is strictly weaker
+  than the Norwegian dual mod-11 + date gate (~1/1500). Identity-PII value is
+  comparable.
+- **Norwegian fødselsnummer was chosen.** It carries TWO public,
+  self-contained **mod-11 weighted check digits** on top of an embedded real
+  `DDMMYY` birth date, the same triple-gate pattern (shape + date + dual
+  checksum) the Brazilian CPF and Mexican CURP use, and the strongest
+  random-token rejection rate of the candidate set (~1/1500). It is also
+  direct identity PII — the value names the person's exact birth date, on a
+  par with the SSN, CPF, CURP, RRN, and TCKN ferryman already detects. It
+  clears the precision bar on shape + structural date + dual checksum,
+  strictly stronger than the checksum-less DNI and the post-2007-degraded
+  Danish CPR.
+
+**Status:** Shipped. `checks/pii.py` gained `_no_fnr_valid()` (gates on the
+exact 11-digit shape; a real embedded `DDMMYY` birth date — `1<=DD<=31`,
+`1<=MM<=12`, the canonical date only, not the H-/D-number `+40` offsets,
+which is the higher-precision choice for an everyday statement memo; and the
+two public mod-11 weighted check digits over `(3,7,6,1,8,9,4,5,2)` and
+`(5,4,3,2,7,6,5,4,3,2)`, with the standard "check-digit-of-10 means no valid
+number" rejection) and `_redact_no_fnr()` (evidence redacted to the two
+birth-month digits, `XX03XXXXXXX`). A new `no_fnr` (high) finding runs in
+`_scan_text` **before** the Turkish TCKN scan: both detectors share the
+contiguous 11-digit `_TR_TCKN_RE` candidate window, so the more
+structurally-constrained Norwegian identifier (date + dual mod-11) claims the
+run first. The Norwegian scan reserves the run under the `tr_tckn` /
+`credit_card` / `account_number` / `routing_number` dedupe namespaces so the
+same leak is never re-reported. The card scanner's 13-digit floor sits above
+the 11-digit window, so no card collision is possible. The chance of the same
+11-digit run passing both the Norwegian dual-mod-11 + date gate AND the
+Turkish dual-mod-10 gate is astronomical (~1/150 000), but the reservation
+keeps the no-double-counting guarantee explicit, exactly as the TCKN scan
+reserves against the account-number scan below it. An 11-digit token that
+fails the Norwegian gate falls through to the TCKN gate, and a TCKN-shaped
+token that also fails TCKN falls through to the account-number finding — so
+no leak is silently dropped. New fixture `tests/fixtures/no-fnr-leak.ofx`
+(two valid fødselsnummer in two memos + one wrong-second-check-digit
+`11037543252` decoy) plus 32 new test cases cover the validator (synthetic
+checksum-valid fødselsnummer, wrong-k1 / wrong-k2 / impossible-day /
+impossible-month / synthetic-TCKN / all-zeros / repeated-digit rejects,
+wrong-length / non-numeric / hyphenated garbage guards), free-text detection,
+redaction, the wrong-check-digit and bad-date non-detection guards, the
+no-collision-with-digit-scanners guarantee, the no-collision-with-TCKN
+guarantee (both directions), the no-collision-with-hyphenated-detectors
+guarantee, the no-interference-with-other-identifiers guard, per-field
+dedupe, the fixture, and the clean-file guard. README gained a Norwegian
+fødselsnummer section and the type lists were updated. The SARIF mapping
+auto-generates the `pii/no_fnr` rule with no changes. No new dependencies
+(stdlib `re` only). Full suite: 694 → 726 passing.
+
+**Research grounding:** Norwegian fødselsnummer (national identification
+number) administered by Skatteetaten — an 11-digit number written
+`DDMMYYIIIIIKK`: a six-digit birth date, a three-digit individual /
+century-encoding serial (encoding sex via the parity of the ninth digit), and
+two trailing mod-11 weighted check digits. The check-digit weights and
+formulas are publicly documented and dependency-free, ~15 lines of Python.
+The fødselsnummer is the master personal identifier in Norway, keying
+banking, tax, healthcare, and government services, so a free-text echo is a
+reportable Norwegian PII disclosure that names the individual and their exact
+birth date.
+
+**Estimated tokens:** 30–50K
+
+---
+
 ## Research notes
 
 **Sources consulted:**

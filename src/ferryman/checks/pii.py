@@ -159,6 +159,24 @@ Detection classes:
                                 other hyphenated detectors; the value encodes a
                                 named individual, so it is reported as an identity
                                 disclosure, not an account leak.
+- ``no_fnr``                  : a Norwegian fødselsnummer -- the 11-digit
+                                national identification number every
+                                Norwegian resident is issued, in its canonical
+                                ``DDMMYYIIIIIKK`` contiguous form (a six-digit
+                                birth date + a three-digit individual /
+                                century-encoding number + two trailing mod-11
+                                weighted check digits) -- whose embedded birth
+                                date and both check digits all validate, a
+                                near-certain Norwegian identity-PII leak. Like
+                                the Turkish TCKN the fødselsnummer is a
+                                contiguous 11-digit run; the Norwegian scan
+                                runs before the TCKN scan and reserves the run
+                                under the numeric namespaces so it is never
+                                also reported as an account number or a TCKN;
+                                the triple gate (shape + real birth date +
+                                dual mod-11) gives roughly a 1/1500
+                                random-token pass rate, a tighter precision
+                                lever than the TCKN's ~1/100.
 - ``tr_tckn``                 : a Turkish T.C. Kimlik Numarasi (TCKN) -- the
                                 11-digit national identification number every
                                 Turkish citizen carries -- whose non-zero leading
@@ -732,6 +750,26 @@ _KR_RRN_WEIGHTS = (2, 3, 4, 5, 6, 7, 8, 9, 2, 3, 4, 5)
 _TR_TCKN_RE = re.compile(r"(?<!\d)\d{11}(?!\d)")
 # A Turkish TCKN is exactly 11 digits.
 _TR_TCKN_LEN = 11
+
+# Norwegian fødselsnummer (national identity number): exactly 11 contiguous
+# decimal digits in the canonical printed form ``DDMMYYIIIIIKK`` (a six-digit
+# birth date, a three-digit individual / century-encoding number, and two
+# trailing public mod-11 weighted check digits). This is the same 11-digit
+# contiguous shape as the Turkish TCKN, so we share ``_TR_TCKN_RE``'s candidate
+# generation. The distinguishing precision comes from three independent gates
+# in the validator: a real embedded ``DDMMYY`` birth date, and two mod-11
+# weighted check digits. The Norwegian scan runs BEFORE the TCKN scan so the
+# more structurally-constrained identifier claims the run first; the chance of
+# the same 11-digit run passing both the Norwegian dual-mod-11 + birth-date
+# gate AND the Turkish dual checksum is astronomical, but defensive reservation
+# under the ``tr_tckn`` namespace keeps the no-double-counting guarantee
+# explicit.
+_NO_FNR_LEN = 11
+# Mod-11 weights for the first check digit (over d1..d9).
+_NO_FNR_K1_WEIGHTS = (3, 7, 6, 1, 8, 9, 4, 5, 2)
+# Mod-11 weights for the second check digit (over d1..d10, the first ten
+# digits including the first check digit).
+_NO_FNR_K2_WEIGHTS = (5, 4, 3, 2, 7, 6, 5, 4, 3, 2)
 
 
 def _curp_check_digit(first17: str) -> int:
@@ -1664,6 +1702,85 @@ def _redact_kr_rrn(code: str) -> str:
     return "XXXXXX-" + code[7] + "XXXXXX"
 
 
+def _no_fnr_valid(candidate: str) -> bool:
+    """Return ``True`` if a string is a structurally valid Norwegian fødselsnummer.
+
+    A Norwegian fødselsnummer is the 11-digit national identification number
+    every Norwegian resident is issued -- the master personal identifier keying
+    banking, tax, healthcare, and government services, on a par with the US
+    SSN, Brazilian CPF, Mexican CURP, South Korean RRN, and Turkish TCKN. A
+    fødselsnummer echoed into a statement memo or transaction name discloses a
+    named individual's identity (and their exact birth date), not merely an
+    account.
+
+    The canonical form is ``DDMMYYIIIIIKK``: a six-digit ``DD MM YY`` birth
+    date, a three-digit ``III`` individual / century-encoding number, and two
+    trailing public mod-11 weighted check digits. Like the Turkish TCKN the
+    canonical printed form is a contiguous 11-digit run with no separator, so
+    precision cannot come from a distinctive structural shape -- it comes from
+    three public, dependency-free gates:
+
+        1. **Shape** -- exactly 11 decimal digits.
+        2. **Real embedded birth date** -- ``DDMMYY`` must parse as a valid
+           day-of-month and month-of-year (`01 <= DD <= 31`,
+           `01 <= MM <= 12`). The validator deliberately accepts the
+           standard 1-31 / 1-12 ranges and does NOT enforce the H-number /
+           D-number birth-date offsets (a known Norwegian convention where
+           ``+40`` is added to ``DD`` for D-numbers or to ``MM`` for
+           H-numbers) -- accepting only the canonical date is the
+           higher-precision choice and matches what an everyday Norwegian
+           statement memo contains.
+        3. **Dual mod-11 weighted check digits** --
+             * ``k1 = (11 - sum(d[i] * W1[i] for i in 0..8) mod 11) mod 11``,
+               with weights ``W1 = (3,7,6,1,8,9,4,5,2)``. If ``k1 == 10`` no
+               valid number can be formed (the algorithm has no representation
+               for ``10``), so the candidate is rejected.
+             * ``k2 = (11 - sum(d[i] * W2[i] for i in 0..9) mod 11) mod 11``,
+               with weights ``W2 = (5,4,3,2,7,6,5,4,3,2)``. Same ``10`` rule.
+           Both must match. Two independent mod-11 constraints on top of the
+           date gate give a probability of a random 11-digit run passing of
+           ~1/(12 * 31 / 366 * 121) -- roughly 1/1500 -- a much tighter
+           precision lever than the Turkish TCKN's dual mod-10 (~1/100).
+
+    Any malformed input returns ``False`` so the helper is safe to reuse.
+    """
+    fnr = candidate.strip()
+    if len(fnr) != _NO_FNR_LEN or not fnr.isdigit():
+        return False
+    # Structural lever: embedded DDMMYY birth date must parse as a valid
+    # day/month pair. Year is unconstrained (an FNR is issued for any year
+    # 1854-current).
+    day = int(fnr[0:2])
+    month = int(fnr[2:4])
+    if not (1 <= day <= 31 and 1 <= month <= 12):
+        return False
+    digits = [int(c) for c in fnr]
+    r1 = sum(digits[i] * _NO_FNR_K1_WEIGHTS[i] for i in range(9)) % 11
+    k1 = (11 - r1) % 11
+    if k1 == 10 or k1 != digits[9]:
+        return False
+    r2 = sum(digits[i] * _NO_FNR_K2_WEIGHTS[i] for i in range(10)) % 11
+    k2 = (11 - r2) % 11
+    if k2 == 10 or k2 != digits[10]:
+        return False
+    return True
+
+
+def _redact_no_fnr(code: str) -> str:
+    """Redact a Norwegian fødselsnummer, preserving only the birth-month pair.
+
+    The day digits, year digits, individual number, and both check digits --
+    everything that pins the leak to a specific identified person and their
+    exact birth date -- are masked. The two birth-month digits survive so a
+    report retains a coarse triage hint (the month a leak refers to) while the
+    11-digit shape is preserved so the masked form still reads as a
+    fødselsnummer::
+
+        11037543251 -> XX03XXXXXXX
+    """
+    return "XX" + code[2:4] + "X" * (len(code) - 4)
+
+
 def _tr_tckn_valid(candidate: str) -> bool:
     """Return ``True`` if a string is a structurally valid Turkish TCKN.
 
@@ -2524,6 +2641,58 @@ def _scan_text(
                 "payer routes a transfer against.",
                 location=location,
                 evidence=_redact_br_cpf(candidate),
+            )
+        )
+
+    # Norwegian fødselsnummer (11 contiguous digits, DDMMYYIIIIIKK) -- the
+    # master Norwegian personal identifier and a direct, high-value
+    # identity-PII leak class on a par with the SSN, CPF, CURP, KR_RRN, and
+    # TCKN detectors. Like the TCKN the canonical printed form is a contiguous
+    # 11-digit run -- so this scan reuses the TCKN regex's 11-digit candidate
+    # window and runs BEFORE the TCKN scan: the more structurally-constrained
+    # identifier (which also requires a real embedded DDMMYY birth date on top
+    # of its two mod-11 check digits) claims the run first. The chance of the
+    # same 11-digit run passing both the Norwegian dual-mod-11 + birth-date
+    # gate AND the Turkish dual checksum is astronomical, but we defensively
+    # reserve the run under the ``tr_tckn`` and the card / account / routing
+    # namespaces so the same leak is never re-reported. The card scanner's
+    # 13-digit floor sits above the 11-digit window, so the two never overlap.
+    # The triple gate (shape + real birth date + two mod-11 check digits)
+    # gives roughly a 1/1500 random-token pass rate, a tighter precision lever
+    # than the TCKN's ~1/100, so a coincidental run is vanishingly unlikely to
+    # be reported. A fødselsnummer echoed into free text discloses a named
+    # individual's identity and their exact birth date -- a reportable
+    # Norwegian PII disclosure.
+    for m in _TR_TCKN_RE.finditer(text):
+        digits = m.group(0)
+        if not _no_fnr_valid(digits):
+            continue
+        key = ("no_fnr", digits)
+        if key in seen:
+            continue
+        seen.add(key)
+        # Reserve the run under the TCKN namespace (defensive against the
+        # astronomically-unlikely double-pass case) and under the account /
+        # routing / card namespaces so the scanners below never re-report a
+        # slice of the same fødselsnummer as a plain account number (the card
+        # scanner's 13-digit floor already excludes this length, but the
+        # reservation keeps the no-double-counting guarantee explicit,
+        # exactly as the TCKN scan below does).
+        seen.add(("tr_tckn", digits))
+        seen.add(("account_number", digits))
+        seen.add(("credit_card", digits))
+        seen.add(("routing_number", digits))
+        findings.append(
+            Finding(
+                check="pii",
+                type="no_fnr",
+                severity="high",
+                message="Norwegian fødselsnummer (valid 11-digit DDMMYYIIIIIKK "
+                "structure, embedded birth date, and two mod-11 check digits) "
+                "leaking into a free-text field -- discloses a named "
+                "individual's identity and birth date.",
+                location=location,
+                evidence=_redact_no_fnr(digits),
             )
         )
 
