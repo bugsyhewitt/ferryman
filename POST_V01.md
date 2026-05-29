@@ -857,6 +857,47 @@ dependencies (stdlib `re` only). Test count 403 → 430.
 
 ---
 
+## Rank 20 — Australian BSB Code Leak Detection, NNN-NNN structure + assigned bank-prefix gated (HIGH signal, low effort) — ✅ IMPLEMENTED (2026-05-29, Phase 2 Rotation 22)
+
+**Pivot note:** Ranks 1–19 were all shipped. A fresh codebase read confirmed the
+pii check covered the US (SSN, ITIN, ABA routing, account number), the UK (sort
+code, SEDOL), Canada (routing number), Europe (IBAN), and the global securities /
+entity / bank identifiers (ISIN, CUSIP, LEI, BIC) — but had **no domestic
+routing detector for Australia**, a major English-speaking fintech market with a
+distinctive, well-documented routing code. The Australian **BSB
+(Bank-State-Branch)** code is the direct domestic-routing companion to the
+already-shipped ABA / UK sort code / Canadian routing detectors, and it carries a
+clean public structural gate, so it was the highest-value unimplemented item.
+
+**Status:** Shipped. `checks/pii.py` gained `_au_bsb_valid()` (gates on the
+`NNN-NNN` hyphenated 3-3 shape plus the assigned AusPayNet bank-prefix ranges
+`01`–`19` / `20`–`79` / `80`–`89`, rejecting the unassigned `00` and the reserved
+`90`–`99`) and `_redact_au_bsb()` (evidence redacted to the leading bank pair,
+`06X-XXX`). A new `au_bsb` (high) finding runs in `_scan_text` alongside the other
+hyphenated routing detectors. Its 3-3 split is distinct from the SSN's 3-2-4, the
+UK sort code's 2-2-2, and the Canadian routing number's 5-3, so the four
+hyphenated detectors never collide, and the hyphen keeps it clear of the
+contiguous account / routing / card scanners. New fixture
+`tests/fixtures/au-bsb-leak.ofx` (two valid BSBs in two memos + one out-of-range
+`000-123` decoy) and 37 new test cases cover the validator (all three prefix
+ranges + boundaries, the reserved/unassigned prefixes, wrong-shape and garbage
+input), free-text detection, redaction, the decoy / zero-prefix / contiguous-run
+non-detection guards, non-collision with the digit scanners and the other
+hyphenated codes, the SSN non-misread guard, per-field dedupe, the fixture, and
+the clean-file guard. README gained an Australian BSB section and the type lists
+were updated. The SARIF mapping auto-generates the `pii/au_bsb` rule with no
+changes. No new dependencies (stdlib `re` only). Test count 430 → 467.
+
+**Research grounding:** AusPayNet (Australian Payments Network, formerly APCA)
+BSB administration — a BSB is a six-digit `NNN-NNN` code whose leading two digits
+are the assigned bank/institution code, with `00` unassigned and `90`–`99`
+reserved. Public, dependency-free, ~15 lines of Python. It is the value a BECS
+direct-entry / PayTo payment routes against, paired with an account number.
+
+**Estimated tokens:** 30–50K
+
+---
+
 ## Research notes
 
 **Sources consulted:**

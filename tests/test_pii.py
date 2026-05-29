@@ -10,6 +10,7 @@ import pytest
 
 from ferryman.checks.pii import (
     _aba_checksum_valid,
+    _au_bsb_valid,
     _bic_valid,
     _ca_routing_valid,
     _cusip_valid,
@@ -1411,6 +1412,162 @@ def test_ca_routing_leak_fixture(ca_routing_file):
 def test_clean_file_no_ca_routing(clean_file):
     findings = check_pii(clean_file.read_bytes())
     assert "ca_routing_number" not in {f.type for f in findings}
+
+
+# --- Australian BSB code detection (NNN-NNN structure + assigned bank-prefix
+# gated) ---
+
+# Real-format Australian BSB codes in the canonical NNN-NNN presentation: a
+# leading bank/financial-institution prefix, a state digit, and a branch. Each
+# must pass the hyphenated structure and the assigned bank-prefix gate. (Branch
+# numbers are arbitrary; the leading pairs below are real AusPayNet bank prefixes.)
+VALID_AU_BSB = [
+    "062-000",  # Commonwealth Bank (CBA, prefix 06)
+    "013-006",  # ANZ (prefix 01)
+    "082-001",  # NAB (prefix 08)
+    "032-000",  # Westpac (prefix 03)
+    "012-003",  # ANZ (prefix 01 -- low end of the big-four/ADI range)
+    "192-879",  # Bank of Melbourne (prefix 19 -- top of the 01-19 range)
+    "484-799",  # an institution in the 20-79 other-ADI block (prefix 48)
+    "802-101",  # a Cuscal-sponsored mutual / credit union (prefix 80)
+    "899-555",  # top of the mutual / credit-union block (prefix 89)
+]
+
+# Strings shaped like a BSB but failing the structure or the assigned bank-prefix
+# gate -- they must NOT validate.
+INVALID_AU_BSB = [
+    "000-123",  # prefix 00 is never an assigned bank code
+    "901-234",  # prefix 90 falls in the reserved 90-99 range
+    "999-999",  # prefix 99 is reserved / the classic decoy
+    "12-345",   # first group not three digits
+    "1234-567", # first group too long
+    "123-45",   # second group not three digits
+    "123-4567", # second group too long
+    "123456",   # no hyphen (not the BSB shape)
+    "123-456-7",  # three parts -- wrong structure
+]
+
+
+@pytest.mark.parametrize("code", VALID_AU_BSB)
+def test_au_bsb_accepts_real_codes(code):
+    assert _au_bsb_valid(code) is True
+
+
+@pytest.mark.parametrize("code", INVALID_AU_BSB)
+def test_au_bsb_rejects_invalid(code):
+    assert _au_bsb_valid(code) is False
+
+
+@pytest.mark.parametrize(
+    "bad", ["", "  ", "abc-def", "062/000", "06X-000", "------", "062000"]
+)
+def test_au_bsb_rejects_garbage(bad):
+    # Defensive: malformed / non-numeric / wrong-shape input is never a valid BSB.
+    assert _au_bsb_valid(bad) is False
+
+
+def test_au_bsb_in_memo_detected():
+    findings = _scan("BECS direct entry to 062-000 CBA branch")
+    codes = [f for f in findings if f.type == "au_bsb"]
+    assert len(codes) == 1
+    assert codes[0].severity == "high"
+    assert codes[0].check == "pii"
+    # Only the leading bank pair survives for triage; the branch is masked.
+    assert codes[0].evidence == "06X-XXX"
+
+
+def test_au_bsb_redaction_masks_branch():
+    findings = _scan("beneficiary at 013-006 ANZ")
+    codes = [f for f in findings if f.type == "au_bsb"]
+    assert len(codes) == 1
+    assert codes[0].evidence == "01X-XXX"
+    # The branch-identifying digits never leave the tool.
+    assert "006" not in codes[0].evidence
+
+
+def test_au_bsb_decoy_prefix_not_reported():
+    # 999-999 has the right NNN-NNN shape but a reserved/out-of-range prefix,
+    # so it must NOT be reported.
+    findings = _scan("decoy reference 999-999 logged")
+    assert "au_bsb" not in {f.type for f in findings}
+
+
+def test_au_bsb_zero_prefix_not_reported():
+    findings = _scan("placeholder 000-123 in the template")
+    assert "au_bsb" not in {f.type for f in findings}
+
+
+def test_contiguous_six_digits_not_an_au_bsb():
+    # The hyphenated NNN-NNN shape is the defining feature: a plain digit run is
+    # never reclassified as a BSB.
+    findings = _scan("reference 062000 noted")
+    assert "au_bsb" not in {f.type for f in findings}
+
+
+def test_au_bsb_does_not_break_other_identifiers():
+    # The hyphenated BSB scan must not interfere with the other identifiers when
+    # those appear on their own.
+    isin_findings = _scan("US0378331005 holding")
+    assert [f.type for f in isin_findings] == ["isin"]
+    aba_findings = [f for f in _scan("routing 121000248 on file")
+                    if f.type == "routing_number"]
+    assert len(aba_findings) == 1
+
+
+def test_au_bsb_does_not_collide_with_digit_scanners():
+    # The hyphen breaks the run into two three-digit pieces, so the 8+/9-digit
+    # account/routing scanners never also claim it.
+    findings = _scan("paid via 062-000 to the account")
+    types = [f.type for f in findings]
+    assert types.count("au_bsb") == 1
+    assert "account_number" not in types
+    assert "routing_number" not in types
+    assert "credit_card" not in types
+
+
+def test_au_bsb_does_not_collide_with_other_hyphenated_codes():
+    # A BSB (3-3 split) is distinct from a UK sort code (2-2-2) and a Canadian
+    # routing number (5-3): each is reported only as its own type.
+    au = _scan("Australian 062-000 here")
+    assert [f.type for f in au] == ["au_bsb"]
+    uk = _scan("British 20-00-00 here")
+    assert [f.type for f in uk] == ["uk_sort_code"]
+    ca = _scan("Canadian 00012-003 here")
+    assert [f.type for f in ca] == ["ca_routing_number"]
+
+
+def test_ssn_not_misread_as_au_bsb():
+    # An SSN (NNN-NN-NNNN, a 3-2-4 split) is a different shape and must be
+    # reported as an SSN, never as a BSB.
+    findings = _scan("client ssn 123-45-6789 on file")
+    types = {f.type for f in findings}
+    assert "ssn" in types
+    assert "au_bsb" not in types
+
+
+def test_same_au_bsb_deduped_per_field():
+    findings = _scan("062-000 and again 062-000 in one memo")
+    codes = [f for f in findings if f.type == "au_bsb"]
+    assert len(codes) == 1
+
+
+def test_au_bsb_leak_fixture(au_bsb_file):
+    findings = check_pii(au_bsb_file.read_bytes())
+    codes = [f for f in findings if f.type == "au_bsb"]
+    types = {f.type for f in findings}
+    assert "au_bsb" in types, f"expected au_bsb, got: {types}"
+    # The fixture leaks two valid BSBs in memos; the out-of-range 000-123 decoy
+    # must NOT be reported.
+    assert len(codes) == 2
+    assert all(c.severity == "high" for c in codes)
+    for c in codes:
+        # No raw branch digits remain in the evidence.
+        assert c.evidence.endswith("X-XXX")
+
+
+def test_clean_file_no_au_bsb(clean_file):
+    findings = check_pii(clean_file.read_bytes())
+    assert "au_bsb" not in {f.type for f in findings}
 
 
 # --- Email-address leak detection ---------------------------------------------

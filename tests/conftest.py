@@ -102,6 +102,12 @@ def ca_routing_file() -> Path:
 
 
 @pytest.fixture
+def au_bsb_file() -> Path:
+    """A bank statement leaking valid Australian BSB codes (NNN-NNN)."""
+    return FIXTURES / "au-bsb-leak.ofx"
+
+
+@pytest.fixture
 def entity_bomb_file() -> Path:
     return FIXTURES / "entity-bomb.ofx"
 

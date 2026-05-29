@@ -15,8 +15,8 @@ scanner that treats an OFX file as an attack surface and asks three questions:
   tax IDs), payment-card numbers (PANs), IBANs, securities identifiers
   (ISIN/CUSIP/SEDOL),
   legal-entity identifiers (LEI), bank identifier codes (BIC/SWIFT), UK sort
-  codes, Canadian routing numbers, full account numbers, and routing numbers
-  smuggled into free-text transaction names and memos.
+  codes, Canadian routing numbers, Australian BSB codes, full account numbers,
+  and routing numbers smuggled into free-text transaction names and memos.
 - **Is this file anomalous?** Out-of-range posting dates, zero / sign-flipped /
   out-of-range transaction amounts, and other signs of tampering or a backend
   that accepts garbage.
@@ -57,8 +57,8 @@ ferryman [--check {malformed,pii,anomaly,all}] [--format {json,text,h1md,sarif}]
     on raw bytes; never parses a hostile file.
   - `pii` &mdash; PII leaking into transaction free-text (email address, SSN,
     ITIN, payment-card number, IBAN, ISIN, CUSIP, SEDOL, LEI, BIC/SWIFT, UK sort
-    code, Canadian routing number, account number, routing number), including
-    investment memos and security ids.
+    code, Canadian routing number, Australian BSB code, account number, routing
+    number), including investment memos and security ids.
     Evidence is always redacted before it leaves the tool.
   - `anomaly` &mdash; structurally valid but suspicious transactions
     (out-of-range dates; zero, sign-contradicting, or out-of-range transaction
@@ -700,6 +700,48 @@ $ ferryman --check pii --format text leak.ofx
 **Remediation:** never echo a customer's routing number into a statement memo or
 transaction name; keep bank/branch routing identifiers in structured,
 access-controlled fields rather than free text.
+
+### Australian BSB code leak detection
+
+An [Australian BSB code](https://en.wikipedia.org/wiki/Bank_state_branch) is the
+six-digit Bank-State-Branch routing code that identifies an Australian bank,
+state, and branch &mdash; the value a domestic BECS direct-entry / PayTo /
+direct-debit payment is routed against, the Australian equivalent of an ABA
+routing number, a UK sort code, or a Canadian routing number. It is
+conventionally written in two hyphen-separated triples, `NNN-NNN` (e.g. `062-000`
+= Commonwealth Bank, `013-006` = ANZ): a leading bank/institution prefix, a state
+digit, and a branch. A BSB echoed into a free-text **memo or transaction name**
+discloses the bank/branch routing of an account. The **pii** check flags an
+`au_bsb` finding (severity `high`) when a free-text field contains a string that
+clears **two** public, dependency-free gates:
+
+1. **shape** &mdash; exactly `NNN-NNN`: two hyphen-separated triples of decimal
+   digits. The hyphenated 3-3 presentation is the dominant precision lever: it is
+   distinct from any contiguous digit run, so it never collides with the account
+   number (`\d{8,}`), routing (`\d{9}`), or payment-card scanners; it is also
+   distinct from the SSN's 3-2-4 split, the UK sort code's 2-2-2 split, and the
+   Canadian routing number's 5-3 split, so the four hyphenated detectors never
+   collide;
+2. **assigned bank prefix** &mdash; the leading two digits (the AusPayNet bank
+   code) must fall in an assigned range (`01`&ndash;`19` the big-four / other
+   ADIs, `20`&ndash;`79` the Reserve-Bank / government / other-ADI blocks,
+   `80`&ndash;`89` the Cuscal-sponsored mutual / credit-union / fintech block).
+   `00` is never assigned and the `90`&ndash;`99` range is reserved, so an
+   all-zeros or out-of-range leading pair (e.g. `999-999`) is never reported.
+
+Like the UK sort code and the Canadian routing number, a BSB carries no
+published, self-contained arithmetic check digit, so precision comes from the
+hyphenated structure plus the assigned bank prefix. Evidence is redacted to the
+leading bank pair (`06X-XXX`); the state and branch digits never leave the tool.
+
+```bash
+$ ferryman --check pii --format text leak.ofx
+  [HIGH] pii/au_bsb @ statement[0].transaction[0].memo: Australian BSB code (valid NNN-NNN structure and assigned bank prefix) leaking into a free-text field -- discloses the bank/branch routing of an account.
+```
+
+**Remediation:** never echo a customer's BSB into a statement memo or transaction
+name; keep bank/branch routing identifiers in structured, access-controlled
+fields rather than free text.
 
 ## From finding to HackerOne report
 
