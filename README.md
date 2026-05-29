@@ -12,8 +12,9 @@ scanner that treats an OFX file as an attack surface and asks three questions:
   CDATA-terminator injection, SGML/XML format confusion, OFX v1 header
   injection / encoding mismatch, encoding tricks, oversized fields.
 - **Is this file leaking PII it should not?** SSNs, payment-card numbers
-  (PANs), IBANs, securities identifiers (ISIN/CUSIP/SEDOL), full account numbers,
-  and routing numbers smuggled into free-text transaction names and memos.
+  (PANs), IBANs, securities identifiers (ISIN/CUSIP/SEDOL), legal-entity
+  identifiers (LEI), full account numbers, and routing numbers smuggled into
+  free-text transaction names and memos.
 - **Is this file anomalous?** Out-of-range posting dates, zero / sign-flipped /
   out-of-range transaction amounts, and other signs of tampering or a backend
   that accepts garbage.
@@ -53,9 +54,9 @@ ferryman [--check {malformed,pii,anomaly,all}] [--format {json,text,h1md,sarif}]
     injection / encoding mismatch, encoding tricks, oversized fields). Operates
     on raw bytes; never parses a hostile file.
   - `pii` &mdash; PII leaking into transaction free-text (SSN, payment-card
-    number, IBAN, ISIN, CUSIP, SEDOL, account number, routing number), including
-    investment memos and security ids. Evidence is always redacted before it
-    leaves the tool.
+    number, IBAN, ISIN, CUSIP, SEDOL, LEI, account number, routing number),
+    including investment memos and security ids. Evidence is always redacted
+    before it leaves the tool.
   - `anomaly` &mdash; structurally valid but suspicious transactions
     (out-of-range dates; zero, sign-contradicting, or out-of-range transaction
     amounts; for investment statements, negative/implausible unit prices and
@@ -468,6 +469,48 @@ $ ferryman --check pii --format text leak.ofx
 **Remediation:** never echo a security's SEDOL into a statement memo or
 transaction name; keep security identifiers in the structured `SECID` field where
 they belong.
+
+### LEI leak detection
+
+A [LEI](https://en.wikipedia.org/wiki/Legal_Entity_Identifier) (Legal Entity
+Identifier, ISO 17442) is the global, public, twenty-character code that
+identifies a legal entity party to a financial transaction &mdash; a
+counterparty, an issuer, or a fund manager. An LEI echoed into a free-text
+**memo or transaction name** discloses *who* a customer transacted with: a
+counterparty-confidentiality leak that is reportable on its own in fintech
+bug-bounty programs (and a regulatory-reporting field that should never travel in
+free text). The **pii** check flags an `lei` finding (severity `high`) when a
+free-text field contains a string that clears **both** public gates:
+
+1. **shape** &mdash; exactly twenty characters: an eighteen-character
+   alphanumeric entity portion (a four-character LOU prefix, a two-character
+   reserved field, and a twelve-character entity-specific part) followed by two
+   decimal check digits;
+2. **check digits** &mdash; the public ISO 7064 mod-97-10 algorithm: expand every
+   letter to its two-digit value (`A`=10&hellip;`Z`=35), interpret the whole
+   twenty-character value (check digits included) as an integer, and verify it is
+   `== 1 (mod 97)`.
+
+Gating on the ISO 7064 check digits mirrors the IBAN gate (same mod-97-10 scheme,
+applied to the whole value with no rearrangement): a run that clears both is a
+near-certain real LEI, while a coincidental twenty-character alphanumeric blob
+fails the check digits with overwhelming probability and is left to the existing
+heuristics. The reserved positions are **not** gated on being `00` &mdash; that
+convention is not honoured by all Local Operating Units, so enforcing it would
+reject real LEIs. The entity portion and check digits never leave the tool
+&mdash; evidence is redacted to the four-character LOU prefix (`5299XXXXXXXXXXXXXXXX`).
+Because an LEI is the longest of the gated identifiers, it is matched before the
+shorter ISIN, CUSIP, and SEDOL detectors so the full twenty-character run is
+claimed first.
+
+```bash
+$ ferryman --check pii --format text leak.ofx
+  [HIGH] pii/lei @ statement[0].transaction[0].memo: Legal Entity Identifier (LEI, valid ISO 17442 mod-97-10 check digits) leaking into a free-text field -- discloses the legal entity behind a transaction.
+```
+
+**Remediation:** never echo a counterparty's or issuer's LEI into a statement
+memo or transaction name; keep entity identifiers in structured, access-controlled
+fields rather than free text.
 
 ## From finding to HackerOne report
 

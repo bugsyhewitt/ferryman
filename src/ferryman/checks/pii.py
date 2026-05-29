@@ -15,6 +15,11 @@ Detection classes:
                                 whose country code, length, and mod-97 check
                                 digits all validate -- a near-certain
                                 international bank-account leak.
+- ``lei``                     : a Legal Entity Identifier (ISO 17442) -- a 20-char
+                                alphanumeric code (18-char entity portion + two
+                                ISO 7064 mod-97-10 check digits) -- whose check
+                                digits validate, a near-certain counterparty /
+                                legal-entity disclosure.
 - ``isin``                    : an International Securities Identification Number
                                 (ISO 6166) -- a 12-char country-code + NSIN +
                                 Luhn check digit -- whose check digit validates,
@@ -127,6 +132,17 @@ _IBAN_LENGTHS = {
 # Generic ISO 13616 bounds for country codes not in the registry table.
 _IBAN_MIN_LEN = 15
 _IBAN_MAX_LEN = 34
+
+# LEI (ISO 17442 / Legal Entity Identifier) candidate: a 20-character run of an
+# 18-character alphanumeric entity portion plus two trailing decimal check
+# digits. The run is bounded by a non-alphanumeric lookaround so an LEI embedded
+# in a longer alphanumeric blob is not partially matched, and the trailing
+# ``\d{2}`` requires the two check positions to be decimal (they always are, by
+# spec). The caller validates the ISO 7064 mod-97-10 check digits before
+# reporting. LEIs are case-insensitive and conventionally upper-case.
+_LEI_RE = re.compile(r"(?<![A-Za-z0-9])[A-Za-z0-9]{18}\d{2}(?![A-Za-z0-9])")
+# LEIs are always exactly 20 characters (18 entity + 2 check digits).
+_LEI_LEN = 20
 
 # ISIN (ISO 6166) candidate: a 12-character run of two letters (country / "XS"
 # for international issues), nine alphanumeric NSIN characters, and one trailing
@@ -295,6 +311,58 @@ def _trim_to_valid_iban(candidate: str) -> str | None:
         if _iban_valid(prefix):
             return prefix
     return None
+
+
+def _lei_valid(candidate: str) -> bool:
+    """Return ``True`` if a string is a structurally valid LEI (ISO 17442).
+
+    An LEI (Legal Entity Identifier) is the global, public identifier for a
+    legal entity that is party to a financial transaction -- a counterparty,
+    issuer, or fund manager. It is twenty characters: an 18-character
+    alphanumeric entity portion (a 4-char LOU prefix, a 2-char reserved field,
+    and a 12-char entity-specific part) followed by two ISO 7064 mod-97-10 check
+    digits. Its public, dependency-free check is::
+
+        1. Shape  -- exactly 20 characters: 18 alphanumerics then 2 decimal
+           check digits.
+        2. Check digits -- expand every letter to its two-digit value
+           (``A``=10 ... ``Z``=35), concatenate to a pure digit string (check
+           digits included), interpret as an integer, and verify it is
+           ``== 1 (mod 97)``.
+
+    The same ISO 7064 mod-97-10 scheme as the IBAN, but applied to the whole
+    20-character value with no rearrangement (the check digits already sit at
+    the end). A run that clears both gates is a near-certain real LEI; a
+    coincidental 20-char alphanumeric blob fails the check digits with
+    overwhelming probability. We deliberately do NOT gate on the reserved
+    positions 4-5 being ``00`` -- that was the convention for the earliest
+    ROC-assigned prefixes but is not honoured by all later LOUs, so enforcing it
+    would reject real LEIs. Any malformed input returns ``False`` so the helper
+    is safe to reuse.
+    """
+    lei = candidate.strip().upper()
+    if len(lei) != _LEI_LEN:
+        return False
+    if not (lei[:18].isalnum() and lei[18:].isdigit()):
+        return False
+    # Expand letters to numbers, then take the whole value mod 97. ISO 7064
+    # mod-97-10: a valid identifier (check digits included) is congruent to 1.
+    digits = "".join(
+        str(ord(ch) - 55) if ch.isalpha() else ch for ch in lei
+    )
+    return int(digits) % 97 == 1
+
+
+def _redact_lei(lei: str) -> str:
+    """Redact an LEI, preserving only the four-character LOU prefix for triage.
+
+    The leading four characters identify the issuing Local Operating Unit
+    (useful context for a report) while the entity-specific portion and the
+    check digits -- the part that pins the leak to a specific legal entity --
+    are masked.
+    """
+    lei = lei.upper()
+    return lei[:4] + "X" * (len(lei) - 4)
 
 
 def _isin_valid(candidate: str) -> bool:
@@ -541,6 +609,42 @@ def _scan_text(
                 "country/length/mod-97 checksum) leaking into a free-text field.",
                 location=location,
                 evidence=_redact_iban(candidate),
+            )
+        )
+
+    # LEIs (ISO 17442) -- check before the shorter securities identifiers and the
+    # credit-card / account-number runs. An LEI is a 20-char alphanumeric run that
+    # can embed long digit tails the account / card scanners would otherwise
+    # misclassify. We gate on the exact 20-char shape AND the ISO 7064 mod-97-10
+    # check digits, so a coincidental alphanumeric blob is vanishingly unlikely to
+    # be reported. An LEI discloses the legal entity (counterparty / issuer / fund
+    # manager) behind a transaction -- a counterparty-confidentiality leak.
+    for m in _LEI_RE.finditer(text):
+        candidate = m.group(0)
+        if not _lei_valid(candidate):
+            continue
+        compact = candidate.upper()
+        key = ("lei", compact)
+        if key in seen:
+            continue
+        seen.add(key)
+        # Reserve any digit run inside the LEI under the account/card/routing
+        # namespaces so the scanners below never re-report a slice of the same
+        # identifier as a separate finding.
+        for run in re.findall(r"\d+", compact):
+            seen.add(("account_number", run))
+            seen.add(("credit_card", run))
+            seen.add(("routing_number", run))
+        findings.append(
+            Finding(
+                check="pii",
+                type="lei",
+                severity="high",
+                message="Legal Entity Identifier (LEI, valid ISO 17442 "
+                "mod-97-10 check digits) leaking into a free-text field -- "
+                "discloses the legal entity behind a transaction.",
+                location=location,
+                evidence=_redact_lei(compact),
             )
         )
 

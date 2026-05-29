@@ -574,6 +574,66 @@ free-text SEDOL echo the natural, in-scope next detector.
 
 ---
 
+## Rank 15 — LEI Leak Detection, ISO 7064 mod-97-10 check-digit gated (HIGH signal, low effort) — ✅ IMPLEMENTED (2026-05-29, Phase 2 Rotation 16)
+
+**Status:** Shipped. `checks/pii.py` gained a `_lei_valid()` helper that gates an
+LEI candidate behind two independent public checks: the 20-character shape (an
+18-character alphanumeric entity portion plus two trailing decimal check digits)
+and the ISO 7064 mod-97-10 check digits (expand every letter to its two-digit
+value, `A`=10&hellip;`Z`=35, via the same `ord-55` expansion the IBAN/ISIN/CUSIP
+gates use; interpret the whole 20-character value — check digits included — as an
+integer; a valid LEI is `== 1 (mod 97)`). This is the same ISO 7064 scheme the
+IBAN gate uses, but applied to the whole value with **no rearrangement** because
+the LEI's check digits already sit at the end. An `_LEI_RE` matcher
+(`[A-Za-z0-9]{18}\d{2}`, non-alphanumeric bounded) finds 20-char candidates in
+free text. In `_scan_text`, LEI detection runs **before** the shorter ISIN (12),
+CUSIP (9), and SEDOL (7) identifiers — the LEI is the longest gated identifier,
+so claiming the full 20-char run first prevents a shorter detector from matching
+a window inside it — and before the credit-card / routing / account scanners;
+every digit run inside a detected LEI is reserved under the
+`account_number`/`credit_card`/`routing_number` dedupe namespaces so the same
+identifier is never double-counted. Findings are `high` severity; evidence is
+redacted to the leading four-character LOU prefix via `_redact_lei()` so the
+entity portion and check digits never leave the tool. Crucially, the reserved
+positions 4–5 are **not** gated on being `00` — that convention is honoured only
+by the earliest ROC-assigned prefixes, not by all later Local Operating Units, so
+enforcing it would reject real LEIs (e.g. Deutsche Bank's `7LTWFZ…`); gating on
+shape + the mod-97-10 check digits alone is the robust rule. New fixture
+`tests/fixtures/lei-leak.ofx` (two valid GLEIF-registry LEIs in two memos plus a
+wrong-check-digit decoy, with legitimate ISINs in the `SECID` fields) plus 24 new
+tests in `tests/test_pii.py` cover the validator (published registry LEIs,
+wrong-check-digit / wrong-length / non-numeric-check-digit / garbage / all-letter
+rejects, lowercase acceptance), memo detection and four-prefix redaction, the
+no-double-count guarantee, the no-interference-with-ISIN/CUSIP/SEDOL guard,
+per-field dedupe, the invalid-LEI no-report case, the fixture, and the clean-file
+no-LEI guarantee. README gained an "LEI leak detection" section and the PII type
+list was updated. No new dependencies (stdlib `re` only).
+
+**What:** The pii check covered SSN, payment card (PAN), IBAN, ISIN, CUSIP,
+SEDOL, US account number, and US ABA routing number — every prior identifier
+naming an *account* or a *security*, but none naming the **legal entity** behind a
+transaction. The LEI (ISO 17442) is the global identifier for that entity — a
+counterparty, issuer, or fund manager — and is mandated in regulatory
+transaction reporting (MiFID II, EMIR, Dodd-Frank). Like the ABA (Rank 1), Luhn
+(Rank 10), IBAN (Rank 11), ISIN (Rank 12), CUSIP (Rank 13), and SEDOL (Rank 14)
+gates, the LEI carries a public checksum (ISO 7064 mod-97-10), so gating on shape
++ check digits yields a high-precision, zero-dependency detector. An LEI echoed
+into a transaction memo discloses *who* a customer transacted with — a
+counterparty-confidentiality leak reportable on its own.
+
+**Research grounding:** ISO 17442 / ISO 7064 mod-97-10 is public domain, ~12
+lines of Python and reuses the same letter-expansion the IBAN/ISIN gates use. The
+algorithm and a set of registry LEIs (Allianz `529900T8BM49AURSDO55`, Deutsche
+Bank `7LTWFZYICNSX8D621K86`, NASDAQ `F3JS33DEI6XQ4ZBPTN86`) are published by GLEIF
+and verifiable against the mod-97-10 rule. The LEI complements the
+account/security identifier family ferryman already detects by adding the
+entity-identity dimension: account (IBAN/account number), security
+(ISIN/CUSIP/SEDOL), and now counterparty (LEI).
+
+**Estimated tokens:** 35–50K
+
+---
+
 ## Research notes
 
 **Sources consulted:**

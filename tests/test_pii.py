@@ -13,6 +13,7 @@ from ferryman.checks.pii import (
     _cusip_valid,
     _iban_valid,
     _isin_valid,
+    _lei_valid,
     _luhn_valid,
     _sedol_valid,
     check_pii,
@@ -727,3 +728,123 @@ def test_sedol_leak_fixture(sedol_file):
 def test_clean_file_no_sedol(clean_file):
     findings = check_pii(clean_file.read_bytes())
     assert "sedol" not in {f.type for f in findings}
+
+
+# --- LEI detection (ISO 17442 / ISO 7064 mod-97-10 check-digit gated) ---
+
+# Real, published Legal Entity Identifiers (GLEIF registry, public information).
+# Each must pass the ISO 7064 mod-97-10 check over the whole 20-char value.
+VALID_LEIS = [
+    "529900T8BM49AURSDO55",  # Allianz SE
+    "5493001KJTIIGC8Y1R12",  # Bloomberg Finance L.P.
+    "7LTWFZYICNSX8D621K86",  # Deutsche Bank AG
+    "F3JS33DEI6XQ4ZBPTN86",  # NASDAQ, Inc.
+    "213800WSGIIZCXF1P572",  # an in-registry entity
+]
+
+# Strings shaped like an LEI but failing the mod-97-10 check digits, or the
+# wrong length / wrong check-digit shape -- they must NOT validate.
+INVALID_LEIS = [
+    "529900T8BM49AURSDO56",  # right entity portion, wrong check digits
+    "7LTWFZYICNSX8D621K87",  # right entity portion, wrong check digits
+    "529900T8BM49AURSDO5",   # 19 chars -- too short
+    "529900T8BM49AURSDO555",  # 21 chars -- too long
+    "529900T8BM49AURSDOAA",  # non-numeric check positions
+]
+
+
+@pytest.mark.parametrize("lei", VALID_LEIS)
+def test_lei_accepts_real_leis(lei):
+    assert _lei_valid(lei) is True
+
+
+@pytest.mark.parametrize("lei", INVALID_LEIS)
+def test_lei_rejects_invalid(lei):
+    assert _lei_valid(lei) is False
+
+
+@pytest.mark.parametrize(
+    "bad", ["", "529900", "  ", "529900T8BM49AURSDO5!", "X" * 20]
+)
+def test_lei_rejects_garbage(bad):
+    # Defensive: malformed / too-short / non-alphanumeric input is never a valid
+    # LEI. An all-letter run ("X"*20) fails the numeric check-digit shape.
+    assert _lei_valid(bad) is False
+
+
+def test_lei_lowercase_accepted_by_validator():
+    # LEIs are case-insensitive; the validator upper-cases before checking.
+    assert _lei_valid("529900t8bm49aursdo55") is True
+
+
+def test_lei_in_memo_detected():
+    findings = _scan("settled with counterparty 529900T8BM49AURSDO55 today")
+    leis = [f for f in findings if f.type == "lei"]
+    assert len(leis) == 1
+    assert leis[0].severity == "high"
+    assert leis[0].check == "pii"
+    # Only the leading four-character LOU prefix survives for triage; the entity
+    # portion and check digits never leave the scanner.
+    assert "T8BM49AURSDO55" not in (leis[0].evidence or "")
+    assert (leis[0].evidence or "").startswith("5299")
+    assert "X" in (leis[0].evidence or "")
+
+
+def test_lei_lowercase_detected_in_freetext():
+    findings = _scan("issuer 529900t8bm49aursdo55 on the trade ticket")
+    leis = [f for f in findings if f.type == "lei"]
+    assert len(leis) == 1
+
+
+def test_invalid_lei_not_reported():
+    # A wrong-check-digit LEI-shaped run must NOT be reported as an lei.
+    findings = _scan("ref 529900T8BM49AURSDO56 logged")
+    assert "lei" not in {f.type for f in findings}
+
+
+def test_lei_not_double_counted_as_account_number():
+    # An LEI must be classified once -- as an lei -- and never also as an
+    # account_number / routing_number / credit_card finding for the digit runs
+    # embedded in its 20 characters.
+    findings = _scan("counterparty 529900T8BM49AURSDO55 in the account")
+    types = [f.type for f in findings]
+    assert types.count("lei") == 1
+    assert "account_number" not in types
+    assert "routing_number" not in types
+    assert "credit_card" not in types
+
+
+def test_lei_does_not_break_shorter_identifiers():
+    # The 20-char LEI regex must not interfere with the shorter ISIN (12),
+    # CUSIP (9), or SEDOL (7) detectors when those appear on their own.
+    isin_findings = _scan("US0378331005 holding")
+    assert [f.type for f in isin_findings] == ["isin"]
+    cusip_findings = _scan("sold security 17275R102 today")
+    assert [f.type for f in cusip_findings] == ["cusip"]
+    sedol_findings = _scan("holding B16GWD5 noted")
+    assert [f.type for f in sedol_findings] == ["sedol"]
+
+
+def test_same_lei_deduped_per_field():
+    findings = _scan("529900T8BM49AURSDO55 aka 529900t8bm49aursdo55 twice")
+    leis = [f for f in findings if f.type == "lei"]
+    assert len(leis) == 1
+
+
+def test_lei_leak_fixture(lei_file):
+    findings = check_pii(lei_file.read_bytes())
+    leis = [f for f in findings if f.type == "lei"]
+    types = {f.type for f in findings}
+    assert "lei" in types, f"expected lei, got: {types}"
+    # The fixture leaks two valid LEIs in memos; the wrong-check-digit decoy must
+    # NOT be reported.
+    assert len(leis) == 2
+    assert all(le.severity == "high" for le in leis)
+    for le in leis:
+        # No raw entity portion remains in the evidence.
+        assert "X" in (le.evidence or "")
+
+
+def test_clean_file_no_lei(clean_file):
+    findings = check_pii(clean_file.read_bytes())
+    assert "lei" not in {f.type for f in findings}
