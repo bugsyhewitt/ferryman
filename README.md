@@ -17,7 +17,7 @@ scanner that treats an OFX file as an attack surface and asks three questions:
   legal-entity identifiers (LEI), bank identifier codes (BIC/SWIFT), UK sort
   codes, Canadian routing numbers, Australian BSB codes, Indian IFSC codes,
   Mexican CLABE numbers, South Korean Giro numbers, Thai national IDs
-  (PromptPay proxy ids), full
+  (PromptPay proxy ids), Brazilian CPFs (Pix keys), full
   account numbers, and routing numbers smuggled into free-text transaction names
   and memos.
 - **Is this file anomalous?** Out-of-range posting dates, zero / sign-flipped /
@@ -61,7 +61,7 @@ ferryman [--check {malformed,pii,anomaly,all}] [--format {json,text,h1md,sarif}]
   - `pii` &mdash; PII leaking into transaction free-text (email address, SSN,
     ITIN, payment-card number, IBAN, ISIN, CUSIP, SEDOL, LEI, BIC/SWIFT, UK sort
     code, Canadian routing number, Australian BSB code, Indian IFSC code, Mexican
-    CLABE, South Korean Giro number, Thai national ID, account
+    CLABE, South Korean Giro number, Thai national ID, Brazilian CPF, account
     number, routing number), including investment memos and security ids.
     Evidence is always redacted before it leaves the tool.
   - `anomaly` &mdash; structurally valid but suspicious transactions
@@ -917,6 +917,55 @@ $ ferryman --check pii --format text leak.ofx
 **Remediation:** never echo a customer's national ID into a statement memo or
 transaction name; keep PromptPay proxy ids in structured, access-controlled
 fields rather than free text.
+
+### Brazilian CPF / Pix key leak detection
+
+A [Brazilian CPF](https://en.wikipedia.org/wiki/CPF_number) (Cadastro de Pessoas
+Físicas) is the 11-digit individual taxpayer registry number every Brazilian
+resident carries &mdash; and the most common [Pix](https://en.wikipedia.org/wiki/Pix_(payment_system))
+payee "chave" (key): a payer routes an instant interbank Pix transfer to a payee
+by their CPF (or phone / email / random key), so a CPF echoed into free text
+discloses the exact value needed to push funds to that person. Its canonical card
+and receipt presentation is the dotted-and-dashed `NNN.NNN.NNN-NN` (3.3.3-2
+split): three triples, then a dash and the two check digits. A CPF echoed into a
+free-text **memo or transaction name** is a direct Brazilian PII / payment-routing
+leak. The **pii** check flags a `br_cpf` finding (severity `high`) when a
+free-text field contains a string that clears three public, dependency-free
+gates:
+
+1. **shape** &mdash; exactly `NNN.NNN.NNN-NN`: eleven decimal digits in the
+   3.3.3-2 dotted-and-dashed grouping.
+2. **all-same-digit rejection** &mdash; the eleven repeated-digit values
+   (`000.000.000-00` … `999.999.999-99`) all satisfy the checksum arithmetic but
+   are well-known invalid placeholder CPFs that the official validator rejects, so
+   they are never reported.
+3. **check digits** &mdash; the first check digit is computed over the first nine
+   digits with descending weights `10, 9, … , 2`; the second over the first ten
+   digits with descending weights `11, 10, … , 2`. For each,
+   `r = (sum mod 11)` and the check digit is `0` when `r < 2` else `11 - r`. Both
+   must match.
+
+Unlike the UK / Canadian / Australian / Indian domestic routing codes, a CPF
+carries two public, self-contained mod-11 weighted check digits, so precision
+comes from a real double checksum plus the all-same-digit rejection &mdash; on a
+par with the IBAN / ABA / Luhn / CLABE / Giro / national-ID-gated identifiers. The
+dotted-and-dashed 3.3.3-2 presentation is the only detector that uses `.`
+separators, so it is distinct from every hyphenated detector &mdash; the SSN's
+3-2-4, the UK sort code's 2-2-2, the Canadian routing number's 5-3, the Australian
+BSB's 3-3, the South Korean Giro's 5-2, and the Thai national ID's 1-4-5-2-1
+&mdash; and from any contiguous digit run, so the detectors never collide. The
+compact 11-digit run is reserved under the account / routing namespaces so a valid
+CPF is reported once as the id it is rather than double-counted. Evidence is
+redacted to the leading block (`111.XXX.XXX-XX`); the identity-bearing digits and
+both check digits never leave the tool.
+
+```bash
+$ ferryman --check pii --format text leak.ofx
+  [HIGH] pii/br_cpf @ statement[0].transaction[0].memo: Brazilian CPF (valid NNN.NNN.NNN-NN structure, all-same-digit rejection, and two mod-11 check digits) leaking into a free-text field -- discloses the taxpayer id / Pix key a payer routes a transfer against.
+```
+
+**Remediation:** never echo a customer's CPF into a statement memo or transaction
+name; keep Pix keys in structured, access-controlled fields rather than free text.
 
 ## From finding to HackerOne report
 

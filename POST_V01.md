@@ -1113,6 +1113,72 @@ Public, dependency-free, ~12 lines of Python.
 
 ---
 
+## Rank 25 — Brazilian CPF / Pix Key Leak Detection, NNN.NNN.NNN-NN structure + all-same-digit rejection + dual mod-11 check-digit gated (HIGH signal, low effort) — ✅ IMPLEMENTED (2026-05-29, Phase 2 Rotation 27)
+
+**Pivot note:** Ranks 1–24 were all shipped. The R25 candidates were the
+**Indonesian NIK** and the **Brazilian CPF**. A fresh read of `checks/pii.py`
+confirmed neither was present (no `br_cpf`, no `nik`, no Brazilian/Indonesian
+handling). The **Indonesian NIK was rejected on the precision bar**: an NIK is a
+16-digit contiguous run (province/regency/district codes + a `DDMMYY` birthdate,
+with `+40` added to `DD` for females, + a daily sequence number) with **no
+self-contained check digit** — its only gates would be a region table and a date
+parse on a contiguous digit run, which collides head-on with the generic
+account-number scanner (`\d{8,}`) and gives no arithmetic checksum, the same
+precision problem that got the Japanese Zengin code and the bare branch codes
+rejected in earlier rotations. The **Brazilian CPF was chosen**: it carries TWO
+public, self-contained **mod-11 weighted check digits**, plus the standard
+all-same-digit placeholder rejection, and its canonical card / Pix-receipt
+presentation `NNN.NNN.NNN-NN` (3.3.3-2 split) is the **only** detector that uses
+`.` separators — so it is structurally distinct from every existing hyphenated
+detector and from any contiguous digit run. It clears ferryman's precision bar
+with both a unique structural gate and a real double checksum, on a par with the
+IBAN / ABA / Luhn / CLABE / Giro / national-ID-gated identifiers. It is the
+highest-value, highest-precision genuinely-unimplemented item.
+
+**Status:** Shipped. `checks/pii.py` gained `_br_cpf_valid()` (gates on the exact
+`NNN.NNN.NNN-NN` 3.3.3-2 dotted-and-dashed shape — validated structurally, not
+only in the regex, so a contiguous / hyphenated / wrong-split run is rejected by
+the helper itself; an all-same-digit rejection for the eleven repeated-digit
+placeholders that pass the arithmetic but are invalid CPFs; and the two public
+mod-11 weighted check digits — the first over the first nine digits with weights
+`10…2`, the second over the first ten with weights `11…2`, each
+`(0 if r<2 else 11-r)` for `r = sum mod 11`, which the respective check digit must
+equal) and `_redact_br_cpf()` (evidence redacted to the leading block,
+`111.XXX.XXX-XX`). A new `br_cpf` (high) finding runs in `_scan_text` **before**
+the credit-card scanner and reserves the compact 11-digit run under the
+`account_number` / `routing_number` dedupe namespaces (the dotted presentation
+already breaks the contiguous run, but the reservation keeps the
+no-double-counting guarantee explicit). The dotted-and-dashed 3.3.3-2 presentation
+is the only `.`-separated detector, so it never collides with the SSN's 3-2-4, the
+UK sort code's 2-2-2, the Canadian routing number's 5-3, the Australian BSB's 3-3,
+the South Korean Giro's 5-2, or the Thai national ID's 1-4-5-2-1. New fixture
+`tests/fixtures/br-cpf-leak.ofx` (two valid CPFs in two memos + one
+wrong-check-digit `111.444.777-34` decoy) plus 29 new test cases cover the
+validator (real-format CPFs, wrong-check-digit / repeated-digit-placeholder /
+off-by-one rejects, contiguous / hyphenated / wrong-split / non-numeric /
+double-separator garbage guards), free-text detection, redaction, the
+wrong-check-digit and repeated-digit-placeholder non-detection guards, the
+no-collision-with-digit-scanners guarantee, the no-collision-with-other-separated-
+detectors guarantee, the no-interference-with-other-identifiers guard, per-field
+dedupe, the fixture, and the clean-file guard. README gained a Brazilian CPF / Pix
+section and the type lists were updated. The SARIF mapping auto-generates the
+`pii/br_cpf` rule with no changes. No new dependencies (stdlib `re` only).
+
+**Research grounding:** Brazilian CPF (Cadastro de Pessoas Físicas) — an 11-digit
+individual taxpayer registry number printed `NNN.NNN.NNN-NN`, where the final two
+digits are public mod-11 weighted check digits. Under the Banco Central do Brasil
+Pix scheme the CPF is the most common payee "chave" (key) an instant interbank
+transfer is routed against (the other keys being a phone number, an email, or a
+random EVP key), so a free-text CPF echo discloses the exact value needed to push
+funds to that person — a reportable Brazilian PII / payment-routing disclosure.
+The eleven repeated-digit values pass the checksum arithmetic but are well-known
+invalid placeholder CPFs, so the official validator (and ferryman) rejects them.
+Public, dependency-free, ~25 lines of Python.
+
+**Estimated tokens:** 30–50K
+
+---
+
 ## Research notes
 
 **Sources consulted:**

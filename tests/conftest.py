@@ -132,6 +132,12 @@ def th_natid_file() -> Path:
 
 
 @pytest.fixture
+def br_cpf_file() -> Path:
+    """A bank statement leaking valid Brazilian CPFs (NNN.NNN.NNN-NN)."""
+    return FIXTURES / "br-cpf-leak.ofx"
+
+
+@pytest.fixture
 def entity_bomb_file() -> Path:
     return FIXTURES / "entity-bomb.ofx"
 
