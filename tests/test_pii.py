@@ -13,6 +13,7 @@ from ferryman.checks.pii import (
     _au_bsb_valid,
     _bic_valid,
     _ca_routing_valid,
+    _clabe_valid,
     _cusip_valid,
     _iban_valid,
     _ifsc_valid,
@@ -1812,3 +1813,141 @@ def test_email_leak_fixture(email_file):
 def test_clean_file_no_email(clean_file):
     findings = check_pii(clean_file.read_bytes())
     assert "email_address" not in {f.type for f in findings}
+
+
+# --- Mexican CLABE detection (18-digit, bank code + mod-10 control digit) ---
+
+# Real-format Mexican CLABE numbers (18 digits: 3-digit bank code + 3-digit
+# plaza + 11-digit account + 1 control digit). Each control digit was computed
+# from the public mod-10 weighted algorithm, so each must pass the gate. The
+# leading three digits are non-zero Banxico-assigned bank codes (002 Banamex,
+# 012 BBVA, 014 Santander, 032 IXE/Banorte family, 127 Azteca).
+VALID_CLABE = [
+    "002180001234567896",  # bank 002 (Banamex)
+    "012180005432109877",  # bank 012 (BBVA)
+    "012180000000543213",  # bank 012, account-heavy zeros
+    "032180001112223332",  # bank 032
+    "127180012345678904",  # bank 127
+]
+
+# 18-digit runs shaped like a CLABE but failing a gate -- they must NOT validate.
+INVALID_CLABE = [
+    "002180001234567890",  # wrong control digit (real one is ...96)
+    "012180005432109870",  # wrong control digit (real one is ...77)
+    "000180001234567890",  # bank code 000 is never assigned
+    "111111111111111111",  # all-ones -- fails the control digit
+    "123456789012345678",  # sequential -- fails the control digit
+]
+
+
+@pytest.mark.parametrize("digits", VALID_CLABE)
+def test_clabe_accepts_real_numbers(digits):
+    assert _clabe_valid(digits) is True
+
+
+@pytest.mark.parametrize("digits", INVALID_CLABE)
+def test_clabe_rejects_invalid(digits):
+    assert _clabe_valid(digits) is False
+
+
+@pytest.mark.parametrize(
+    "bad",
+    ["", "  ", "00218000123456789", "0021800012345678901", "abcdefghijklmnopqr"],
+)
+def test_clabe_rejects_garbage(bad):
+    # Defensive: empty / wrong-length (17 or 19) / non-numeric input is never a
+    # valid CLABE.
+    assert _clabe_valid(bad) is False
+
+
+def test_clabe_in_memo_detected():
+    findings = _scan("Routed to CLABE 002180001234567896 Banamex")
+    codes = [f for f in findings if f.type == "clabe"]
+    assert len(codes) == 1
+    assert codes[0].severity == "high"
+    assert codes[0].check == "pii"
+    # Only the three-digit bank code survives for triage; the rest is masked.
+    assert codes[0].evidence == "002XXXXXXXXXXXXXXX"
+
+
+def test_clabe_redaction_masks_account():
+    findings = _scan("beneficiary 012180005432109877")
+    codes = [f for f in findings if f.type == "clabe"]
+    assert len(codes) == 1
+    assert codes[0].evidence == "012XXXXXXXXXXXXXXX"
+    # The account-identifying digits never leave the tool.
+    assert "543210987" not in codes[0].evidence
+
+
+def test_clabe_wrong_control_digit_not_reported():
+    # An 18-digit run with a valid bank code but a wrong control digit has the
+    # CLABE shape but fails the checksum -- it is not reported as a CLABE.
+    findings = _scan("decoy reference 002180001234567890 logged")
+    assert "clabe" not in {f.type for f in findings}
+
+
+def test_clabe_zero_bank_code_not_reported():
+    # A 000 bank code is never assigned, so even a checksum-shaped run is not a
+    # CLABE.
+    findings = _scan("reference 000180001234567890 logged")
+    assert "clabe" not in {f.type for f in findings}
+
+
+def test_clabe_does_not_collide_with_digit_scanners():
+    # A valid CLABE is reserved under the card / account / routing namespaces, so
+    # the 13-19-digit card scanner and the 8+-digit account scanner never also
+    # claim the same run as a separate finding.
+    findings = _scan("paid via 002180001234567896 to vendor")
+    types = [f.type for f in findings]
+    assert types.count("clabe") == 1
+    assert "account_number" not in types
+    assert "credit_card" not in types
+    assert "routing_number" not in types
+
+
+def test_clabe_does_not_break_other_identifiers():
+    # The CLABE scan must not interfere with the other identifiers when those
+    # appear on their own.
+    card_findings = _scan("card 4111111111111111 today")
+    assert [f.type for f in card_findings] == ["credit_card"]
+    acct_findings = [f for f in _scan("account 123456789012 on file")
+                     if f.type == "account_number"]
+    assert len(acct_findings) == 1
+
+
+def test_invalid_clabe_still_seen_as_account_number():
+    # An 18-digit run that fails the CLABE control digit is NOT a CLABE, but it
+    # is still an account-number-shaped run and must be reported as such (no leak
+    # is silently dropped).
+    findings = _scan("reference 002180001234567890 noted")
+    types = {f.type for f in findings}
+    assert "clabe" not in types
+    assert "account_number" in types
+
+
+def test_same_clabe_deduped_per_field():
+    findings = _scan(
+        "CLABE 002180001234567896 and again 002180001234567896 in one memo"
+    )
+    codes = [f for f in findings if f.type == "clabe"]
+    assert len(codes) == 1
+
+
+def test_clabe_leak_fixture(clabe_file):
+    findings = check_pii(clabe_file.read_bytes())
+    codes = [f for f in findings if f.type == "clabe"]
+    types = {f.type for f in findings}
+    assert "clabe" in types, f"expected clabe, got: {types}"
+    # The fixture leaks two valid CLABEs in memos; the wrong-control-digit
+    # decoy (012180005432109870) must NOT be reported as a CLABE.
+    assert len(codes) == 2
+    assert all(c.severity == "high" for c in codes)
+    for c in codes:
+        # Only the three-digit bank code survives in the evidence.
+        assert c.evidence.endswith("X" * 15)
+        assert "clabe" == c.type
+
+
+def test_clean_file_no_clabe(clean_file):
+    findings = check_pii(clean_file.read_bytes())
+    assert "clabe" not in {f.type for f in findings}

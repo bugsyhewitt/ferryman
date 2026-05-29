@@ -87,6 +87,15 @@ Detection classes:
                                 equivalent of an ABA routing number / UK sort code /
                                 Australian BSB, the value a NEFT / RTGS / IMPS
                                 payment routes against.
+- ``clabe``                   : a Mexican CLABE (Clave Bancaria Estandarizada) --
+                                the 18-digit standardized bank-account number
+                                (3-digit bank code + 3-digit branch/plaza code +
+                                11-digit account + 1 control digit) -- whose
+                                non-zero bank code and mod-10 weighted control
+                                digit both validate, a near-certain Mexican
+                                bank-account leak. Checked before the generic
+                                account-number run so a valid CLABE is named as
+                                the account identifier it is.
 - ``account_number``          : a long account-number-shaped digit run leaking
                                 into a transaction name/memo.
 - ``routing_number``          : a 9-digit run that passes the ABA weighted
@@ -438,6 +447,25 @@ _IFSC_RE = re.compile(
 )
 # An IFSC is exactly 11 characters (4 bank + 1 reserved zero + 6 branch).
 _IFSC_LEN = 11
+
+# Mexican CLABE (Clave Bancaria Estandarizada) candidate -- the 18-digit
+# standardized bank-account number that drives every domestic SPEI / interbank
+# transfer in Mexico. Its structure is a 3-digit bank (institution) code, a
+# 3-digit branch/plaza code, an 11-digit account number, and one trailing
+# control digit. The whole value is a contiguous 18-digit run, so -- unlike the
+# hyphenated routing codes -- it WOULD be claimed by the generic account-number
+# scanner (8+ digits); we therefore check it first and reserve the run. The run
+# is bounded by a non-digit lookaround so a CLABE embedded in a longer digit blob
+# is not partially matched. Unlike the UK/CA/AU/IN routing codes, a CLABE carries
+# a public, self-contained control digit, so precision comes from a real
+# arithmetic checksum plus the non-zero bank code -- on a par with the
+# IBAN/ABA/Luhn-gated identifiers. The caller validates both before reporting.
+_CLABE_RE = re.compile(r"(?<!\d)\d{18}(?!\d)")
+# A CLABE is exactly 18 digits.
+_CLABE_LEN = 18
+# CLABE control-digit weights, applied positionally and repeating across the
+# first 17 digits (the 18th is the control digit being checked).
+_CLABE_WEIGHTS = (3, 7, 1)
 
 
 def _luhn_valid(digits: str) -> bool:
@@ -966,6 +994,55 @@ def _redact_ifsc(code: str) -> str:
     """
     code = code.upper()
     return code[:4] + "X" * (len(code) - 4)
+
+
+def _clabe_valid(candidate: str) -> bool:
+    """Return ``True`` if a string is a structurally valid Mexican CLABE.
+
+    A CLABE (Clave Bancaria Estandarizada) is the 18-digit standardized
+    bank-account number that every domestic SPEI / interbank transfer in Mexico
+    is routed against -- the Mexican equivalent of an IBAN, and the value (on its
+    own) needed to receive funds into a specific account. Unlike the UK / Canadian
+    / Australian / Indian routing codes it carries a public, self-contained
+    arithmetic control digit, so precision comes from two public, dependency-free
+    gates:
+
+        1. **Shape** -- exactly 18 decimal digits: a 3-digit bank (institution)
+           code, a 3-digit branch/plaza code, an 11-digit account number, and one
+           trailing control digit.
+        2. **Bank code** -- the leading three digits (the Banxico-assigned bank
+           code) must be non-zero. ``000`` is never an assigned institution, so an
+           all-zeros or zero-prefixed leading code is never a live CLABE.
+        3. **Control digit** -- multiply each of the first 17 digits by the
+           repeating weights ``(3, 7, 1)``, take each product *mod 10*, sum those,
+           and the control digit is ``(10 - (sum mod 10)) mod 10``. The 18th digit
+           must equal that control digit.
+
+    A run that clears all three gates is a near-certain real CLABE; a coincidental
+    18-digit run fails the control digit with overwhelming probability. Any
+    malformed input returns ``False`` so the helper is safe to reuse.
+    """
+    clabe = candidate.strip()
+    if len(clabe) != _CLABE_LEN or not clabe.isdigit():
+        return False
+    if int(clabe[:3]) == 0:
+        return False
+    total = 0
+    for i, ch in enumerate(clabe[:17]):
+        total += (int(ch) * _CLABE_WEIGHTS[i % 3]) % 10
+    control = (10 - (total % 10)) % 10
+    return control == int(clabe[17])
+
+
+def _redact_clabe(clabe: str) -> str:
+    """Redact a CLABE, preserving only the leading bank code for triage.
+
+    The first three digits identify the bank/institution (useful context for a
+    report -- 002 Banamex, 012 BBVA, 014 Santander, and so on) while the
+    branch/plaza code, the account number, and the control digit -- the part that
+    pins the leak to a specific account -- are masked.
+    """
+    return clabe[:3] + "X" * (len(clabe) - 3)
 
 
 def _redact_sedol(sedol: str) -> str:
@@ -1522,6 +1599,41 @@ def _scan_text(
                 "bank/branch routing of an account.",
                 location=location,
                 evidence=_redact_ifsc(compact),
+            )
+        )
+
+    # Mexican CLABE numbers (18 contiguous digits) -- the Mexican standardized
+    # bank-account number. Unlike the hyphenated routing codes a CLABE is a
+    # contiguous digit run, so it would otherwise be claimed by the credit-card
+    # (13-19 digit) and the account-number (8+ digit) scanners below. We check it
+    # first, gate on the non-zero bank code AND the public mod-10 weighted control
+    # digit, and reserve the run under every numeric namespace so the same leak is
+    # never re-reported as a card or a generic account number. A CLABE echoed into
+    # free text is a near-certain Mexican bank-account leak -- on its own it is the
+    # value needed to route a SPEI transfer into the account.
+    for m in _CLABE_RE.finditer(text):
+        digits = m.group(0)
+        if not _clabe_valid(digits):
+            continue
+        key = ("clabe", digits)
+        if key in seen:
+            continue
+        seen.add(key)
+        # Reserve the run under the card / account / routing namespaces so the
+        # scanners below never re-report a slice of the same CLABE.
+        seen.add(("credit_card", digits))
+        seen.add(("account_number", digits))
+        seen.add(("routing_number", digits))
+        findings.append(
+            Finding(
+                check="pii",
+                type="clabe",
+                severity="high",
+                message="Mexican CLABE (valid 18-digit structure, non-zero bank "
+                "code, and mod-10 control digit) leaking into a free-text field "
+                "-- discloses a bank account routable for a SPEI transfer.",
+                location=location,
+                evidence=_redact_clabe(digits),
             )
         )
 

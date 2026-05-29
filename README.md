@@ -15,7 +15,8 @@ scanner that treats an OFX file as an attack surface and asks three questions:
   tax IDs), payment-card numbers (PANs), IBANs, securities identifiers
   (ISIN/CUSIP/SEDOL),
   legal-entity identifiers (LEI), bank identifier codes (BIC/SWIFT), UK sort
-  codes, Canadian routing numbers, Australian BSB codes, Indian IFSC codes, full
+  codes, Canadian routing numbers, Australian BSB codes, Indian IFSC codes,
+  Mexican CLABE numbers, full
   account numbers, and routing numbers smuggled into free-text transaction names
   and memos.
 - **Is this file anomalous?** Out-of-range posting dates, zero / sign-flipped /
@@ -58,7 +59,8 @@ ferryman [--check {malformed,pii,anomaly,all}] [--format {json,text,h1md,sarif}]
     on raw bytes; never parses a hostile file.
   - `pii` &mdash; PII leaking into transaction free-text (email address, SSN,
     ITIN, payment-card number, IBAN, ISIN, CUSIP, SEDOL, LEI, BIC/SWIFT, UK sort
-    code, Canadian routing number, Australian BSB code, Indian IFSC code, account
+    code, Canadian routing number, Australian BSB code, Indian IFSC code, Mexican
+    CLABE, account
     number, routing number), including investment memos and security ids.
     Evidence is always redacted before it leaves the tool.
   - `anomaly` &mdash; structurally valid but suspicious transactions
@@ -782,6 +784,47 @@ $ ferryman --check pii --format text leak.ofx
 
 **Remediation:** never echo a customer's IFSC into a statement memo or transaction
 name; keep bank/branch routing identifiers in structured, access-controlled
+fields rather than free text.
+
+### Mexican CLABE leak detection
+
+A [CLABE (Clave Bancaria Estandarizada)](https://en.wikipedia.org/wiki/CLABE) is
+the eighteen-digit standardized bank-account number that every domestic SPEI /
+interbank transfer in Mexico is routed against &mdash; the Mexican equivalent of
+an IBAN, and the value (on its own) needed to receive funds into a specific
+account. It is `BBBPPPNNNNNNNNNNNC`: a three-digit bank (institution) code, a
+three-digit branch/plaza code, an eleven-digit account number, and one trailing
+control digit. A CLABE echoed into a free-text **memo or transaction name**
+discloses a bank account routable for a SPEI transfer. The **pii** check flags a
+`clabe` finding (severity `high`) when a free-text field contains a string that
+clears two public, dependency-free gates:
+
+1. **shape + bank code** &mdash; exactly eighteen decimal digits, with a non-zero
+   leading three-digit bank code (`000` is never an assigned institution).
+2. **control digit** &mdash; multiply each of the first seventeen digits by the
+   repeating weights `(3, 7, 1)`, take each product mod 10, sum them, and the
+   control digit is `(10 - (sum mod 10)) mod 10`. The eighteenth digit must equal
+   that control digit.
+
+Unlike the UK / Canadian / Australian / Indian domestic routing codes, a CLABE
+carries a public, self-contained arithmetic control digit, so precision comes
+from a real checksum &mdash; on a par with the IBAN / ABA / Luhn-gated
+identifiers. Because a CLABE is a contiguous eighteen-digit run it is checked
+**before** the payment-card and account-number scanners and its run is reserved,
+so a valid CLABE is reported once as the account identifier it is rather than
+being double-counted as a card or a generic account number. An eighteen-digit run
+that fails the control digit is not a CLABE but is still reported as an
+`account_number` (no leak is silently dropped). Evidence is redacted to the
+three-digit bank code (`002XXXXXXXXXXXXXXX`); the branch, account, and control
+digit never leave the tool.
+
+```bash
+$ ferryman --check pii --format text leak.ofx
+  [HIGH] pii/clabe @ statement[0].transaction[0].memo: Mexican CLABE (valid 18-digit structure, non-zero bank code, and mod-10 control digit) leaking into a free-text field -- discloses a bank account routable for a SPEI transfer.
+```
+
+**Remediation:** never echo a customer's CLABE into a statement memo or
+transaction name; keep bank-account identifiers in structured, access-controlled
 fields rather than free text.
 
 ## From finding to HackerOne report
