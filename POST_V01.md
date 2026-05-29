@@ -992,6 +992,62 @@ free-text CLABE echo is a reportable Mexican bank-account disclosure.
 
 ---
 
+## Rank 23 — South Korean Giro Number Leak Detection, NNNNN-NN structure + non-zero payee block + mod-10 check-digit gated (HIGH signal, low effort) — ✅ IMPLEMENTED (2026-05-29, Phase 2 Rotation 25)
+
+**Pivot note:** Ranks 1–22 were all shipped. The suggested R23 candidates were
+the **South Korean Giro/Bank code** and the **South African SWIFT branch code**.
+A fresh read of `checks/pii.py` confirmed neither was present. The South Korean
+Giro number was chosen over the South African option: the South African
+domestic identifier is either a SWIFT/BIC branch code (which collides with the
+already-shipped Rank 16 BIC detector) or the bare six-digit universal branch
+code (which has no self-contained check digit — the same precision problem that
+got the Japanese Zengin code rejected in Rotation 24). The Korean Giro number,
+by contrast, carries a public, self-contained **mod-10 weighted check digit**
+(weights `3,1,3,1,3,1` over the six-digit payee block), and its canonical
+**hyphenated `NNNNN-NN` (5-2) bill presentation** is structurally distinct from
+every existing hyphenated detector — so it clears ferryman's precision bar with
+both a structural gate and an arithmetic checksum, on a par with the IBAN / ABA /
+Luhn / CLABE-gated identifiers. It is the highest-value, highest-precision
+genuinely-unimplemented item.
+
+**Status:** Shipped. `checks/pii.py` gained `_kr_giro_valid()` (gates on the
+exact `NNNNN-NN` shape: five digits, a hyphen, two digits; a non-zero six-digit
+payee block — `000000` is never a live payee; and the public mod-10 weighted
+check digit: each of the first six digits times the repeating weights
+`(3, 1, 3, 1, 3, 1)`, summed, check digit `(10 - sum mod 10) mod 10`, which the
+seventh digit must equal) and `_redact_kr_giro()` (evidence redacted to the
+leading two digits, `10XXX-XX`). A new `kr_giro` (high) finding runs in
+`_scan_text`. The hyphenated 5-2 shape is distinct from any contiguous digit run
+(so it never competes with the card / account / routing scanners) and from every
+other hyphenated detector — the SSN's 3-2-4, the UK sort code's 2-2-2, the
+Canadian routing number's 5-3, and the Australian BSB's 3-3 — so the five
+hyphenated detectors never collide (a CA routing token `12345-003` is a 5-3 split
+and is excluded by the trailing non-digit lookaround). New fixture
+`tests/fixtures/kr-giro-leak.ofx` (two valid Giro numbers in two memos + one
+wrong-check-digit `10005-21` decoy) plus 29 new test cases cover the validator
+(real-format Giro numbers across several payee blocks, wrong-check-digit /
+zero-payee-block / coincidental-token rejects, wrong-split / non-numeric /
+double-hyphen / short-tail garbage guards), free-text detection, redaction, the
+wrong-check-digit and zero-payee-block non-detection guards, the
+no-collision-with-digit-scanners guarantee, the no-collision-with-other-
+hyphenated-detectors guarantee, the no-interference-with-other-identifiers guard,
+per-field dedupe, the fixture, and the clean-file guard. README gained a South
+Korean Giro section and the type lists were updated. The SARIF mapping
+auto-generates the `pii/kr_giro` rule with no changes. No new dependencies
+(stdlib `re` only). Test count 521 → 550.
+
+**Research grounding:** Korea Financial Telecommunications & Clearings Institute
+Giro (지로) system — a Giro number is the seven-digit payee-routing code printed
+on a domestic utility / tax / insurance bill, written `NNNNN-NN` (a six-digit
+payee/biller block plus one trailing mod-10 weighted check digit). It is the
+value a domestic Giro bill payment is routed against, so a free-text Giro echo is
+a reportable South Korean biller-routing disclosure. Public, dependency-free,
+~12 lines of Python.
+
+**Estimated tokens:** 30–50K
+
+---
+
 ## Research notes
 
 **Sources consulted:**
