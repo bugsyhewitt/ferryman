@@ -72,6 +72,12 @@ def lei_file() -> Path:
 
 
 @pytest.fixture
+def bic_file() -> Path:
+    """A bank statement leaking valid BIC/SWIFT codes (ISO 9362) in free text."""
+    return FIXTURES / "bic-leak.ofx"
+
+
+@pytest.fixture
 def entity_bomb_file() -> Path:
     return FIXTURES / "entity-bomb.ofx"
 

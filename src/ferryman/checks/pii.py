@@ -20,6 +20,11 @@ Detection classes:
                                 ISO 7064 mod-97-10 check digits) -- whose check
                                 digits validate, a near-certain counterparty /
                                 legal-entity disclosure.
+- ``bic``                     : a Bank Identifier Code / SWIFT code (ISO 9362) --
+                                an 8- or 11-char code (bank + ISO 3166-1 country
+                                + location [+ branch]) -- whose structure, country
+                                code, and location-code rules all validate, a
+                                near-certain financial-institution disclosure.
 - ``isin``                    : an International Securities Identification Number
                                 (ISO 6166) -- a 12-char country-code + NSIN +
                                 Luhn check digit -- whose check digit validates,
@@ -143,6 +148,42 @@ _IBAN_MAX_LEN = 34
 _LEI_RE = re.compile(r"(?<![A-Za-z0-9])[A-Za-z0-9]{18}\d{2}(?![A-Za-z0-9])")
 # LEIs are always exactly 20 characters (18 entity + 2 check digits).
 _LEI_LEN = 20
+
+# BIC / SWIFT (ISO 9362) candidate: an 8-character base -- four letters (the
+# institution/bank code), two letters (an ISO 3166-1 alpha-2 country code), and a
+# two-character alphanumeric location code -- optionally followed by a
+# three-character alphanumeric branch code (total 11). The run is bounded by a
+# non-alphanumeric lookaround so a BIC embedded in a longer alphanumeric blob is
+# not partially matched. The match is deliberately UPPER-CASE only: a BIC is an
+# ISO 9362 code always transmitted in upper case, while an all-letter BIC shape is
+# otherwise dangerously easy to collide with an ordinary lower-case English word
+# (e.g. "beneficiary" -> B-E-N-E-F[FI]-... ). Restricting the regex to upper case
+# is the precision lever that keeps prose out of the BIC channel; the
+# ``_bic_valid`` helper itself stays case-insensitive so it is safe to reuse. The
+# caller validates the structure, the country code against the ISO 3166-1
+# registry, and the ISO 9362 location-code rules before reporting.
+_BIC_RE = re.compile(
+    r"(?<![A-Za-z0-9])[A-Z]{6}[A-Z0-9]{2}(?:[A-Z0-9]{3})?(?![A-Za-z0-9])"
+)
+# A BIC is exactly 8 (bank + country + location) or 11 (+ branch) characters.
+_BIC_LENGTHS = (8, 11)
+# ISO 3166-1 alpha-2 country codes -- the set a BIC's 5th-6th characters must be
+# drawn from. Gating on the registered country code (exactly as the IBAN gate
+# does) is the primary precision lever that keeps an ordinary 8-letter word from
+# being misread as a BIC: it must end in a real country code AND satisfy the
+# location-code rules below. The list is the full ISO 3166-1 alpha-2 assignment.
+_ISO_3166_1 = frozenset(
+    "AD AE AF AG AI AL AM AO AQ AR AS AT AU AW AX AZ BA BB BD BE BF BG BH BI BJ "
+    "BL BM BN BO BQ BR BS BT BV BW BY BZ CA CC CD CF CG CH CI CK CL CM CN CO CR "
+    "CU CV CW CX CY CZ DE DJ DK DM DO DZ EC EE EG EH ER ES ET FI FJ FK FM FO FR "
+    "GA GB GD GE GF GG GH GI GL GM GN GP GQ GR GS GT GU GW GY HK HM HN HR HT HU "
+    "ID IE IL IM IN IO IQ IR IS IT JE JM JO JP KE KG KH KI KM KN KP KR KW KY KZ "
+    "LA LB LC LI LK LR LS LT LU LV LY MA MC MD ME MF MG MH MK ML MM MN MO MP MQ "
+    "MR MS MT MU MV MW MX MY MZ NA NC NE NF NG NI NL NO NP NR NU NZ OM PA PE PF "
+    "PG PH PK PL PM PN PR PS PT PW PY QA RE RO RS RU RW SA SB SC SD SE SG SH SI "
+    "SJ SK SL SM SN SO SR SS ST SV SX SY SZ TC TD TF TG TH TJ TK TL TM TN TO TR "
+    "TT TV TW TZ UA UG UM US UY UZ VA VC VE VG VI VN VU WF WS XK YE YT ZA ZM ZW".split()
+)
 
 # ISIN (ISO 6166) candidate: a 12-character run of two letters (country / "XS"
 # for international issues), nine alphanumeric NSIN characters, and one trailing
@@ -363,6 +404,57 @@ def _redact_lei(lei: str) -> str:
     """
     lei = lei.upper()
     return lei[:4] + "X" * (len(lei) - 4)
+
+
+def _bic_valid(candidate: str) -> bool:
+    """Return ``True`` if a string is a structurally valid BIC (ISO 9362).
+
+    A BIC (Bank/Business Identifier Code, the value carried in a SWIFT message
+    and printed alongside an IBAN) is the public identifier for a financial
+    institution. Unlike the account/security identifiers, ISO 9362 defines no
+    arithmetic checksum -- its precision comes instead from a strict structure
+    plus a registered country code:
+
+        1. **Shape** -- exactly 8 or 11 characters. The first four are letters
+           (the institution / bank code), the next two are letters (the country
+           code), the next two are alphanumeric (the location code), and -- for
+           the 11-character form -- the final three are alphanumeric (the branch
+           code).
+        2. **Country** -- the 5th-6th characters must be a registered ISO 3166-1
+           alpha-2 country code. This is the primary precision lever (mirroring
+           the IBAN gate): an ordinary 8-letter word will almost never end in a
+           real country code AND satisfy the location rules below.
+        3. **Location code** -- per ISO 9362, the first location character must
+           not be ``0`` or ``1`` (those are reserved) and the second must not be
+           the letter ``O`` (to avoid confusion with zero).
+
+    A run that clears all three is a near-certain real BIC; a coincidental
+    alphanumeric blob fails one of them with overwhelming probability. Any
+    malformed input returns ``False`` so the helper is safe to reuse.
+    """
+    bic = candidate.strip().upper()
+    if len(bic) not in _BIC_LENGTHS:
+        return False
+    # Bank code (4) + country code (2) must be letters; the rest alphanumeric.
+    if not (bic[:6].isalpha() and bic[6:].isalnum()):
+        return False
+    if bic[4:6] not in _ISO_3166_1:
+        return False
+    # Location code rules (ISO 9362): pos 7 not in {0,1}; pos 8 not 'O'.
+    if bic[6] in "01" or bic[7] == "O":
+        return False
+    return True
+
+
+def _redact_bic(bic: str) -> str:
+    """Redact a BIC, preserving only the bank + country prefix for triage.
+
+    The leading six characters (institution code + country) identify the bank
+    and jurisdiction -- useful context for a report -- while the location and
+    branch codes, which pin the leak to a specific office, are masked.
+    """
+    bic = bic.upper()
+    return bic[:6] + "X" * (len(bic) - 6)
 
 
 def _isin_valid(candidate: str) -> bool:
@@ -645,6 +737,44 @@ def _scan_text(
                 "discloses the legal entity behind a transaction.",
                 location=location,
                 evidence=_redact_lei(compact),
+            )
+        )
+
+    # BICs / SWIFT codes (ISO 9362) -- check before the securities identifiers and
+    # the credit-card / account-number runs. A BIC is an 8- or 11-char run that is
+    # mostly letters and is gated on its strict structure, a registered ISO 3166-1
+    # country code, AND the ISO 9362 location-code rules -- there is no arithmetic
+    # checksum, but the country gate plus the location rules make a coincidental
+    # word vanishingly unlikely to validate. A BIC discloses the financial
+    # institution behind a transaction (and pairs with an IBAN to fully identify a
+    # bank account), so an echo into free text is a counterparty-confidentiality
+    # leak.
+    for m in _BIC_RE.finditer(text):
+        candidate = m.group(0)
+        if not _bic_valid(candidate):
+            continue
+        compact = candidate.upper()
+        key = ("bic", compact)
+        if key in seen:
+            continue
+        seen.add(key)
+        # Reserve any digit run inside the BIC under the account/card/routing
+        # namespaces so the scanners below never re-report a slice of the same
+        # identifier (a BIC's location/branch code may contain digits).
+        for run in re.findall(r"\d+", compact):
+            seen.add(("account_number", run))
+            seen.add(("credit_card", run))
+            seen.add(("routing_number", run))
+        findings.append(
+            Finding(
+                check="pii",
+                type="bic",
+                severity="high",
+                message="Bank Identifier Code (BIC/SWIFT, valid ISO 9362 "
+                "structure and country code) leaking into a free-text field -- "
+                "identifies the financial institution behind a transaction.",
+                location=location,
+                evidence=_redact_bic(compact),
             )
         )
 

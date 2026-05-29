@@ -10,6 +10,7 @@ import pytest
 
 from ferryman.checks.pii import (
     _aba_checksum_valid,
+    _bic_valid,
     _cusip_valid,
     _iban_valid,
     _isin_valid,
@@ -848,3 +849,145 @@ def test_lei_leak_fixture(lei_file):
 def test_clean_file_no_lei(clean_file):
     findings = check_pii(clean_file.read_bytes())
     assert "lei" not in {f.type for f in findings}
+
+
+# --- BIC / SWIFT detection (ISO 9362 structure + country-code gated) ---
+
+# Real, published BIC/SWIFT codes (public information). Each must pass the
+# structure + country code + location-code rules. Both the 8-char (head office)
+# and 11-char (with branch code) forms are represented.
+VALID_BICS = [
+    "DEUTDEFF",      # Deutsche Bank, Frankfurt (8-char)
+    "DEUTDEFF500",   # Deutsche Bank, Frankfurt, branch 500 (11-char)
+    "BOFAUS3N",      # Bank of America, US
+    "CHASUS33",      # JPMorgan Chase, US
+    "NWBKGB2L",      # NatWest, GB
+    "BNPAFRPP",      # BNP Paribas, FR
+    "UBSWCHZH80A",   # UBS, Zurich, branch 80A (11-char)
+    "HBUKGB4B",      # HSBC, GB
+]
+
+# Strings shaped like a BIC but failing the structure, the country code, or the
+# location-code rules -- they must NOT validate.
+INVALID_BICS = [
+    "DEUTXXFF",      # "XX" is not a registered ISO 3166-1 country code
+    "DEUTDE0F",      # location code first char '0' is reserved
+    "DEUTDE1F",      # location code first char '1' is reserved
+    "DEUTDEFO",      # location code second char 'O' is forbidden
+    "DEUT1EFF",      # country code contains a digit (not two letters)
+    "DEUTDEF",       # 7 chars -- wrong length
+    "DEUTDEFF50",    # 10 chars -- wrong length (branch must be 0 or 3 chars)
+]
+
+
+@pytest.mark.parametrize("bic", VALID_BICS)
+def test_bic_accepts_real_bics(bic):
+    assert _bic_valid(bic) is True
+
+
+@pytest.mark.parametrize("bic", INVALID_BICS)
+def test_bic_rejects_invalid(bic):
+    assert _bic_valid(bic) is False
+
+
+@pytest.mark.parametrize(
+    "bad", ["", "DEUT", "  ", "DEUTDEF!", "12345678", "DEUTDEFF!00"]
+)
+def test_bic_rejects_garbage(bad):
+    # Defensive: malformed / wrong-length / non-alphanumeric input is never a
+    # valid BIC.
+    assert _bic_valid(bad) is False
+
+
+def test_bic_lowercase_accepted_by_validator():
+    # BICs are case-insensitive; the validator upper-cases before checking.
+    assert _bic_valid("deutdeff500") is True
+
+
+def test_bic_8char_in_memo_detected():
+    findings = _scan("settlement at BOFAUS3N this morning")
+    bics = [f for f in findings if f.type == "bic"]
+    assert len(bics) == 1
+    assert bics[0].severity == "high"
+    assert bics[0].check == "pii"
+    # Only the bank + country prefix survives for triage; the location/branch
+    # code is masked.
+    assert (bics[0].evidence or "").startswith("BOFAUS")
+    assert "X" in (bics[0].evidence or "")
+    assert "3N" not in (bics[0].evidence or "")
+
+
+def test_bic_11char_branch_code_detected():
+    findings = _scan("wire routed via DEUTDEFF500 to the beneficiary")
+    bics = [f for f in findings if f.type == "bic"]
+    assert len(bics) == 1
+    # The 11-char form keeps the 6-char prefix and masks the 5 trailing chars.
+    assert bics[0].evidence == "DEUTDEXXXXX"
+
+
+def test_bic_lowercase_not_detected_in_freetext():
+    # Detection is upper-case only by design: a BIC is always transmitted in
+    # upper case, and matching lower-case all-letter runs would flood reports
+    # with ordinary English words (e.g. "beneficiary"). The validator helper
+    # stays case-insensitive, but the free-text scan does not.
+    findings = _scan("paid through deutdeff today")
+    assert "bic" not in {f.type for f in findings}
+
+
+def test_bic_lowercase_word_not_misdetected():
+    # "beneficiary" is B-E-N-E-F-I-C-I-A-R-Y: 11 letters whose 5th-6th chars are
+    # "FI" (Finland) -- a country-code collision the upper-case-only rule guards
+    # against. It must NOT be reported as a BIC.
+    findings = _scan("wire to the beneficiary bank today")
+    assert "bic" not in {f.type for f in findings}
+
+
+def test_invalid_bic_not_reported():
+    # A BIC-shaped run with an unregistered country code must NOT be reported.
+    findings = _scan("ref DEUTXXFF logged")
+    assert "bic" not in {f.type for f in findings}
+
+
+def test_bic_does_not_break_other_identifiers():
+    # The BIC regex (mostly letters, 8/11 chars) must not interfere with the
+    # numeric/check-digit identifiers when those appear on their own.
+    isin_findings = _scan("US0378331005 holding")
+    assert [f.type for f in isin_findings] == ["isin"]
+    lei_findings = _scan("counterparty 529900T8BM49AURSDO55 noted")
+    assert [f.type for f in lei_findings] == ["lei"]
+
+
+def test_bic_not_double_counted():
+    # A BIC must be classified once -- as a bic -- and never also as an
+    # account_number / routing / credit_card finding for any digit run inside it.
+    findings = _scan("via UBSWCHZH80A to the account")
+    types = [f.type for f in findings]
+    assert types.count("bic") == 1
+    assert "account_number" not in types
+    assert "routing_number" not in types
+    assert "credit_card" not in types
+
+
+def test_same_bic_deduped_per_field():
+    findings = _scan("BOFAUS3N aka bofaus3n twice")
+    bics = [f for f in findings if f.type == "bic"]
+    assert len(bics) == 1
+
+
+def test_bic_leak_fixture(bic_file):
+    findings = check_pii(bic_file.read_bytes())
+    bics = [f for f in findings if f.type == "bic"]
+    types = {f.type for f in findings}
+    assert "bic" in types, f"expected bic, got: {types}"
+    # The fixture leaks two valid BICs in memos; the bad-country decoy (DEUTXXFF)
+    # must NOT be reported.
+    assert len(bics) == 2
+    assert all(b.severity == "high" for b in bics)
+    for b in bics:
+        # No raw location/branch code remains in the evidence.
+        assert "X" in (b.evidence or "")
+
+
+def test_clean_file_no_bic(clean_file):
+    findings = check_pii(clean_file.read_bytes())
+    assert "bic" not in {f.type for f in findings}
