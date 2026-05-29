@@ -120,6 +120,12 @@ def clabe_file() -> Path:
 
 
 @pytest.fixture
+def kr_giro_file() -> Path:
+    """A bank statement leaking valid South Korean Giro numbers (NNNNN-NN)."""
+    return FIXTURES / "kr-giro-leak.ofx"
+
+
+@pytest.fixture
 def entity_bomb_file() -> Path:
     return FIXTURES / "entity-bomb.ofx"
 

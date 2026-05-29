@@ -87,6 +87,19 @@ Detection classes:
                                 equivalent of an ABA routing number / UK sort code /
                                 Australian BSB, the value a NEFT / RTGS / IMPS
                                 payment routes against.
+- ``kr_giro``                 : a South Korean Giro number -- the 7-digit
+                                payee-routing code (a 6-digit payee/biller block
+                                plus one trailing mod-10 weighted check digit)
+                                printed on Korean utility/tax bills in its
+                                canonical ``NNNNN-NN`` (5-2) grouped form -- whose
+                                hyphenated structure, non-zero payee block, and
+                                public mod-10 weighted check digit all validate, a
+                                near-certain South Korean biller-routing leak. The
+                                hyphenated 5-2 split is distinct from every other
+                                hyphenated detector (SSN's 3-2-4, the UK sort
+                                code's 2-2-2, the Canadian routing number's 5-3,
+                                the Australian BSB's 3-3) so the detectors never
+                                collide.
 - ``clabe``                   : a Mexican CLABE (Clave Bancaria Estandarizada) --
                                 the 18-digit standardized bank-account number
                                 (3-digit bank code + 3-digit branch/plaza code +
@@ -466,6 +479,33 @@ _CLABE_LEN = 18
 # CLABE control-digit weights, applied positionally and repeating across the
 # first 17 digits (the 18th is the control digit being checked).
 _CLABE_WEIGHTS = (3, 7, 1)
+
+# South Korean Giro number candidate -- the seven-digit payee-routing code
+# printed on a Korean utility / tax / insurance bill, written in its canonical
+# grouped presentation ``NNNNN-NN``: a five-digit block, a hyphen, and a final
+# two-digit block (the last of which is a mod-10 weighted check digit). The Giro
+# (지로) system, operated by the Korea Financial Telecommunications & Clearings
+# Institute, is how a payer routes a domestic bill payment to a registered
+# biller, so a Giro number echoed into a statement memo discloses the
+# biller/payee routing of a payment -- the South Korean companion to the ABA /
+# UK sort code / Canadian routing / Australian BSB / Indian IFSC detectors. The
+# hyphenated 5-2 split is the defining presentation and the first precision
+# lever: it is distinct from any contiguous digit run (so it never competes with
+# the account-number ``\d{8,}``, routing ``\d{9}``, or card scanners), and
+# distinct from every other hyphenated detector -- the SSN's 3-2-4, the UK sort
+# code's 2-2-2, the Canadian routing number's 5-3, and the Australian BSB's 3-3
+# -- so none of the hyphenated detectors ever collide. The run is bounded by a
+# non-digit/non-hyphen lookaround so a Giro number embedded in a longer
+# digit-and-hyphen blob is not partially matched. Unlike the hyphenated routing
+# codes above, a Giro number carries a public, self-contained mod-10 weighted
+# check digit, so precision comes from a real arithmetic checksum plus the
+# non-zero payee block -- on a par with the IBAN / ABA / Luhn / CLABE-gated
+# identifiers. The caller validates both before reporting.
+_KR_GIRO_RE = re.compile(r"(?<![\d-])\d{5}-\d{2}(?![\d-])")
+# Korean Giro check-digit weights, applied positionally to the first six digits
+# of the seven-digit number. The trailing seventh digit is the check digit being
+# verified.
+_KR_GIRO_WEIGHTS = (3, 1, 3, 1, 3, 1)
 
 
 def _luhn_valid(digits: str) -> bool:
@@ -1043,6 +1083,63 @@ def _redact_clabe(clabe: str) -> str:
     pins the leak to a specific account -- are masked.
     """
     return clabe[:3] + "X" * (len(clabe) - 3)
+
+
+def _kr_giro_valid(candidate: str) -> bool:
+    """Return ``True`` if a string is a structurally valid South Korean Giro number.
+
+    A South Korean Giro number is the seven-digit payee-routing code printed on a
+    Korean utility / tax / insurance bill -- the value a domestic Giro bill
+    payment is routed against, the South Korean companion to an ABA routing
+    number, a UK sort code, an Australian BSB, an Indian IFSC, or a Canadian
+    routing number. Its canonical bill presentation is the grouped ``NNNNN-NN``
+    (5-2 split). Precision comes from three public, dependency-free gates:
+
+        1. **Shape** -- exactly ``NNNNN-NN``: five decimal digits, a hyphen, and
+           two decimal digits.
+        2. **Non-zero payee block** -- the first six digits (the biller/payee
+           block) must not be all zeros; ``000000`` is never a live Giro payee.
+        3. **Check digit** -- multiply each of the first six digits by the
+           repeating weights ``(3, 1, 3, 1, 3, 1)``, sum the products, and the
+           seventh (final) digit must equal ``(10 - (sum mod 10)) mod 10``.
+
+    The hyphenated 5-2 shape is itself a precision lever: it is distinct from any
+    contiguous digit run and from the SSN's 3-2-4 split, the UK sort code's
+    2-2-2, the Canadian routing number's 5-3, and the Australian BSB's 3-3, so
+    the gate never competes with the account / routing / card scanners nor the
+    other hyphenated detectors. A run that clears all three gates is a
+    near-certain real Giro number; a coincidental ``NNNNN-NN`` token fails the
+    check digit with overwhelming probability. Any malformed input returns
+    ``False`` so the helper is safe to reuse.
+    """
+    code = candidate.strip()
+    parts = code.split("-")
+    if len(parts) != 2:
+        return False
+    head, tail = parts
+    if not (len(head) == 5 and head.isdigit()):
+        return False
+    if not (len(tail) == 2 and tail.isdigit()):
+        return False
+    digits = head + tail
+    if int(digits[:6]) == 0:
+        return False
+    total = sum(w * int(d) for w, d in zip(_KR_GIRO_WEIGHTS, digits[:6]))
+    check = (10 - (total % 10)) % 10
+    return check == int(digits[6])
+
+
+def _redact_kr_giro(code: str) -> str:
+    """Redact a South Korean Giro number, preserving only the leading pair.
+
+    The first two digits hint at the biller category (useful context for a
+    report) while the rest of the payee block and the check digit -- the part
+    that pins the leak to a specific biller -- are masked. The hyphen is
+    preserved so the masked shape still reads as a Giro number::
+
+        12345-67 -> 12XXX-XX
+    """
+    return code[:2] + "XXX-XX"
 
 
 def _redact_sedol(sedol: str) -> str:
@@ -1634,6 +1731,43 @@ def _scan_text(
                 "-- discloses a bank account routable for a SPEI transfer.",
                 location=location,
                 evidence=_redact_clabe(digits),
+            )
+        )
+
+    # South Korean Giro numbers (NNNNN-NN, the canonical 5-2 grouped form) -- the
+    # South Korean domestic biller-routing code. Like the UK sort code / Canadian
+    # routing number / Australian BSB its hyphenated shape is distinct from any
+    # contiguous digit run, so this scan neither competes with nor is
+    # double-counted against the card / account / routing scanners below (those
+    # match contiguous digits; the hyphen breaks the token into a five- and a
+    # two-digit piece, neither of which the 8+/9-digit scanners match). Its 5-2
+    # split is also distinct from the SSN's 3-2-4, the UK sort code's 2-2-2, the
+    # Canadian routing number's 5-3, and the Australian BSB's 3-3, so the five
+    # hyphenated detectors never collide. We gate on the NNNNN-NN shape, the
+    # non-zero payee block, AND the public mod-10 weighted check digit, so a
+    # coincidental NNNNN-NN token is vanishingly unlikely to be reported. A Giro
+    # number echoed into free text discloses the biller/payee routing of a
+    # payment -- the South Korean-domestic companion to the ABA, UK-sort-code,
+    # Canadian-routing, Australian-BSB, and Indian-IFSC detectors.
+    for m in _KR_GIRO_RE.finditer(text):
+        candidate = m.group(0)
+        if not _kr_giro_valid(candidate):
+            continue
+        key = ("kr_giro", candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        findings.append(
+            Finding(
+                check="pii",
+                type="kr_giro",
+                severity="high",
+                message="South Korean Giro number (valid NNNNN-NN structure, "
+                "non-zero payee block, and mod-10 check digit) leaking into a "
+                "free-text field -- discloses the biller/payee routing of a "
+                "payment.",
+                location=location,
+                evidence=_redact_kr_giro(candidate),
             )
         )
 

@@ -16,7 +16,7 @@ scanner that treats an OFX file as an attack surface and asks three questions:
   (ISIN/CUSIP/SEDOL),
   legal-entity identifiers (LEI), bank identifier codes (BIC/SWIFT), UK sort
   codes, Canadian routing numbers, Australian BSB codes, Indian IFSC codes,
-  Mexican CLABE numbers, full
+  Mexican CLABE numbers, South Korean Giro numbers, full
   account numbers, and routing numbers smuggled into free-text transaction names
   and memos.
 - **Is this file anomalous?** Out-of-range posting dates, zero / sign-flipped /
@@ -60,7 +60,7 @@ ferryman [--check {malformed,pii,anomaly,all}] [--format {json,text,h1md,sarif}]
   - `pii` &mdash; PII leaking into transaction free-text (email address, SSN,
     ITIN, payment-card number, IBAN, ISIN, CUSIP, SEDOL, LEI, BIC/SWIFT, UK sort
     code, Canadian routing number, Australian BSB code, Indian IFSC code, Mexican
-    CLABE, account
+    CLABE, South Korean Giro number, account
     number, routing number), including investment memos and security ids.
     Evidence is always redacted before it leaves the tool.
   - `anomaly` &mdash; structurally valid but suspicious transactions
@@ -826,6 +826,48 @@ $ ferryman --check pii --format text leak.ofx
 **Remediation:** never echo a customer's CLABE into a statement memo or
 transaction name; keep bank-account identifiers in structured, access-controlled
 fields rather than free text.
+
+### South Korean Giro number leak detection
+
+A [South Korean Giro number](https://en.wikipedia.org/wiki/Giro) is the
+seven-digit payee-routing code printed on a Korean utility / tax / insurance
+bill &mdash; the value a domestic Giro bill payment is routed against, the South
+Korean companion to an ABA routing number, a UK sort code, an Australian BSB, an
+Indian IFSC, or a Canadian routing number. Its canonical bill presentation is
+the grouped `NNNNN-NN` (5-2 split): a six-digit payee/biller block plus one
+trailing check digit. A Giro number echoed into a free-text **memo or
+transaction name** discloses the biller/payee routing of a payment. The **pii**
+check flags a `kr_giro` finding (severity `high`) when a free-text field
+contains a string that clears three public, dependency-free gates:
+
+1. **shape** &mdash; exactly `NNNNN-NN`: five decimal digits, a hyphen, and two
+   decimal digits.
+2. **non-zero payee block** &mdash; the first six digits (the biller/payee block)
+   must not be all zeros (`000000` is never a live Giro payee).
+3. **check digit** &mdash; multiply each of the first six digits by the repeating
+   weights `(3, 1, 3, 1, 3, 1)`, sum the products, and the seventh (final) digit
+   must equal `(10 - (sum mod 10)) mod 10`.
+
+Unlike the UK / Canadian / Australian / Indian domestic routing codes, a Giro
+number carries a public, self-contained mod-10 weighted check digit, so
+precision comes from a real arithmetic checksum plus the non-zero payee block
+&mdash; on a par with the IBAN / ABA / Luhn / CLABE-gated identifiers. The
+hyphenated 5-2 shape is distinct from any contiguous digit run (so it never
+competes with the card / account / routing scanners) and from every other
+hyphenated detector &mdash; the SSN's 3-2-4 split, the UK sort code's 2-2-2, the
+Canadian routing number's 5-3, and the Australian BSB's 3-3 &mdash; so the
+detectors never collide. Evidence is redacted to the leading two digits
+(`10XXX-XX`); the rest of the payee block and the check digit never leave the
+tool.
+
+```bash
+$ ferryman --check pii --format text leak.ofx
+  [HIGH] pii/kr_giro @ statement[0].transaction[0].memo: South Korean Giro number (valid NNNNN-NN structure, non-zero payee block, and mod-10 check digit) leaking into a free-text field -- discloses the biller/payee routing of a payment.
+```
+
+**Remediation:** never echo a customer's Giro number into a statement memo or
+transaction name; keep biller-routing identifiers in structured,
+access-controlled fields rather than free text.
 
 ## From finding to HackerOne report
 

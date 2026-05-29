@@ -19,6 +19,7 @@ from ferryman.checks.pii import (
     _ifsc_valid,
     _isin_valid,
     _itin_valid,
+    _kr_giro_valid,
     _lei_valid,
     _luhn_valid,
     _redact_email,
@@ -1951,3 +1952,143 @@ def test_clabe_leak_fixture(clabe_file):
 def test_clean_file_no_clabe(clean_file):
     findings = check_pii(clean_file.read_bytes())
     assert "clabe" not in {f.type for f in findings}
+
+
+# --- South Korean Giro number detection (NNNNN-NN, payee block + mod-10 check) ---
+
+# Real-format South Korean Giro numbers (7 digits, written NNNNN-NN: a 6-digit
+# payee block + 1 trailing mod-10 weighted check digit). Each check digit was
+# computed from the public weighted algorithm (weights 3,1,3,1,3,1 over the
+# first six digits), so each must pass the gate.
+VALID_KR_GIRO = [
+    "10005-20",  # base 100052, check 0
+    "20315-09",  # base 203150, check 9
+    "70000-18",  # base 700001, check 8
+    "45678-95",  # base 456789, check 5
+    "99999-92",  # all-nines payee, check 2
+    "00001-98",  # zero-heavy but non-zero payee block, check 8
+]
+
+# NNNNN-NN-shaped runs that must NOT validate -- wrong check digit or an
+# all-zeros payee block.
+INVALID_KR_GIRO = [
+    "10005-21",  # wrong check digit (real one is ...0)
+    "20315-00",  # wrong check digit (real one is ...9)
+    "00000-00",  # all-zeros payee block is never a live Giro number
+    "12345-67",  # coincidental token -- fails the check digit
+    "98765-43",  # coincidental token -- fails the check digit
+]
+
+
+@pytest.mark.parametrize("code", VALID_KR_GIRO)
+def test_kr_giro_accepts_real_numbers(code):
+    assert _kr_giro_valid(code) is True
+
+
+@pytest.mark.parametrize("code", INVALID_KR_GIRO)
+def test_kr_giro_rejects_invalid(code):
+    assert _kr_giro_valid(code) is False
+
+
+@pytest.mark.parametrize(
+    "bad",
+    ["", "  ", "1234-567", "100052-0", "1000-520", "abcde-fg", "10005--20", "10005-2"],
+)
+def test_kr_giro_rejects_garbage(bad):
+    # Defensive: empty / wrong split (4-3, 6-1, 4-3) / non-numeric / double-hyphen
+    # / short-tail input is never a valid Giro number.
+    assert _kr_giro_valid(bad) is False
+
+
+def test_kr_giro_in_memo_detected():
+    findings = _scan("Paid utility giro 10005-20 KEPCO")
+    codes = [f for f in findings if f.type == "kr_giro"]
+    assert len(codes) == 1
+    assert codes[0].severity == "high"
+    assert codes[0].check == "pii"
+    # Only the leading two digits survive for triage; the rest is masked.
+    assert codes[0].evidence == "10XXX-XX"
+
+
+def test_kr_giro_redaction_masks_payee():
+    findings = _scan("biller 20315-09 on file")
+    codes = [f for f in findings if f.type == "kr_giro"]
+    assert len(codes) == 1
+    assert codes[0].evidence == "20XXX-XX"
+    # The payee-identifying digits and the check digit never leave the tool.
+    assert "315" not in codes[0].evidence
+    assert "09" not in codes[0].evidence
+
+
+def test_kr_giro_wrong_check_digit_not_reported():
+    # An NNNNN-NN run with a non-zero payee block but a wrong check digit has the
+    # Giro shape but fails the checksum -- it is not reported as a Giro number.
+    findings = _scan("decoy reference 10005-21 logged")
+    assert "kr_giro" not in {f.type for f in findings}
+
+
+def test_kr_giro_zero_payee_block_not_reported():
+    # An all-zeros payee block is never a live Giro number, so even a
+    # checksum-shaped run is not reported.
+    findings = _scan("reference 00000-00 logged")
+    assert "kr_giro" not in {f.type for f in findings}
+
+
+def test_kr_giro_does_not_collide_with_digit_scanners():
+    # A Giro number is a hyphenated 5-2 token; the hyphen breaks it into a
+    # five- and a two-digit piece, so the 9-digit routing scanner, the 8+-digit
+    # account scanner, and the card scanner never also claim it.
+    findings = _scan("paid via 10005-20 to biller")
+    types = [f.type for f in findings]
+    assert types.count("kr_giro") == 1
+    assert "account_number" not in types
+    assert "credit_card" not in types
+    assert "routing_number" not in types
+
+
+def test_kr_giro_does_not_collide_with_other_hyphenated_detectors():
+    # The 5-2 Giro split must not be confused with the UK sort code (2-2-2),
+    # the Canadian routing number (5-3), the Australian BSB (3-3), or the SSN
+    # (3-2-4); each of those tokens must be classified as itself, never as a
+    # Giro number.
+    assert "kr_giro" not in {f.type for f in _scan("sort 20-00-00 here")}
+    assert "kr_giro" not in {f.type for f in _scan("routing 12345-003 here")}
+    assert "kr_giro" not in {f.type for f in _scan("bsb 062-000 here")}
+    assert "kr_giro" not in {f.type for f in _scan("ssn 123-45-6789 here")}
+
+
+def test_kr_giro_does_not_break_other_identifiers():
+    # The Giro scan must not interfere with other identifiers on their own.
+    card_findings = _scan("card 4111111111111111 today")
+    assert [f.type for f in card_findings] == ["credit_card"]
+    sort_findings = [f for f in _scan("sort code 20-00-00 today")
+                     if f.type == "uk_sort_code"]
+    assert len(sort_findings) == 1
+
+
+def test_same_kr_giro_deduped_per_field():
+    findings = _scan(
+        "giro 10005-20 and again 10005-20 in one memo"
+    )
+    codes = [f for f in findings if f.type == "kr_giro"]
+    assert len(codes) == 1
+
+
+def test_kr_giro_leak_fixture(kr_giro_file):
+    findings = check_pii(kr_giro_file.read_bytes())
+    codes = [f for f in findings if f.type == "kr_giro"]
+    types = {f.type for f in findings}
+    assert "kr_giro" in types, f"expected kr_giro, got: {types}"
+    # The fixture leaks two valid Giro numbers in memos; the wrong-check-digit
+    # decoy (10005-21) must NOT be reported as a Giro number.
+    assert len(codes) == 2
+    assert all(c.severity == "high" for c in codes)
+    for c in codes:
+        # Only the leading two digits survive in the evidence.
+        assert c.evidence.endswith("XXX-XX")
+        assert "kr_giro" == c.type
+
+
+def test_clean_file_no_kr_giro(clean_file):
+    findings = check_pii(clean_file.read_bytes())
+    assert "kr_giro" not in {f.type for f in findings}
