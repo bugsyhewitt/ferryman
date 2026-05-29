@@ -19,6 +19,13 @@ Detection classes:
                                 (ISO 6166) -- a 12-char country-code + NSIN +
                                 Luhn check digit -- whose check digit validates,
                                 a near-certain securities-holding leak.
+- ``cusip``                    : a CUSIP -- the 9-char US/Canada securities
+                                identifier (8-char base + modulus-10 check
+                                digit) -- whose check digit validates, a
+                                near-certain securities-holding leak. A letter
+                                is required in the base so a purely numeric
+                                9-digit run is never confused with a routing
+                                number.
 - ``account_number``          : a long account-number-shaped digit run leaking
                                 into a transaction name/memo.
 - ``routing_number``          : a 9-digit run that passes the ABA weighted
@@ -122,6 +129,28 @@ _IBAN_MAX_LEN = 34
 _ISIN_RE = re.compile(r"(?<![A-Za-z0-9])[A-Z]{2}[A-Z0-9]{9}\d(?![A-Za-z0-9])")
 # ISINs are always exactly 12 characters.
 _ISIN_LEN = 12
+
+# CUSIP (CUSIP Global Services / ISO 6166 NSIN for US & Canada) candidate: a
+# 9-character run of an 8-character alphanumeric base plus one trailing decimal
+# check digit. We deliberately require at least one LETTER in the base (the
+# regex forces a letter somewhere in the first eight characters) so a purely
+# numeric 9-digit run -- which belongs to the ABA routing-number space -- is
+# never misclassified as a CUSIP. The run is bounded by a non-alphanumeric
+# lookaround so a CUSIP embedded in a longer alphanumeric blob is not partially
+# matched. The caller validates the CUSIP modulus-10 check digit before
+# reporting. CUSIPs are case-insensitive and conventionally upper-case.
+_CUSIP_RE = re.compile(
+    r"(?<![A-Za-z0-9])"
+    r"(?=[A-Za-z0-9*@#]{8}\d)"        # 8-char base + 1 check digit, ...
+    r"[A-Za-z0-9*@#]*[A-Za-z][A-Za-z0-9*@#]*\d"  # ... with a letter in the base
+    r"(?![A-Za-z0-9])"
+)
+# CUSIPs are always exactly 9 characters (8 base + 1 check digit).
+_CUSIP_LEN = 9
+# CUSIP character-to-value table for the modulus-10 check digit. Digits map to
+# themselves, letters A=10 ... Z=35, and the three legacy special characters
+# carry their own fixed values.
+_CUSIP_SPECIAL = {"*": 36, "@": 37, "#": 38}
 
 
 def _luhn_valid(digits: str) -> bool:
@@ -266,6 +295,70 @@ def _isin_valid(candidate: str) -> bool:
     return _luhn_valid(digits)
 
 
+def _cusip_char_value(ch: str) -> int | None:
+    """Map a single CUSIP character to its numeric value, or ``None``.
+
+    Digits map to themselves, letters ``A``=10 ... ``Z``=35, and the three
+    legacy special characters ``*``=36, ``@``=37, ``#``=38. Anything else is not
+    a valid CUSIP character and returns ``None``.
+    """
+    if ch.isdigit():
+        return int(ch)
+    if ch.isalpha():
+        return ord(ch.upper()) - 55
+    return _CUSIP_SPECIAL.get(ch)
+
+
+def _cusip_valid(candidate: str) -> bool:
+    """Return ``True`` if a string is a structurally valid CUSIP.
+
+    A CUSIP (the US/Canada NSIN issued by CUSIP Global Services) is a public,
+    dependency-free identifier with a built-in check digit. Its modulus-10
+    "double-add-double" algorithm mirrors the Luhn idea:
+
+        1. Shape -- exactly 9 characters: an 8-character base (digits, letters
+           A-Z, or the legacy specials ``*`` ``@`` ``#``) plus one trailing
+           decimal check digit.
+        2. Check digit -- map each of the first eight characters to its value
+           (digit-as-itself, ``A``=10 ... ``Z``=35, ``*``=36 ``@``=37 ``#``=38);
+           double every value in an even 1-based position; sum the *digits* of
+           each (doubled) value; the check digit is ``(10 - (sum mod 10)) mod 10``.
+
+    A run that clears both gates is a near-certain real CUSIP; a coincidental
+    alphanumeric blob fails the check digit with overwhelming probability. Any
+    malformed input returns ``False`` so the helper is safe to reuse.
+    """
+    cusip = candidate.strip().upper()
+    if len(cusip) != _CUSIP_LEN:
+        return False
+    if not cusip[8].isdigit():
+        return False
+    total = 0
+    for i, ch in enumerate(cusip[:8]):
+        value = _cusip_char_value(ch)
+        if value is None:
+            return False
+        # Positions are 1-based for the doubling rule: double the value of
+        # every character in an even position (the 2nd, 4th, 6th, 8th).
+        if (i + 1) % 2 == 0:
+            value *= 2
+        # Sum the decimal digits of the (possibly doubled) value.
+        total += value // 10 + value % 10
+    check = (10 - (total % 10)) % 10
+    return check == int(cusip[8])
+
+
+def _redact_cusip(cusip: str) -> str:
+    """Redact a CUSIP, preserving only the leading two characters for triage.
+
+    The first two characters narrow down the issuer family (useful for a report)
+    while the rest of the base and the check digit -- the part that pins the leak
+    to a specific security -- are masked.
+    """
+    cusip = cusip.upper()
+    return cusip[:2] + "X" * (len(cusip) - 2)
+
+
 def _redact_isin(isin: str) -> str:
     """Redact an ISIN, preserving only the two-letter country/issuer prefix.
 
@@ -396,6 +489,42 @@ def _scan_text(
                 "valid ISO 6166 check digit) leaking into a free-text field.",
                 location=location,
                 evidence=_redact_isin(compact),
+            )
+        )
+
+    # CUSIPs (US/Canada securities identifier) -- check after the 12-char ISIN
+    # (a US ISIN embeds a CUSIP as its NSIN, so the longer match wins there) and
+    # before the credit-card / account / routing scanners. We require a letter in
+    # the base (enforced by the regex) so a purely numeric 9-digit value -- which
+    # lives in the ABA routing-number space -- is never reclassified here. A
+    # match is gated on the public CUSIP modulus-10 check digit, so a coincidental
+    # 9-char alphanumeric run is vanishingly unlikely to be reported.
+    for m in _CUSIP_RE.finditer(text):
+        candidate = m.group(0)
+        if not _cusip_valid(candidate):
+            continue
+        compact = candidate.upper()
+        key = ("cusip", compact)
+        if key in seen:
+            continue
+        seen.add(key)
+        # Reserve any digit run inside the CUSIP under the account/card/routing
+        # namespaces so the scanners below never re-report a slice of the same
+        # identifier as a separate finding.
+        for run in re.findall(r"\d+", compact):
+            seen.add(("account_number", run))
+            seen.add(("credit_card", run))
+            seen.add(("routing_number", run))
+        findings.append(
+            Finding(
+                check="pii",
+                type="cusip",
+                severity="high",
+                message="CUSIP securities identifier (valid check digit) "
+                "leaking into a free-text field -- discloses a customer's "
+                "securities holding.",
+                location=location,
+                evidence=_redact_cusip(compact),
             )
         )
 

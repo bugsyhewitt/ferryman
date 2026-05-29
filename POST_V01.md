@@ -455,6 +455,66 @@ making the free-text ISIN echo a natural, in-scope next detector.
 
 ---
 
+## Rank 13 — CUSIP Leak Detection, modulus-10 check-digit gated (HIGH signal, low effort) — ✅ IMPLEMENTED (2026-05-28, Phase 2 Rotation 14)
+
+**Status:** Shipped. `checks/pii.py` gained a `_cusip_valid()` helper that gates a
+CUSIP candidate behind two independent public checks: the 9-character shape
+(8-character base of digits / `A`&ndash;`Z` / the legacy specials `*` `@` `#`,
+plus one trailing decimal check digit) and the public CUSIP modulus-10
+"double-add-double" check digit (a `_cusip_char_value()` table maps digits to
+themselves, `A`=10&hellip;`Z`=35, `*`=36 `@`=37 `#`=38; every even-position value
+is doubled, the decimal digits of each value are summed, and the check digit is
+`(10 - sum mod 10) mod 10`). A `_CUSIP_RE` matcher finds 9-char candidates in
+free text **but requires at least one letter in the base** (via a lookahead
+asserting the 8-base + check-digit shape and a consuming pattern that forces a
+letter), so a purely numeric 9-digit run &mdash; which belongs to the ABA
+routing-number space &mdash; is never reclassified as a CUSIP and the
+routing/`probable_routing_number` path is untouched. In `_scan_text`, CUSIP
+detection runs **after** the 12-char ISIN (a US ISIN embeds a CUSIP as its NSIN,
+so the longer ISIN match wins) and **before** the credit-card / routing / account
+scanners, and every digit run inside a detected CUSIP is reserved under the
+`account_number`/`credit_card`/`routing_number` dedupe namespaces so the same
+identifier is never double-counted. Findings are `high` severity; evidence is
+redacted to the leading two characters via `_redact_cusip()` so the base and
+check digit never leave the tool. Crucially, a CUSIP sitting in its own
+structured `SECID` field is **not** flagged (the narrow `_scan_secid` path is
+unchanged) &mdash; only a CUSIP bleeding into a free-text memo/name, which
+discloses a customer's securities holdings, is reported. New fixture
+`tests/fixtures/cusip-leak.ofx` (a Cisco CUSIP and a Tesla CUSIP in two memos plus
+a wrong-check-digit decoy, with the same CUSIPs sitting legitimately in their
+`SECID` fields) plus 26 new tests in `tests/test_pii.py` cover the validator
+(published registry CUSIPs incl. all-numeric and special-char value mapping,
+wrong-check-digit / wrong-length / non-numeric-check-digit / garbage rejects,
+lowercase acceptance), memo detection and redaction, the numeric-run /
+routing-space guard, per-field dedupe, the no-double-count guarantee, ISIN
+precedence over an embedded CUSIP, the invalid-CUSIP no-report case, the fixture,
+and the clean-file no-CUSIP guarantee. README gained a "CUSIP leak detection"
+section and the PII type list was updated. No new dependencies (stdlib `re`
+only).
+
+**What:** The pii check covered SSN, payment card (PAN), IBAN, ISIN, US account
+number, and US ABA routing number, but not the **CUSIP** &mdash; the nine-character
+US/Canada securities identifier and a brokerage-account PII leak class. The CUSIP
+is the NSIN at the core of a US ISIN; many OFX investment statements use a CUSIP
+rather than an ISIN in their `SECID`. Like the ABA (Rank 1), Luhn (Rank 10), IBAN
+(Rank 11), and ISIN (Rank 12) gates, the CUSIP carries a public check digit
+(modulus-10 double-add-double), so gating on shape + check digit yields a
+high-precision, zero-dependency detector. A CUSIP echoed into a transaction memo
+reveals which securities a customer holds &mdash; reportable on its own in fintech
+bug-bounty programs.
+
+**Research grounding:** The CUSIP check-digit algorithm (CUSIP Global Services,
+ISO 6166 NSIN for US & Canada) is public and documented, ~20 lines of Python with
+no new dependency. It complements the existing ISIN detector: a US/Canada holding
+is typically identified by a bare CUSIP, while the international form prefixes the
+country code and re-checksums into an ISIN. The project already parses INVSTMTRS
+investment statements (Rank 4) and detects ISIN free-text leaks (Rank 12), making
+the bare-CUSIP free-text echo the natural, in-scope next detector.
+
+**Estimated tokens:** 35–50K
+
+---
+
 ## Research notes
 
 **Sources consulted:**
