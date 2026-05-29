@@ -24,6 +24,7 @@ from ferryman.checks.pii import (
     _luhn_valid,
     _redact_email,
     _sedol_valid,
+    _th_natid_valid,
     _uk_sort_code_valid,
     check_pii,
 )
@@ -2092,3 +2093,161 @@ def test_kr_giro_leak_fixture(kr_giro_file):
 def test_clean_file_no_kr_giro(clean_file):
     findings = check_pii(clean_file.read_bytes())
     assert "kr_giro" not in {f.type for f in findings}
+
+
+# --- Thai national ID / PromptPay proxy id detection ---
+# (N-NNNN-NNNNN-NN-N, category digit + mod-11 check)
+
+# Real-format Thai national IDs (13 digits, written N-NNNN-NNNNN-NN-N: a 1-8
+# category digit, then the 1-4-5-2-1 grouping ending in a trailing mod-11
+# weighted check digit). Each check digit was computed from the public weighted
+# algorithm (weights 13..2 over the first twelve digits), so each must pass the
+# gate.
+VALID_TH_NATID = [
+    "1-1017-00522-00-8",  # category 1, check 8
+    "3-1007-01234-56-7",  # category 3, check 7
+    "5-2009-98877-00-9",  # category 5, check 9
+    "1-4002-00030-00-5",  # zero-heavy but valid, check 5
+    "8-1001-00010-00-2",  # category 8 (the highest issued), check 2
+    "2-9999-99999-90-3",  # nine-heavy payload, check 3
+]
+
+# N-NNNN-NNNNN-NN-N-shaped runs that must NOT validate -- wrong check digit or an
+# unissued category digit.
+INVALID_TH_NATID = [
+    "1-1017-00522-00-7",  # wrong check digit (real one is ...8)
+    "3-1007-01234-56-6",  # wrong check digit (real one is ...7)
+    "0-1017-00522-00-8",  # category 0 is never an issued first digit
+    "9-1017-00522-00-8",  # category 9 is never an issued first digit
+    "1-2345-67890-12-3",  # coincidental token -- fails the check digit
+]
+
+
+@pytest.mark.parametrize("code", VALID_TH_NATID)
+def test_th_natid_accepts_real_numbers(code):
+    assert _th_natid_valid(code) is True
+
+
+@pytest.mark.parametrize("code", INVALID_TH_NATID)
+def test_th_natid_rejects_invalid(code):
+    assert _th_natid_valid(code) is False
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "",
+        "  ",
+        "1101700522008",      # contiguous (no hyphen grouping) is not the canonical form
+        "11-017-00522-00-8",  # wrong split (2-3-5-2-1)
+        "1-1017-0052-200-8",  # wrong split (1-4-4-3-1)
+        "1-1017-00522-008",   # only four groups
+        "1-1017-00522-00-8-9",  # six groups
+        "a-1017-00522-00-8",  # non-numeric
+        "1--1017-00522-00-8",  # double hyphen
+    ],
+)
+def test_th_natid_rejects_garbage(bad):
+    # Defensive: empty / wrong split / contiguous / non-numeric / extra-group /
+    # double-hyphen input is never a valid national ID in the canonical form.
+    assert _th_natid_valid(bad) is False
+
+
+def test_th_natid_in_memo_detected():
+    findings = _scan("PromptPay payee natid 1-1017-00522-00-8 Somchai")
+    codes = [f for f in findings if f.type == "th_natid"]
+    assert len(codes) == 1
+    assert codes[0].severity == "high"
+    assert codes[0].check == "pii"
+    # Only the leading category digit survives for triage; the rest is masked.
+    assert codes[0].evidence == "1-XXXX-XXXXX-XX-X"
+
+
+def test_th_natid_redaction_masks_identity():
+    findings = _scan("proxy id 3-1007-01234-56-7 on file")
+    codes = [f for f in findings if f.type == "th_natid"]
+    assert len(codes) == 1
+    assert codes[0].evidence == "3-XXXX-XXXXX-XX-X"
+    # The identity-bearing digits and the check digit never leave the tool.
+    assert "1007" not in codes[0].evidence
+    assert "01234" not in codes[0].evidence
+
+
+def test_th_natid_wrong_check_digit_not_reported():
+    # A N-NNNN-NNNNN-NN-N run with a valid category digit but a wrong check digit
+    # has the national-ID shape but fails the checksum -- not reported.
+    findings = _scan("decoy reference 1-1017-00522-00-7 logged")
+    assert "th_natid" not in {f.type for f in findings}
+
+
+def test_th_natid_bad_category_digit_not_reported():
+    # A leading 0 or 9 is never an issued category digit, so even a
+    # checksum-shaped run is not reported.
+    assert "th_natid" not in {f.type for f in _scan("ref 0-1017-00522-00-8 here")}
+    assert "th_natid" not in {f.type for f in _scan("ref 9-1017-00522-00-8 here")}
+
+
+def test_th_natid_does_not_collide_with_digit_scanners():
+    # The national ID's single-dash grouping satisfies the credit-card matcher,
+    # so without the reservation it would be double-counted. The compact 13-digit
+    # run is reserved under the card / account / routing namespaces, so the ID is
+    # classified exactly once and never also as a card or account number.
+    findings = _scan("paid 1-1017-00522-00-8 to payee")
+    types = [f.type for f in findings]
+    assert types.count("th_natid") == 1
+    assert "account_number" not in types
+    assert "credit_card" not in types
+    assert "routing_number" not in types
+
+
+def test_th_natid_does_not_collide_with_other_hyphenated_detectors():
+    # The 1-4-5-2-1 national-ID split must not be confused with the UK sort code
+    # (2-2-2), the Canadian routing number (5-3), the Australian BSB (3-3), the
+    # South Korean Giro (5-2), or the SSN (3-2-4); each of those must be
+    # classified as itself, never as a national ID.
+    assert "th_natid" not in {f.type for f in _scan("sort 20-00-00 here")}
+    assert "th_natid" not in {f.type for f in _scan("routing 12345-003 here")}
+    assert "th_natid" not in {f.type for f in _scan("bsb 062-000 here")}
+    assert "th_natid" not in {f.type for f in _scan("giro 10005-20 here")}
+    assert "th_natid" not in {f.type for f in _scan("ssn 123-45-6789 here")}
+
+
+def test_th_natid_does_not_break_other_identifiers():
+    # The national-ID scan must not interfere with other identifiers on their own.
+    card_findings = _scan("card 4111111111111111 today")
+    assert [f.type for f in card_findings] == ["credit_card"]
+    giro_findings = [f for f in _scan("giro 10005-20 today")
+                     if f.type == "kr_giro"]
+    assert len(giro_findings) == 1
+
+
+def test_same_th_natid_deduped_per_field():
+    findings = _scan(
+        "id 1-1017-00522-00-8 and again 1-1017-00522-00-8 in one memo"
+    )
+    codes = [f for f in findings if f.type == "th_natid"]
+    assert len(codes) == 1
+
+
+def test_th_natid_leak_fixture(th_natid_file):
+    findings = check_pii(th_natid_file.read_bytes())
+    codes = [f for f in findings if f.type == "th_natid"]
+    types = {f.type for f in findings}
+    assert "th_natid" in types, f"expected th_natid, got: {types}"
+    # The fixture leaks two valid national IDs in memos; the wrong-check-digit
+    # decoy (1-1017-00522-00-7) must NOT be reported.
+    assert len(codes) == 2
+    assert all(c.severity == "high" for c in codes)
+    for c in codes:
+        # Only the leading category digit survives in the evidence.
+        assert c.evidence.endswith("-XXXX-XXXXX-XX-X")
+        assert "th_natid" == c.type
+    # The reservation guarantees the IDs are never also reported as cards /
+    # account numbers.
+    assert "credit_card" not in types
+    assert "account_number" not in types
+
+
+def test_clean_file_no_th_natid(clean_file):
+    findings = check_pii(clean_file.read_bytes())
+    assert "th_natid" not in {f.type for f in findings}

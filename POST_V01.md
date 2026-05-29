@@ -1048,6 +1048,71 @@ a reportable South Korean biller-routing disclosure. Public, dependency-free,
 
 ---
 
+## Rank 24 — Thai National ID / PromptPay Proxy-ID Leak Detection, N-NNNN-NNNNN-NN-N structure + 1-8 category digit + mod-11 check-digit gated (HIGH signal, low effort) — ✅ IMPLEMENTED (2026-05-29, Phase 2 Rotation 26)
+
+**Pivot note:** Ranks 1–23 were all shipped. The suggested R24 candidates were
+the **South African IBAN** and the **Thai PromptPay ID**. A fresh read of
+`checks/pii.py` confirmed neither was present (no `th_natid`, no `ZA` IBAN
+handling beyond the generic gate). The South African candidate was **rejected as
+unimplementable**: South Africa does not participate in the IBAN system at all —
+there is no `ZA` country code in the ISO 13616 registry and no South African IBAN
+to detect, so a "South African IBAN" detector would be fabricated. (South
+Africa's real domestic routing identifier is a six-digit universal branch code
+with no self-contained check digit — the same precision problem that got the
+Japanese Zengin code and the bare South African branch code rejected in earlier
+rotations.) The **Thai PromptPay proxy id** was chosen: the most common PromptPay
+proxy id is the 13-digit Thai national ID, which carries a public, self-contained
+**mod-11 weighted check digit** (weights 13…2 over the first twelve digits) plus
+a structurally-constrained 1-8 category digit, and its canonical card
+presentation `N-NNNN-NNNNN-NN-N` (1-4-5-2-1 split) is structurally distinct from
+every existing hyphenated detector — so it clears ferryman's precision bar with
+both a structural gate and an arithmetic checksum, on a par with the IBAN / ABA /
+Luhn / CLABE / Giro-gated identifiers. It is the highest-value, highest-precision
+genuinely-unimplemented item.
+
+**Status:** Shipped. `checks/pii.py` gained `_th_natid_valid()` (gates on the
+exact `N-NNNN-NNNNN-NN-N` 1-4-5-2-1 shape; a 1-8 category digit — `0` and `9`
+are never issued first digits; and the public mod-11 weighted check digit: each
+of the first twelve digits times the descending weights `13, 12, … , 2`, summed,
+check digit `(11 - sum mod 11) mod 10`, which the thirteenth digit must equal)
+and `_redact_th_natid()` (evidence redacted to the leading category digit,
+`1-XXXX-XXXXX-XX-X`). A new `th_natid` (high) finding runs in `_scan_text`
+**before** the credit-card scanner: the national ID's single-dash separators read
+as the conventional digit grouping, so the whole token also satisfies the
+13-19-digit card matcher — exactly the CLABE situation — so we check it first and
+reserve the compact 13-digit run under the `credit_card` / `account_number` /
+`routing_number` dedupe namespaces so the same leak is never double-counted. The
+hyphenated 1-4-5-2-1 split is distinct from every other hyphenated detector — the
+SSN's 3-2-4, the UK sort code's 2-2-2, the Canadian routing number's 5-3, the
+Australian BSB's 3-3, and the South Korean Giro's 5-2 — so the six hyphenated
+detectors never collide. New fixture `tests/fixtures/th-natid-leak.ofx` (two
+valid national IDs in two memos + one wrong-check-digit `1-1017-00522-00-7`
+decoy) plus 30 new test cases cover the validator (real-format IDs across several
+category digits, wrong-check-digit / bad-category / coincidental-token rejects,
+contiguous / wrong-split / non-numeric / extra-group / double-hyphen garbage
+guards), free-text detection, redaction, the wrong-check-digit and
+bad-category-digit non-detection guards, the no-collision-with-digit-scanners
+guarantee (the card-reservation test), the no-collision-with-other-hyphenated-
+detectors guarantee, the no-interference-with-other-identifiers guard, per-field
+dedupe, the fixture, and the clean-file guard. README gained a Thai national ID /
+PromptPay section and the type lists were updated. The SARIF mapping
+auto-generates the `pii/th_natid` rule with no changes. No new dependencies
+(stdlib `re` only). Test count 550 → 580.
+
+**Research grounding:** Thai national identification number
+(เลขประจำตัวประชาชน) — a 13-digit number printed `N-NNNN-NNNNN-NN-N` on every
+Thai ID card, where the leading digit is the registration category (1-8) and the
+final digit is a public mod-11 weighted check digit. Under the Bank of Thailand
+PromptPay scheme it is the most common payee "proxy id" an instant interbank
+transfer is routed against (the alternative proxies being a mobile number or an
+e-wallet id), so a free-text national-ID echo discloses the exact value needed to
+push funds to that person — a reportable Thai PII / payment-routing disclosure.
+Public, dependency-free, ~12 lines of Python.
+
+**Estimated tokens:** 30–50K
+
+---
+
 ## Research notes
 
 **Sources consulted:**

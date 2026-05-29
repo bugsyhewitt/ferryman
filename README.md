@@ -16,7 +16,8 @@ scanner that treats an OFX file as an attack surface and asks three questions:
   (ISIN/CUSIP/SEDOL),
   legal-entity identifiers (LEI), bank identifier codes (BIC/SWIFT), UK sort
   codes, Canadian routing numbers, Australian BSB codes, Indian IFSC codes,
-  Mexican CLABE numbers, South Korean Giro numbers, full
+  Mexican CLABE numbers, South Korean Giro numbers, Thai national IDs
+  (PromptPay proxy ids), full
   account numbers, and routing numbers smuggled into free-text transaction names
   and memos.
 - **Is this file anomalous?** Out-of-range posting dates, zero / sign-flipped /
@@ -60,7 +61,7 @@ ferryman [--check {malformed,pii,anomaly,all}] [--format {json,text,h1md,sarif}]
   - `pii` &mdash; PII leaking into transaction free-text (email address, SSN,
     ITIN, payment-card number, IBAN, ISIN, CUSIP, SEDOL, LEI, BIC/SWIFT, UK sort
     code, Canadian routing number, Australian BSB code, Indian IFSC code, Mexican
-    CLABE, South Korean Giro number, account
+    CLABE, South Korean Giro number, Thai national ID, account
     number, routing number), including investment memos and security ids.
     Evidence is always redacted before it leaves the tool.
   - `anomaly` &mdash; structurally valid but suspicious transactions
@@ -868,6 +869,54 @@ $ ferryman --check pii --format text leak.ofx
 **Remediation:** never echo a customer's Giro number into a statement memo or
 transaction name; keep biller-routing identifiers in structured,
 access-controlled fields rather than free text.
+
+### Thai national ID / PromptPay proxy id leak detection
+
+A [Thai national ID](https://en.wikipedia.org/wiki/Thai_identity_card)
+(เลขประจำตัวประชาชน) is the 13-digit citizen identification number every Thai
+resident carries &mdash; and the most common
+[PromptPay](https://en.wikipedia.org/wiki/PromptPay) payee "proxy id": a payer
+routes an instant interbank PromptPay transfer to a payee by their national ID
+(or phone number), so a national ID echoed into free text discloses the exact
+value needed to push funds to that person. Its canonical card presentation is the
+grouped `N-NNNN-NNNNN-NN-N` (1-4-5-2-1 split): a category digit, then the
+identity payload, ending in one trailing check digit. A national ID echoed into a
+free-text **memo or transaction name** is a direct Thai PII / payment-routing
+leak. The **pii** check flags a `th_natid` finding (severity `high`) when a
+free-text field contains a string that clears three public, dependency-free
+gates:
+
+1. **shape** &mdash; exactly `N-NNNN-NNNNN-NN-N`: thirteen decimal digits in the
+   1-4-5-2-1 hyphen grouping.
+2. **category digit** &mdash; the leading digit (the registration category) is
+   1-8; `0` and `9` are not issued first digits, so they are never a live ID.
+3. **check digit** &mdash; multiply each of the first twelve digits by the
+   descending weights `13, 12, … , 2`, sum the products, and the thirteenth
+   (final) digit must equal `(11 - (sum mod 11)) mod 10`.
+
+Unlike the UK / Canadian / Australian / Indian domestic routing codes, a national
+ID carries a public, self-contained mod-11 weighted check digit, so precision
+comes from a real arithmetic checksum plus the valid category digit &mdash; on a
+par with the IBAN / ABA / Luhn / CLABE / Giro-gated identifiers. The hyphenated
+1-4-5-2-1 split is distinct from every other hyphenated detector &mdash; the
+SSN's 3-2-4, the UK sort code's 2-2-2, the Canadian routing number's 5-3, the
+Australian BSB's 3-3, and the South Korean Giro's 5-2 &mdash; so the detectors
+never collide. Because the token's single-dash separators read as the
+conventional digit grouping the whole value also satisfies the 13-19-digit
+payment-card matcher, so &mdash; like the CLABE &mdash; the compact 13-digit run
+is reserved under the card / account namespaces and a valid national ID is
+reported once as the ID it is rather than double-counted as a card. Evidence is
+redacted to the leading category digit (`1-XXXX-XXXXX-XX-X`); the identity-bearing
+digits and the check digit never leave the tool.
+
+```bash
+$ ferryman --check pii --format text leak.ofx
+  [HIGH] pii/th_natid @ statement[0].transaction[0].memo: Thai national ID / PromptPay proxy id (valid N-NNNN-NNNNN-NN-N structure, category digit, and mod-11 check digit) leaking into a free-text field -- discloses the proxy id a PromptPay transfer routes against.
+```
+
+**Remediation:** never echo a customer's national ID into a statement memo or
+transaction name; keep PromptPay proxy ids in structured, access-controlled
+fields rather than free text.
 
 ## From finding to HackerOne report
 
