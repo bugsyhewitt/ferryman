@@ -31,6 +31,12 @@ def credit_card_file() -> Path:
 
 
 @pytest.fixture
+def email_file() -> Path:
+    """A bank statement leaking email addresses in free-text name/memo fields."""
+    return FIXTURES / "email-leak.ofx"
+
+
+@pytest.fixture
 def iban_file() -> Path:
     """A bank statement leaking valid IBANs (mod-97) in free text."""
     return FIXTURES / "iban-leak.ofx"

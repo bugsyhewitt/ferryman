@@ -7,6 +7,11 @@ numbers that should never travel in a statement export.
 
 Detection classes:
 - ``ssn``                     : SSN-shaped strings (NNN-NN-NNNN) in free text.
+- ``email_address``           : an RFC-5321-shaped email address (a ``local@domain``
+                                with a dotted, registrable domain and a 2+ letter
+                                TLD) in free text -- a direct, high-precision PII
+                                leak (GDPR/CCPA "personal data") that should never
+                                travel in a statement export.
 - ``credit_card``             : a 13-19 digit run (allowing the conventional
                                 space/dash grouping) that passes the Luhn
                                 checksum -- a near-certain payment-card (PAN)
@@ -87,6 +92,26 @@ from ferryman.parsing import parse_statements
 # SSN: NNN-NN-NNNN, optionally with spaces. Word-bounded to avoid matching
 # inside longer digit runs.
 _SSN_RE = re.compile(r"\b\d{3}[-\s]\d{2}[-\s]\d{4}\b")
+
+# Email address. A deliberately conservative, high-precision pattern -- the goal
+# is near-zero false positives, not RFC-5322 completeness. We require:
+#   - a local part of the common atom characters, not starting/ending with a dot;
+#   - an ``@``;
+#   - a domain of one or more dot-separated labels (each starting and ending with
+#     an alphanumeric), ending in a top-level domain of at least two letters.
+# The leading/trailing lookarounds keep an address embedded in a larger token
+# (e.g. ``mailto:a@b.com`` or ``a@b.com.``) from over- or under-matching at the
+# boundary. The ``@`` plus the dotted, letter-TLD domain makes this structurally
+# unambiguous, so unlike the phone-shaped digit runs an email is safe to report
+# at high precision with no checksum.
+_EMAIL_RE = re.compile(
+    r"(?<![A-Za-z0-9._%+\-])"
+    r"[A-Za-z0-9_%+\-]+(?:\.[A-Za-z0-9_%+\-]+)*"   # local part (dot-separated atoms)
+    r"@"
+    r"(?:[A-Za-z0-9](?:[A-Za-z0-9\-]*[A-Za-z0-9])?\.)+"  # one or more domain labels
+    r"[A-Za-z]{2,}"                                  # TLD: 2+ letters
+    r"(?![A-Za-z0-9.\-])"
+)
 # Routing/ABA number: exactly 9 digits, word-bounded.
 _ROUTING_RE = re.compile(r"\b\d{9}\b")
 # Account-number-shaped run: 8+ consecutive digits in free text.
@@ -781,6 +806,27 @@ def _redact_isin(isin: str) -> str:
     return isin[:2] + "X" * (len(isin) - 2)
 
 
+def _redact_email(email: str) -> str:
+    """Redact an email address, preserving only enough for triage.
+
+    We keep the first character of the local part and the domain (so a reporter
+    can tell two distinct leaks apart and see the provider) while masking the
+    rest of the local part -- the part that identifies the individual. For a
+    single-character local part nothing of it survives::
+
+        john.doe@example.com -> j*******@example.com
+        a@example.com        -> *@example.com
+    """
+    local, _, domain = email.partition("@")
+    if not domain:
+        return email  # not actually an address; leave untouched
+    if len(local) <= 1:
+        masked = "*"
+    else:
+        masked = local[0] + "*" * (len(local) - 1)
+    return f"{masked}@{domain}"
+
+
 def _redact_ssn(text: str) -> str:
     return _SSN_RE.sub("XXX-XX-XXXX", text)
 
@@ -834,6 +880,38 @@ def _scan_text(
                 message="SSN-shaped value found in a free-text field.",
                 location=location,
                 evidence=_redact_ssn(m.group(0)),
+            )
+        )
+
+    # Email addresses -- a direct, high-precision PII leak. An email is
+    # structurally unambiguous (``local@domain`` with a dotted, letter-TLD
+    # domain), so it never overlaps the numeric/identifier detectors below and
+    # needs no dedupe coordination with them. We dedupe case-insensitively so the
+    # same address written in different cases collapses to one finding per field.
+    for m in _EMAIL_RE.finditer(text):
+        email = m.group(0)
+        key = ("email_address", email.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        # An address can carry a long digit run in its local part (e.g. a numeric
+        # user id) that the account / card / routing scanners below would
+        # otherwise re-report as a separate finding. Reserve every digit run in
+        # the address so the same leak is counted once, as the email it is.
+        for run in re.findall(r"\d+", email):
+            seen.add(("account_number", run))
+            seen.add(("credit_card", run))
+            seen.add(("routing_number", run))
+        findings.append(
+            Finding(
+                check="pii",
+                type="email_address",
+                severity="high",
+                message="Email address leaking into a free-text field -- direct "
+                "PII (GDPR/CCPA personal data) that should not travel in a "
+                "statement export.",
+                location=location,
+                evidence=_redact_email(email),
             )
         )
 

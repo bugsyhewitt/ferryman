@@ -17,6 +17,7 @@ from ferryman.checks.pii import (
     _isin_valid,
     _lei_valid,
     _luhn_valid,
+    _redact_email,
     _sedol_valid,
     _uk_sort_code_valid,
     check_pii,
@@ -1294,3 +1295,113 @@ def test_ca_routing_leak_fixture(ca_routing_file):
 def test_clean_file_no_ca_routing(clean_file):
     findings = check_pii(clean_file.read_bytes())
     assert "ca_routing_number" not in {f.type for f in findings}
+
+
+# --- Email-address leak detection ---------------------------------------------
+
+# Addresses that must be detected: ordinary, tagged (+), subdomained, and
+# multi-label-TLD forms a real export might echo.
+VALID_EMAILS = [
+    "john.doe@example.com",
+    "a@example.com",
+    "billing+stmt@sub.corp.co.uk",
+    "first.last@mail.example.org",
+    "user_name@example-host.io",
+    "JANE.SMITH@EXAMPLE.COM",
+]
+
+# Strings that look email-ish but are NOT a valid address -- the detector must
+# stay silent on these so it keeps its near-zero false-positive promise.
+NON_EMAILS = [
+    "no at sign here",
+    "twitter @handle mention",          # @ not part of an address
+    "@example.com",                      # no local part
+    "user@",                             # no domain
+    "user@localhost",                    # no dot / no TLD
+    "user@example",                      # bare label, no TLD
+    "user@example.c",                    # 1-char TLD
+    "price was $5@store today",          # local part touches a non-atom $
+]
+
+
+@pytest.mark.parametrize("text", VALID_EMAILS)
+def test_email_address_detected_in_freetext(text):
+    findings = _scan(f"please contact {text} for details")
+    emails = [f for f in findings if f.type == "email_address"]
+    assert len(emails) == 1, f"expected one email finding for {text!r}"
+    assert emails[0].check == "pii"
+    assert emails[0].severity == "high"
+    # The raw address never leaves the scanner -- only the first local char survives.
+    assert text.lower() not in (emails[0].evidence or "").lower()
+
+
+@pytest.mark.parametrize("text", NON_EMAILS)
+def test_non_email_strings_not_flagged(text):
+    findings = _scan(text)
+    assert "email_address" not in {f.type for f in findings}, (
+        f"{text!r} should not be reported as an email"
+    )
+
+
+def test_email_evidence_is_redacted():
+    findings = _scan("send to john.doe@example.com")
+    email = next(f for f in findings if f.type == "email_address")
+    # Local part masked (only the first character survives), domain preserved.
+    assert email.evidence == "j*******@example.com"
+
+
+@pytest.mark.parametrize(
+    "email,expected",
+    [
+        ("john.doe@example.com", "j*******@example.com"),
+        ("a@example.com", "*@example.com"),
+        ("billing+stmt@sub.corp.co.uk", "b***********@sub.corp.co.uk"),
+    ],
+)
+def test_redact_email_masks_local_part(email, expected):
+    assert _redact_email(email) == expected
+
+
+def test_redact_email_leaves_non_address_untouched():
+    # Defensive: a string with no @ is returned unchanged.
+    assert _redact_email("not-an-email") == "not-an-email"
+
+
+def test_same_email_deduped_per_field_case_insensitive():
+    findings = _scan("a@example.com and again A@Example.COM in one memo")
+    emails = [f for f in findings if f.type == "email_address"]
+    assert len(emails) == 1
+
+
+def test_distinct_emails_each_reported():
+    findings = _scan("alice@example.com paid bob@other.org")
+    emails = [f for f in findings if f.type == "email_address"]
+    assert len(emails) == 2
+
+
+def test_email_does_not_collide_with_numeric_detectors():
+    # An address whose local part is digits must be reported as an email, not as
+    # an account-number / routing-number run.
+    findings = _scan("statement to 1234567890@example.com on file")
+    types = {f.type for f in findings}
+    assert "email_address" in types
+    assert "account_number" not in types
+    assert "routing_number" not in types
+
+
+def test_email_leak_fixture(email_file):
+    findings = check_pii(email_file.read_bytes())
+    emails = [f for f in findings if f.type == "email_address"]
+    types = {f.type for f in findings}
+    assert "email_address" in types, f"expected email_address, got: {types}"
+    # The fixture leaks the same address twice (different case) in txn 0 and a
+    # distinct address in txn 1; the "ref 99" decoy in txn 2 yields nothing.
+    assert len(emails) == 2
+    assert all(e.severity == "high" for e in emails)
+    for e in emails:
+        assert "@" in e.evidence and "*" in e.evidence
+
+
+def test_clean_file_no_email(clean_file):
+    findings = check_pii(clean_file.read_bytes())
+    assert "email_address" not in {f.type for f in findings}
