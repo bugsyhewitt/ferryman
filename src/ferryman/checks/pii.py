@@ -100,6 +100,19 @@ Detection classes:
                                 code's 2-2-2, the Canadian routing number's 5-3,
                                 the Australian BSB's 3-3) so the detectors never
                                 collide.
+- ``th_natid``                : a Thai national ID (เลขประจำตัวประชาชน) -- the
+                                13-digit citizen identification number that is the
+                                most common Thai PromptPay payee "proxy id" --
+                                printed in its canonical ``N-NNNN-NNNNN-NN-N``
+                                (1-4-5-2-1) grouped form, whose hyphenated
+                                structure, 1-8 category digit, and public mod-11
+                                weighted check digit all validate, a near-certain
+                                Thai PII / PromptPay payment-routing leak. The
+                                1-4-5-2-1 split is distinct from every other
+                                hyphenated detector so they never collide; the
+                                compact 13-digit run is reserved under the card /
+                                account namespaces so the card scanner never
+                                re-reports it.
 - ``clabe``                   : a Mexican CLABE (Clave Bancaria Estandarizada) --
                                 the 18-digit standardized bank-account number
                                 (3-digit bank code + 3-digit branch/plaza code +
@@ -506,6 +519,38 @@ _KR_GIRO_RE = re.compile(r"(?<![\d-])\d{5}-\d{2}(?![\d-])")
 # of the seven-digit number. The trailing seventh digit is the check digit being
 # verified.
 _KR_GIRO_WEIGHTS = (3, 1, 3, 1, 3, 1)
+
+# Thai PromptPay national-ID candidate -- the 13-digit Thai citizen identification
+# number (เลขประจำตัวประชาชน) that is the most common PromptPay registration
+# "proxy id": a payer routes an instant interbank PromptPay transfer to a payee by
+# their national ID (or phone number), so a national ID echoed into a statement
+# memo discloses the exact value needed to push funds to that person -- a direct,
+# high-value Thai PII / payment-routing leak. Its canonical printed presentation
+# is the grouped ``N-NNNN-NNNNN-NN-N`` (1-4-5-2-1 split) seen on every Thai ID
+# card. The hyphenated 1-4-5-2-1 shape is the defining presentation and the first
+# precision lever: it is distinct from every other hyphenated detector -- the
+# SSN's 3-2-4, the UK sort code's 2-2-2, the Canadian routing number's 5-3, the
+# Australian BSB's 3-3, and the South Korean Giro's 5-2 -- so none of the
+# hyphenated detectors ever collide. Unlike the routing codes a national ID
+# carries a public, self-contained mod-11 weighted check digit, so precision comes
+# from a real arithmetic checksum plus a valid category digit -- on a par with the
+# IBAN / ABA / Luhn / CLABE / Giro-gated identifiers. The whole token, when its
+# single-character separators are read as the conventional digit grouping, also
+# satisfies the 13-19-digit credit-card matcher, so -- like the CLABE -- we check
+# it first and reserve the compact run under the card / account / routing
+# namespaces so the same leak is never re-reported as a slice. The run is bounded
+# by a non-digit/non-hyphen lookaround so an ID embedded in a longer
+# digit-and-hyphen blob is not partially matched. The caller validates the
+# structure, the category digit, and the check digit before reporting.
+_TH_NATID_RE = re.compile(
+    r"(?<![\d-])\d-\d{4}-\d{5}-\d{2}-\d(?![\d-])"
+)
+# A Thai national ID is exactly 13 digits.
+_TH_NATID_LEN = 13
+# Mod-11 check-digit weights, applied positionally to the first twelve digits of
+# the thirteen-digit number (the leading digit gets weight 13, descending to 2).
+# The trailing thirteenth digit is the check digit being verified.
+_TH_NATID_WEIGHTS = (13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2)
 
 
 def _luhn_valid(digits: str) -> bool:
@@ -1142,6 +1187,65 @@ def _redact_kr_giro(code: str) -> str:
     return code[:2] + "XXX-XX"
 
 
+def _th_natid_valid(candidate: str) -> bool:
+    """Return ``True`` if a string is a structurally valid Thai national ID.
+
+    A Thai national ID number (เลขประจำตัวประชาชน) is the 13-digit citizen
+    identification number every Thai resident carries -- and the most common
+    PromptPay "proxy id" a payer routes an instant interbank transfer against, so
+    a national ID echoed into a statement memo discloses the exact value needed to
+    push funds to that person. Its canonical card presentation is the grouped
+    ``N-NNNN-NNNNN-NN-N`` (1-4-5-2-1 split). Unlike the UK / Canadian / Australian
+    / Indian routing codes it carries a public, self-contained arithmetic check
+    digit, so precision comes from three public, dependency-free gates:
+
+        1. **Shape** -- exactly ``N-NNNN-NNNNN-NN-N``: thirteen decimal digits in
+           the 1-4-5-2-1 hyphen grouping.
+        2. **Category digit** -- the leading digit (the registration category) is
+           1-8. ``0`` and ``9`` are not issued first digits, so a leading ``0`` or
+           ``9`` is never a live national ID -- the structural lever that rejects a
+           coincidental run.
+        3. **Check digit** -- multiply each of the first twelve digits by the
+           descending weights ``13, 12, ... , 2``, sum the products, and the
+           thirteenth (final) digit must equal ``(11 - (sum mod 11)) mod 10``.
+
+    The hyphenated 1-4-5-2-1 shape is itself a precision lever: it is distinct
+    from every other hyphenated detector -- the SSN's 3-2-4, the UK sort code's
+    2-2-2, the Canadian routing number's 5-3, the Australian BSB's 3-3, and the
+    South Korean Giro's 5-2 -- so the detectors never collide. A run that clears
+    all three gates is a near-certain real national ID; a coincidental token fails
+    the check digit with overwhelming probability. Any malformed input returns
+    ``False`` so the helper is safe to reuse.
+    """
+    code = candidate.strip()
+    parts = code.split("-")
+    if len(parts) != 5:
+        return False
+    if [len(p) for p in parts] != [1, 4, 5, 2, 1]:
+        return False
+    if not all(p.isdigit() for p in parts):
+        return False
+    digits = "".join(parts)
+    if not (1 <= int(digits[0]) <= 8):
+        return False
+    total = sum(w * int(d) for w, d in zip(_TH_NATID_WEIGHTS, digits[:12]))
+    check = (11 - (total % 11)) % 10
+    return check == int(digits[12])
+
+
+def _redact_th_natid(code: str) -> str:
+    """Redact a Thai national ID, preserving only the leading category digit.
+
+    The first digit hints at the registration category (useful context for a
+    report) while the rest of the number and the check digit -- the part that pins
+    the leak to a specific person -- are masked. The hyphen grouping is preserved
+    so the masked shape still reads as a national ID::
+
+        1-1017-00522-00-8 -> 1-XXXX-XXXXX-XX-X
+    """
+    return code[0] + "-XXXX-XXXXX-XX-X"
+
+
 def _redact_sedol(sedol: str) -> str:
     """Redact a SEDOL, preserving only the leading character for triage.
 
@@ -1768,6 +1872,48 @@ def _scan_text(
                 "payment.",
                 location=location,
                 evidence=_redact_kr_giro(candidate),
+            )
+        )
+
+    # Thai national IDs (N-NNNN-NNNNN-NN-N, the canonical 1-4-5-2-1 grouped form)
+    # -- the Thai PromptPay payee proxy id. The hyphenated 1-4-5-2-1 split is
+    # distinct from every other hyphenated detector (the SSN's 3-2-4, the UK sort
+    # code's 2-2-2, the Canadian routing number's 5-3, the Australian BSB's 3-3,
+    # and the South Korean Giro's 5-2), so the detectors never collide. BUT the
+    # whole token, with its single-dash separators read as the conventional digit
+    # grouping, also satisfies the 13-19-digit credit-card matcher below -- so,
+    # like the CLABE, we check it FIRST and reserve the compact 13-digit run under
+    # the card / account / routing namespaces so the same leak is never re-reported
+    # as a card or a generic account number. We gate on the 1-4-5-2-1 shape, the
+    # 1-8 category digit, AND the public mod-11 weighted check digit, so a
+    # coincidental token is vanishingly unlikely to be reported. A national ID
+    # echoed into free text discloses the PromptPay proxy id a payer routes an
+    # instant transfer against -- a direct Thai PII / payment-routing leak.
+    for m in _TH_NATID_RE.finditer(text):
+        candidate = m.group(0)
+        if not _th_natid_valid(candidate):
+            continue
+        key = ("th_natid", candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        # Reserve the compact 13-digit run under the card / account / routing
+        # namespaces so the scanners below never re-report a slice of the same ID.
+        compact = candidate.replace("-", "")
+        seen.add(("credit_card", compact))
+        seen.add(("account_number", compact))
+        seen.add(("routing_number", compact))
+        findings.append(
+            Finding(
+                check="pii",
+                type="th_natid",
+                severity="high",
+                message="Thai national ID / PromptPay proxy id (valid "
+                "N-NNNN-NNNNN-NN-N structure, category digit, and mod-11 check "
+                "digit) leaking into a free-text field -- discloses the proxy id "
+                "a PromptPay transfer routes against.",
+                location=location,
+                evidence=_redact_th_natid(candidate),
             )
         )
 

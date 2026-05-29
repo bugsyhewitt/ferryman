@@ -126,6 +126,12 @@ def kr_giro_file() -> Path:
 
 
 @pytest.fixture
+def th_natid_file() -> Path:
+    """A bank statement leaking valid Thai national IDs (N-NNNN-NNNNN-NN-N)."""
+    return FIXTURES / "th-natid-leak.ofx"
+
+
+@pytest.fixture
 def entity_bomb_file() -> Path:
     return FIXTURES / "entity-bomb.ofx"
 
