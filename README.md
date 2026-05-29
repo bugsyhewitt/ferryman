@@ -17,7 +17,8 @@ scanner that treats an OFX file as an attack surface and asks three questions:
   legal-entity identifiers (LEI), bank identifier codes (BIC/SWIFT), UK sort
   codes, Canadian routing numbers, Australian BSB codes, Indian IFSC codes,
   Mexican CLABE numbers, South Korean Giro numbers, Thai national IDs
-  (PromptPay proxy ids), Brazilian CPFs (Pix keys), full
+  (PromptPay proxy ids), Brazilian CPFs (Pix keys), Mexican CURPs (population
+  identity keys), full
   account numbers, and routing numbers smuggled into free-text transaction names
   and memos.
 - **Is this file anomalous?** Out-of-range posting dates, zero / sign-flipped /
@@ -61,7 +62,8 @@ ferryman [--check {malformed,pii,anomaly,all}] [--format {json,text,h1md,sarif}]
   - `pii` &mdash; PII leaking into transaction free-text (email address, SSN,
     ITIN, payment-card number, IBAN, ISIN, CUSIP, SEDOL, LEI, BIC/SWIFT, UK sort
     code, Canadian routing number, Australian BSB code, Indian IFSC code, Mexican
-    CLABE, South Korean Giro number, Thai national ID, Brazilian CPF, account
+    CLABE, South Korean Giro number, Thai national ID, Brazilian CPF, Mexican
+    CURP, account
     number, routing number), including investment memos and security ids.
     Evidence is always redacted before it leaves the tool.
   - `anomaly` &mdash; structurally valid but suspicious transactions
@@ -966,6 +968,55 @@ $ ferryman --check pii --format text leak.ofx
 
 **Remediation:** never echo a customer's CPF into a statement memo or transaction
 name; keep Pix keys in structured, access-controlled fields rather than free text.
+
+### Mexican CURP leak detection
+
+A [Mexican CURP](https://en.wikipedia.org/wiki/Unique_Population_Registry_Code)
+(Clave Única de Registro de Población) is the 18-character unique
+population-registry key every Mexican resident carries. Unlike a routing or
+account number it is **identity** PII: the value *encodes the person* &mdash; four
+name initials, the full birth date, the sex, and the birth state are all readable
+straight from the code &mdash; so a CURP echoed into free text discloses a named
+individual, not merely an account. Its canonical presentation is a single
+contiguous 18-character run, `AAAA NNNNNN S EE CCC X D`: four name letters, a
+`YYMMDD` birth date, a sex marker (`H`/`M`), a two-letter birth-state code, three
+internal consonants, a homoclave (`0`–`9` before 2000, `A`–`Z` from 2000), and a
+final check digit. A CURP echoed into a free-text **memo or transaction name** is a
+direct Mexican identity-PII leak. The **pii** check flags a `curp` finding
+(severity `high`) when an upper-case free-text token clears four public,
+dependency-free gates:
+
+1. **shape** &mdash; exactly 18 characters in the `AAAA NNNNNN S EE CCC X D`
+   layout (four letters, six date digits, an `H`/`M` sex marker, a two-letter
+   state code, three letters, an alphanumeric homoclave, a decimal check digit).
+2. **birth date** &mdash; the six date digits must form a real month (`01`–`12`)
+   and day (`01`–`31`).
+3. **state code** &mdash; the 12th–13th characters must be one of the RENAPO
+   registered codes (the 31 states + `DF` + `NE` for the foreign-born) &mdash; the
+   dominant precision lever, mirroring the BIC's ISO 3166-1 country gate.
+4. **check digit** &mdash; the public RENAPO mod-10 check digit, computed over the
+   first 17 characters with the base-37 alphabet (`0`=0 … `Z`=36) and descending
+   positional weights, must equal the 18th character.
+
+Because a CURP leads with four **letters** while a Mexican CLABE is 18 **digits**,
+the two 18-character Mexican identifiers never collide, and the only contiguous
+digit run inside a CURP is the six-digit birth date &mdash; too short for the
+account (8+), routing (9), or card (13+) scanners to claim &mdash; so the detector
+neither competes with nor is double-counted against them; the digit runs are
+reserved under the numeric namespaces anyway so the guarantee stays explicit. The
+match is restricted to upper case (a CURP is always transmitted upper-case, and an
+18-character mixed-case shape is otherwise too easy to collide with prose).
+Evidence is redacted to the four leading name initials (`HEGGXXXXXXXXXXXXXX`); the
+birth date, sex, state, homoclave, and check digit never leave the tool.
+
+```bash
+$ ferryman --check pii --format text leak.ofx
+  [HIGH] pii/curp @ statement[0].transaction[0].memo: Mexican CURP (valid 18-char structure, birth date, registered state code, and mod-10 check digit) leaking into a free-text field -- discloses a named individual's identity.
+```
+
+**Remediation:** never echo a customer's CURP into a statement memo or transaction
+name; keep population-registry identity keys in structured, access-controlled
+fields rather than free text.
 
 ## From finding to HackerOne report
 

@@ -134,6 +134,19 @@ Detection classes:
                                 bank-account leak. Checked before the generic
                                 account-number run so a valid CLABE is named as
                                 the account identifier it is.
+- ``curp``                    : a Mexican CURP (Clave Única de Registro de
+                                Población) -- the 18-character unique
+                                population-registry identity key (four name
+                                initials + a YYMMDD birth date + a sex marker + a
+                                two-letter birth-state code + three consonants + a
+                                homoclave + a mod-10 check digit) -- whose
+                                structure, embedded birth date, registered state
+                                code, and check digit all validate, a near-certain
+                                Mexican identity-PII leak. Unlike the CLABE (18
+                                digits) a CURP leads with four letters, so the two
+                                18-character Mexican identifiers never collide; the
+                                value encodes a named individual, so it is reported
+                                as an identity disclosure, not an account leak.
 - ``account_number``          : a long account-number-shaped digit run leaking
                                 into a transaction name/memo.
 - ``routing_number``          : a 9-digit run that passes the ABA weighted
@@ -589,6 +602,76 @@ _BR_CPF_RE = re.compile(
 )
 # A Brazilian CPF is exactly 11 digits.
 _BR_CPF_LEN = 11
+
+# Mexican CURP (Clave Única de Registro de Población) candidate -- the 18-character
+# unique population-registry key every Mexican resident carries. It is a direct,
+# high-value piece of PII: unlike a routing or account number, the CURP *encodes*
+# the person -- four name initials, the full birth date, the sex, and the birth
+# state are all readable from the value itself, so a CURP echoed into a statement
+# memo discloses a named individual's identity, not merely an account. Its
+# canonical presentation is a single contiguous 18-character run::
+#
+#     AAAA NNNNNN S EE CCC H D
+#     ^^^^                      4 name initials (3 consonants + a leading vowel/X)
+#          ^^^^^^               YYMMDD birth date (6 digits)
+#                 ^             sex: ``H`` (hombre/male) or ``M`` (mujer/female)
+#                   ^^          2-letter birth-state code (the 31 states + ``DF`` +
+#                               ``NE`` for foreign-born)
+#                      ^^^      3 internal consonants of the names
+#                          ^    homoclave -- a disambiguator: ``0``-``9`` for people
+#                               born before 2000, ``A``-``Z`` for 2000 onward
+#                            ^  check digit (mod-10 over a base-37 alphabet)
+#
+# The leading four LETTERS make the contiguous 18-character shape distinct from the
+# Mexican CLABE (18 *digits*), so the two 18-character Mexican identifiers never
+# collide. The run is bounded by a non-alphanumeric lookaround so a CURP embedded
+# in a longer alphanumeric blob is not partially matched, and the match is
+# restricted to UPPER-CASE (a CURP is always transmitted upper-case, while an
+# 18-character mixed shape is otherwise far too easy to collide with prose). The
+# caller validates the structure, the embedded birth date, the sex marker, the
+# registered state code, AND the public mod-10 check digit before reporting -- on a
+# par with the CPF / national-ID / IBAN-gated identifiers.
+_CURP_RE = re.compile(
+    r"(?<![A-Za-z0-9])"
+    r"[A-Z]{4}\d{6}[HM][A-Z]{2}[A-Z]{3}[A-Z0-9]\d"
+    r"(?![A-Za-z0-9])"
+)
+# A CURP is exactly 18 characters.
+_CURP_LEN = 18
+# The base-37 alphabet the CURP check digit is computed over. Position in this
+# string IS the character's value (``0``=0 ... ``9``=9, ``A``=10 ... ``Z``=36),
+# with ``Ñ`` deliberately interposed at index 23 (between ``N`` and ``O``) exactly
+# as RENAPO defines it. A CURP never actually contains ``Ñ`` in the eighteen
+# positions the regex matches (the matcher only admits ``A``-``Z`` and digits), but
+# the alphabet is kept faithful so the positional values of every later letter are
+# correct.
+_CURP_ALPHABET = "0123456789ABCDEFGHIJKLMNÑOPQRSTUVWXYZ"
+# The two-letter birth-state codes RENAPO assigns: the 31 states, ``DF`` for what
+# is now Mexico City, and ``NE`` (nacido en el extranjero) for the foreign-born.
+# Gating the 12th-13th characters to this registered set is a strong precision
+# lever -- exactly as the BIC gate uses the ISO 3166-1 country set -- that keeps a
+# coincidental 18-character token from validating as a CURP.
+_CURP_STATES = frozenset(
+    "AS BC BS CC CL CM CS CH DF DG GT GR HG JC MC MN MS NT NL OC PL QT QR "
+    "SP SL SR TC TS TL VZ YN ZS NE".split()
+)
+
+
+def _curp_check_digit(first17: str) -> int:
+    """Return the RENAPO mod-10 check digit for a CURP's first 17 characters.
+
+    Each character is mapped to its value via its position in the base-37
+    ``_CURP_ALPHABET`` (``0``=0 ... ``9``=9, ``A``=10 ... ``Z``=36), multiplied by
+    a descending positional weight (18 for the first character down to 2 for the
+    seventeenth), the products are summed, and the check digit is
+    ``(10 - (sum mod 10)) mod 10``. A character outside the alphabet raises
+    ``ValueError`` via ``str.index``; the caller has already restricted the input
+    to ``A``-``Z`` and digits, so this never fires in practice.
+    """
+    total = 0
+    for i, ch in enumerate(first17):
+        total += _CURP_ALPHABET.index(ch) * (18 - (i + 1))
+    return (10 - (total % 10)) % 10
 
 
 def _luhn_valid(digits: str) -> bool:
@@ -1359,6 +1442,77 @@ def _redact_br_cpf(code: str) -> str:
     return code[:3] + ".XXX.XXX-XX"
 
 
+def _curp_valid(candidate: str) -> bool:
+    """Return ``True`` if a string is a structurally valid Mexican CURP.
+
+    A CURP (Clave Única de Registro de Población) is the 18-character unique
+    population-registry key every Mexican resident carries -- and a direct piece
+    of identity PII: the value *encodes* the person (name initials, full birth
+    date, sex, and birth state), so a CURP echoed into a statement memo discloses
+    a named individual, not merely an account. Precision comes from four public,
+    dependency-free gates:
+
+        1. **Shape** -- exactly 18 characters: four letters (name initials), six
+           digits (``YYMMDD`` birth date), a sex marker (``H`` or ``M``), a
+           two-letter state code, three letters (internal consonants), an
+           alphanumeric homoclave, and a final decimal check digit.
+        2. **Birth date** -- the six date digits must form a real ``MM`` (01-12)
+           and ``DD`` (01-31) pair. A coincidental token with an impossible month
+           or day (``00``/``13``+ month, ``00``/``32``+ day) is never a live CURP.
+        3. **State code** -- the 12th-13th characters must be one of the RENAPO
+           registered codes (the 31 states + ``DF`` + ``NE`` for foreign-born).
+           This is the dominant precision lever, mirroring the BIC's ISO 3166-1
+           country gate: an arbitrary 18-character token almost never carries a
+           real state code in exactly those two positions.
+        4. **Check digit** -- the public RENAPO mod-10 check digit, computed over
+           the first 17 characters with the base-37 alphabet and descending
+           positional weights, must equal the 18th character.
+
+    A run that clears all four gates is a near-certain real CURP; a coincidental
+    18-character token fails the date, state, or check-digit gate with
+    overwhelming probability. Any malformed input returns ``False`` so the helper
+    is safe to reuse.
+    """
+    curp = candidate.strip().upper()
+    if len(curp) != _CURP_LEN:
+        return False
+    # Shape: AAAA NNNNNN S EE CCC X D
+    if not (
+        curp[:4].isalpha()
+        and curp[4:10].isdigit()
+        and curp[10] in "HM"
+        and curp[11:13].isalpha()
+        and curp[13:16].isalpha()
+        and curp[16].isalnum()
+        and curp[17].isdigit()
+    ):
+        return False
+    # Birth date: a real MM (01-12) and DD (01-31). The two-digit year is
+    # ambiguous across centuries (the homoclave disambiguates in practice), so we
+    # do not gate on it -- but an impossible month or day is never a live CURP.
+    month = int(curp[6:8])
+    day = int(curp[8:10])
+    if not (1 <= month <= 12 and 1 <= day <= 31):
+        return False
+    if curp[11:13] not in _CURP_STATES:
+        return False
+    return _curp_check_digit(curp[:17]) == int(curp[17])
+
+
+def _redact_curp(curp: str) -> str:
+    """Redact a CURP, preserving only the leading name initials for triage.
+
+    The first four characters (the name initials) survive so a reporter can tell
+    two distinct leaks apart, while the birth date, sex, state, internal
+    consonants, homoclave, and check digit -- the part that pins the leak to a
+    specific identified person -- are masked::
+
+        HEGG560427MVZRRL08 -> HEGGXXXXXXXXXXXXXX
+    """
+    curp = curp.upper()
+    return curp[:4] + "X" * (len(curp) - 4)
+
+
 def _redact_sedol(sedol: str) -> str:
     """Redact a SEDOL, preserving only the leading character for triage.
 
@@ -1948,6 +2102,48 @@ def _scan_text(
                 "-- discloses a bank account routable for a SPEI transfer.",
                 location=location,
                 evidence=_redact_clabe(digits),
+            )
+        )
+
+    # Mexican CURP (18 contiguous characters, AAAA NNNNNN S EE CCC X D) -- the
+    # Mexican population-registry identity key. Unlike the CLABE (18 *digits*) a
+    # CURP leads with four LETTERS, so the two 18-character Mexican identifiers
+    # never collide, and the only contiguous digit run inside a CURP is the
+    # six-digit birth date -- too short for the account (8+) / routing (9) / card
+    # (13+) scanners to claim -- so it neither competes with nor is double-counted
+    # against them. We still reserve every digit run under the numeric namespaces
+    # for robustness, exactly as the IFSC / LEI scans do. We gate on the strict
+    # structure, a real embedded birth date, the registered state code, AND the
+    # public mod-10 check digit, so a coincidental 18-character token is
+    # vanishingly unlikely to be reported. A CURP echoed into free text discloses a
+    # named individual's identity -- a direct, high-value Mexican PII leak, the
+    # identity-key companion to the CLABE's account-routing leak.
+    for m in _CURP_RE.finditer(text):
+        candidate = m.group(0)
+        if not _curp_valid(candidate):
+            continue
+        compact = candidate.upper()
+        key = ("curp", compact)
+        if key in seen:
+            continue
+        seen.add(key)
+        # Reserve any digit run inside the CURP under the account/card/routing
+        # namespaces so the scanners below never re-report a slice of the same
+        # identifier (the embedded birth date and the homoclave may be digits).
+        for run in re.findall(r"\d+", compact):
+            seen.add(("account_number", run))
+            seen.add(("credit_card", run))
+            seen.add(("routing_number", run))
+        findings.append(
+            Finding(
+                check="pii",
+                type="curp",
+                severity="high",
+                message="Mexican CURP (valid 18-char structure, birth date, "
+                "registered state code, and mod-10 check digit) leaking into a "
+                "free-text field -- discloses a named individual's identity.",
+                location=location,
+                evidence=_redact_curp(compact),
             )
         )
 

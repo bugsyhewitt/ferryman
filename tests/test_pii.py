@@ -15,6 +15,7 @@ from ferryman.checks.pii import (
     _br_cpf_valid,
     _ca_routing_valid,
     _clabe_valid,
+    _curp_valid,
     _cusip_valid,
     _iban_valid,
     _ifsc_valid,
@@ -2406,3 +2407,156 @@ def test_br_cpf_leak_fixture(br_cpf_file):
 def test_clean_file_no_br_cpf(clean_file):
     findings = check_pii(clean_file.read_bytes())
     assert "br_cpf" not in {f.type for f in findings}
+
+
+# --- Mexican CURP (Clave Única de Registro de Población) -------------------
+#
+# Each VALID_MX_CURP value is a structurally complete 18-character CURP whose
+# RENAPO mod-10 check digit was computed from its own first 17 characters, so
+# the suite carries no real person's CURP -- the values are self-consistent
+# synthetic identities (the leading initials/date/state are plausible but the
+# bearers are fictitious). INVALID_MX_CURP collects near-miss tokens that must
+# each fail one structural or checksum gate.
+VALID_MX_CURP = [
+    "HEGG560427MVZRRL08",  # VZ (Veracruz), female, 1956-04-27
+    "MARC890123HDFRZN06",  # DF (Mexico City), male, 1989-01-23
+    "GALR720815MSPLPS09",  # SP (San Luis Potosi), female, 1972-08-15
+    "PXTR051231HNERMA01",  # NE (foreign-born), male, 2005-12-31, letter homoclave
+]
+INVALID_MX_CURP = [
+    "HEGG560427MVZRRL09",  # wrong check digit (real one is ...08)
+    "HEGG560427MZZRRL08",  # ZZ is not a registered state code
+    "HEGG561327MVZRRL00",  # impossible month (13)
+    "HEGG560432MVZRRL00",  # impossible day (32)
+    "HEGG560427XVZRRL00",  # sex marker neither H nor M
+    "1234560427MVZRRL00",  # leading block is digits, not name letters
+]
+
+
+@pytest.mark.parametrize("code", VALID_MX_CURP)
+def test_mx_curp_accepts_real_structure(code):
+    assert _curp_valid(code) is True
+
+
+@pytest.mark.parametrize("code", INVALID_MX_CURP)
+def test_mx_curp_rejects_invalid(code):
+    assert _curp_valid(code) is False
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "",
+        "  ",
+        "HEGG560427MVZRRL0",    # 17 chars -- too short
+        "HEGG560427MVZRRL088",  # 19 chars -- too long
+        "HEGG560427MVZRRL0A",   # check position must be a digit, not a letter
+        "HEG5560427MVZRRL08",   # name block must be four letters
+    ],
+)
+def test_mx_curp_rejects_garbage(bad):
+    # Defensive: empty / wrong-length / wrong-position-type input is never a
+    # valid CURP.
+    assert _curp_valid(bad) is False
+
+
+def test_mx_curp_in_memo_detected():
+    findings = _scan("Beneficiario CURP HEGG560427MVZRRL08 Hernandez")
+    codes = [f for f in findings if f.type == "curp"]
+    assert len(codes) == 1
+    assert codes[0].severity == "high"
+    assert codes[0].check == "pii"
+    # Only the four leading name initials survive for triage; the rest is masked.
+    assert codes[0].evidence == "HEGGXXXXXXXXXXXXXX"
+
+
+def test_mx_curp_redaction_masks_identity():
+    findings = _scan("curp MARC890123HDFRZN06 on file")
+    codes = [f for f in findings if f.type == "curp"]
+    assert len(codes) == 1
+    assert codes[0].evidence == "MARCXXXXXXXXXXXXXX"
+    # The birth date, state, and check digit never leave the tool.
+    assert "890123" not in codes[0].evidence
+    assert "DF" not in codes[0].evidence[4:]
+
+
+def test_mx_curp_wrong_check_digit_not_reported():
+    # An 18-char CURP-shaped run with a wrong check digit fails the checksum.
+    findings = _scan("decoy reference HEGG560427MVZRRL09 logged")
+    assert "curp" not in {f.type for f in findings}
+
+
+def test_mx_curp_bad_state_not_reported():
+    # A CURP-shaped run with an unregistered state code (ZZ) fails the state gate.
+    findings = _scan("decoy HEGG560427MZZRRL08 here")
+    assert "curp" not in {f.type for f in findings}
+
+
+def test_mx_curp_lowercase_not_reported_from_text():
+    # A CURP is always transmitted upper-case; the scanner's regex is upper-only
+    # (the precision lever, mirroring the BIC/IFSC gates), so a lower-case run in
+    # prose is left for the prose, not reported as a CURP.
+    assert "curp" not in {f.type for f in _scan("ref hegg560427mvzrrl08 here")}
+
+
+def test_mx_curp_does_not_collide_with_clabe():
+    # The CLABE is 18 *digits*; the CURP is 18 chars led by four LETTERS. The two
+    # 18-character Mexican identifiers must each be classified as themselves.
+    curp = _scan("identity HEGG560427MVZRRL08 here")
+    assert [f.type for f in curp if f.type in ("curp", "clabe")] == ["curp"]
+    clabe = _scan("account 002010077777777771 here")
+    assert "curp" not in {f.type for f in clabe}
+
+
+def test_mx_curp_does_not_collide_with_digit_scanners():
+    # The only contiguous digit run in a CURP is the six-digit birth date -- too
+    # short for the account (8+) / routing (9) / card (13+) scanners -- and the
+    # reservation keeps that guarantee explicit. The CURP is classified once.
+    findings = _scan("paid beneficiary HEGG560427MVZRRL08 today")
+    types = [f.type for f in findings]
+    assert types.count("curp") == 1
+    assert "account_number" not in types
+    assert "routing_number" not in types
+    assert "credit_card" not in types
+
+
+def test_mx_curp_does_not_break_other_identifiers():
+    # The CURP scan must not interfere with other identifiers on their own.
+    card_findings = _scan("card 4111111111111111 today")
+    assert [f.type for f in card_findings] == ["credit_card"]
+    cpf_findings = [f for f in _scan("cpf 111.444.777-35 today")
+                    if f.type == "br_cpf"]
+    assert len(cpf_findings) == 1
+
+
+def test_same_mx_curp_deduped_per_field():
+    findings = _scan(
+        "curp HEGG560427MVZRRL08 and again HEGG560427MVZRRL08 in one memo"
+    )
+    codes = [f for f in findings if f.type == "curp"]
+    assert len(codes) == 1
+
+
+def test_mx_curp_leak_fixture(mx_curp_file):
+    findings = check_pii(mx_curp_file.read_bytes())
+    codes = [f for f in findings if f.type == "curp"]
+    types = {f.type for f in findings}
+    assert "curp" in types, f"expected curp, got: {types}"
+    # The fixture leaks two valid CURPs in memos; the wrong-check-digit decoy
+    # (HEGG560427MVZRRL09) must NOT be reported.
+    assert len(codes) == 2
+    assert all(c.severity == "high" for c in codes)
+    for c in codes:
+        # Only the four leading name initials survive in the evidence.
+        assert len(c.evidence) == 18
+        assert c.evidence.endswith("X" * 14)
+        assert "curp" == c.type
+    # The reservation guarantees the CURPs are never also reported as cards /
+    # account numbers.
+    assert "credit_card" not in types
+    assert "account_number" not in types
+
+
+def test_clean_file_no_mx_curp(clean_file):
+    findings = check_pii(clean_file.read_bytes())
+    assert "curp" not in {f.type for f in findings}
