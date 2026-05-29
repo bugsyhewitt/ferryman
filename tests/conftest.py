@@ -66,6 +66,12 @@ def sedol_file() -> Path:
 
 
 @pytest.fixture
+def lei_file() -> Path:
+    """An investment statement leaking valid LEIs (ISO 17442) in free text."""
+    return FIXTURES / "lei-leak.ofx"
+
+
+@pytest.fixture
 def entity_bomb_file() -> Path:
     return FIXTURES / "entity-bomb.ofx"
 
