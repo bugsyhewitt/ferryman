@@ -25,6 +25,12 @@ def clean_file() -> Path:
 
 
 @pytest.fixture
+def itin_file() -> Path:
+    """A bank statement leaking valid US ITINs (and a real SSN) in free text."""
+    return FIXTURES / "itin-leak.ofx"
+
+
+@pytest.fixture
 def credit_card_file() -> Path:
     """A bank statement leaking Luhn-valid payment-card numbers in free text."""
     return FIXTURES / "credit-card-leak.ofx"

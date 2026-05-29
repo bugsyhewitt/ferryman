@@ -820,6 +820,43 @@ digit runs. ~20 lines of Python with no new dependency.
 
 ---
 
+## Rank 19 — US ITIN Leak Detection, area + IRS-middle-group gated (HIGH signal, low effort) — ✅ IMPLEMENTED (2026-05-29, Phase 2 Rotation 21)
+
+**Pivot note:** Ranks 1–18 were all shipped, so this rotation did a fresh gap
+analysis (codebase read + 2026 financial-PII landscape research). The pii check
+covered SSN, email, PAN, IBAN, ISIN, CUSIP, SEDOL, LEI, BIC, UK sort code,
+Canadian routing, and US account/routing — but the **US ITIN** was both a
+coverage gap *and* a precision bug: an ITIN is SSN-shaped (`NNN-NN-NNNN`), so the
+existing SSN detector silently mislabelled every leaked ITIN as `ssn`. The ITIN
+is direct US tax PII issued to the exact non-citizen / resident-alien population
+a fintech serves, and it carries a clean public structural gate, so it was the
+highest-value unimplemented item.
+
+**Status:** Shipped. `checks/pii.py` gained `_itin_valid()` (gates on area
+`900`–`999` — an SSN area never begins with `9`, the clean separator — plus the
+IRS-assigned middle-group ranges `50`–`65`/`70`–`88`/`90`–`92`/`94`–`99`, with
+the reserved gaps `66`–`69`/`89`/`93` rejected) and `_redact_itin()`. A new
+`itin` (critical) finding runs **before** the SSN detector in both `_scan_text`
+and `_scan_secid`, sharing the `ssn` dedupe namespace so a valid ITIN is reported
+once as `itin` while a genuine SSN (area not `9XX`) falls through to the existing
+`ssn` finding unchanged. Evidence is redacted to `9XX-XX-XXXX`. New fixture
+`tests/fixtures/itin-leak.ofx` (two valid ITINs in two fields + one real SSN) and
+27 new tests cover the validator (all four middle ranges + boundaries, reserved
+gaps, non-9XX areas, garbage, stripped-digit behaviour), free-text detection,
+the itin-not-ssn precision guarantee, the ssn-still-reported guarantee, the
+reserved-middle non-detection guard, per-field dedupe, the fixture, and the
+clean-file guard. README gained an ITIN section and the type lists were updated.
+The SARIF mapping auto-generates the `pii/itin` rule with no changes. No new
+dependencies (stdlib `re` only). Test count 403 → 430.
+
+**Research grounding:** IRS Publication 4757 / IRM 3.21.263 — ITIN area is
+900-999 and the middle group is restricted to the assigned ranges above, with
+`89`/`93` reserved. Public, dependency-free, ~15 lines of Python.
+
+**Estimated tokens:** 30–50K
+
+---
+
 ## Research notes
 
 **Sources consulted:**

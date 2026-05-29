@@ -11,8 +11,9 @@ scanner that treats an OFX file as an attack surface and asks three questions:
   declarations, recursive entity-expansion (Billion Laughs) DoS chains,
   CDATA-terminator injection, SGML/XML format confusion, OFX v1 header
   injection / encoding mismatch, encoding tricks, oversized fields.
-- **Is this file leaking PII it should not?** Email addresses, SSNs,
-  payment-card numbers (PANs), IBANs, securities identifiers (ISIN/CUSIP/SEDOL),
+- **Is this file leaking PII it should not?** Email addresses, SSNs, ITINs (US
+  tax IDs), payment-card numbers (PANs), IBANs, securities identifiers
+  (ISIN/CUSIP/SEDOL),
   legal-entity identifiers (LEI), bank identifier codes (BIC/SWIFT), UK sort
   codes, Canadian routing numbers, full account numbers, and routing numbers
   smuggled into free-text transaction names and memos.
@@ -55,8 +56,8 @@ ferryman [--check {malformed,pii,anomaly,all}] [--format {json,text,h1md,sarif}]
     injection / encoding mismatch, encoding tricks, oversized fields). Operates
     on raw bytes; never parses a hostile file.
   - `pii` &mdash; PII leaking into transaction free-text (email address, SSN,
-    payment-card number, IBAN, ISIN, CUSIP, SEDOL, LEI, BIC/SWIFT, UK sort code,
-    Canadian routing number, account number, routing number), including
+    ITIN, payment-card number, IBAN, ISIN, CUSIP, SEDOL, LEI, BIC/SWIFT, UK sort
+    code, Canadian routing number, account number, routing number), including
     investment memos and security ids.
     Evidence is always redacted before it leaves the tool.
   - `anomaly` &mdash; structurally valid but suspicious transactions
@@ -329,6 +330,43 @@ $ ferryman --check pii --format text leak.ofx
 
 **Remediation:** never echo a customer's (or counterparty's) email address into a
 statement export or transaction memo; keep contact details in structured,
+access-controlled fields rather than free text.
+
+### ITIN (US Individual Taxpayer Identification Number) leak detection
+
+An [ITIN](https://en.wikipedia.org/wiki/Individual_Taxpayer_Identification_Number)
+is the nine-digit tax-processing number the IRS issues to people who must file a
+US tax return but are not eligible for an SSN &mdash; resident and non-resident
+aliens, their spouses and dependents. It is **direct US tax PII**, and it shares
+the SSN `NNN-NN-NNNN` presentation exactly, so a plain SSN-shaped match cannot
+tell the two apart. ferryman now reports a valid ITIN as the distinct identifier
+it is rather than mislabelling it `ssn`. The **pii** check flags an `itin`
+finding (severity `critical`) when a free-text **name or memo** contains a string
+that clears **two** public, dependency-free structural gates:
+
+1. **area** &mdash; the first three digits are `900`&ndash;`999`. An SSN area
+   number never begins with `9`, so the leading `9` is what cleanly separates an
+   ITIN from a real SSN with no overlap;
+2. **middle group** &mdash; the 4th&ndash;5th digits fall only in the
+   IRS-assigned ranges `50`&ndash;`65`, `70`&ndash;`88`, `90`&ndash;`92`, or
+   `94`&ndash;`99`. The gaps (`66`&ndash;`69`, `89`, `93`) are reserved for other
+   IRS programs (`93` is the ATIN range) and are never assigned to a live ITIN,
+   so an out-of-range middle group is never reported as an ITIN.
+
+The ITIN detector runs **before** the SSN detector and shares its dedupe channel:
+a value that clears both gates is reported once as `itin`, while a genuine SSN
+(area not `9XX`) fails the area gate and falls through to the existing `ssn`
+finding unchanged. The raw number never leaves the tool &mdash; evidence is
+redacted to the ITIN shape (`9XX-XX-XXXX`). The same gate runs over investment
+security ids, so an ITIN smuggled into a `SECID` is caught too.
+
+```bash
+$ ferryman --check pii --format text leak.ofx
+  [CRITICAL] pii/itin @ statement[0].transaction[0].name (fitid 0001): US Individual Taxpayer Identification Number (ITIN, valid 9XX area and IRS-assigned middle group) leaking into a free-text field -- direct US tax PII.
+```
+
+**Remediation:** never echo a customer's ITIN (or any tax identifier) into a
+statement export or transaction memo; keep tax IDs in structured,
 access-controlled fields rather than free text.
 
 ### Payment-card (PAN) leak detection
