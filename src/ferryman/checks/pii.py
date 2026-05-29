@@ -26,6 +26,13 @@ Detection classes:
                                 is required in the base so a purely numeric
                                 9-digit run is never confused with a routing
                                 number.
+- ``sedol``                    : a SEDOL -- the 7-char UK/Ireland securities
+                                identifier (6-char base + weighted modulus-10
+                                check digit) -- whose check digit validates, a
+                                near-certain securities-holding leak. Vowels are
+                                forbidden in the base and a letter is required so
+                                a purely numeric 7-digit run is never confused
+                                with a coincidental digit run.
 - ``account_number``          : a long account-number-shaped digit run leaking
                                 into a transaction name/memo.
 - ``routing_number``          : a 9-digit run that passes the ABA weighted
@@ -151,6 +158,32 @@ _CUSIP_LEN = 9
 # themselves, letters A=10 ... Z=35, and the three legacy special characters
 # carry their own fixed values.
 _CUSIP_SPECIAL = {"*": 36, "@": 37, "#": 38}
+
+# SEDOL (Stock Exchange Daily Official List -- the UK/Ireland NSIN, issued by the
+# London Stock Exchange) candidate: a 7-character run of a 6-character base plus
+# one trailing decimal check digit. SEDOLs deliberately exclude the vowels
+# (A, E, I, O, U) from the base, which both defines them and sharply cuts the
+# false-positive rate against random 7-char runs. We additionally require at
+# least one LETTER in the base (modern post-2004 SEDOLs are alphanumeric and
+# start with a letter) so a purely numeric 7-digit run -- a common coincidental
+# value -- is never misclassified as a SEDOL. The run is bounded by a
+# non-alphanumeric lookaround so a SEDOL embedded in a longer alphanumeric blob
+# is not partially matched. The caller validates the SEDOL weighted check digit
+# before reporting.
+_SEDOL_RE = re.compile(
+    r"(?<![A-Za-z0-9])"
+    r"(?=[0-9B-DF-HJ-NP-TV-Z]{6}\d)"          # 6 non-vowel base chars + check digit
+    r"[0-9B-DF-HJ-NP-TV-Z]*[B-DF-HJ-NP-TV-Z][0-9B-DF-HJ-NP-TV-Z]*\d"  # letter in base
+    r"(?![A-Za-z0-9])",
+    re.IGNORECASE,
+)
+# SEDOLs are always exactly 7 characters (6 base + 1 check digit).
+_SEDOL_LEN = 7
+# SEDOL positional weights, applied to the 6 base characters' values. The
+# trailing check digit is not weighted.
+_SEDOL_WEIGHTS = (1, 3, 1, 7, 3, 9)
+# Vowels are never valid in a SEDOL base -- a defining structural rule.
+_SEDOL_VOWELS = frozenset("AEIOU")
 
 
 def _luhn_valid(digits: str) -> bool:
@@ -348,6 +381,58 @@ def _cusip_valid(candidate: str) -> bool:
     return check == int(cusip[8])
 
 
+def _sedol_valid(candidate: str) -> bool:
+    """Return ``True`` if a string is a structurally valid SEDOL.
+
+    A SEDOL (Stock Exchange Daily Official List number, the UK/Ireland NSIN
+    issued by the London Stock Exchange) is a public, dependency-free identifier
+    with a built-in weighted check digit:
+
+        1. Shape -- exactly 7 characters: a 6-character base of digits or
+           consonants (the vowels A, E, I, O, U are never used in a SEDOL base)
+           plus one trailing decimal check digit.
+        2. Check digit -- map each of the first six characters to its value
+           (digit-as-itself, ``B``=11 ... ``Z``=35, the same ``ord-55`` letter
+           expansion used by ISIN/CUSIP); multiply by the positional weights
+           ``(1, 3, 1, 7, 3, 9)``; the check digit is
+           ``(10 - (weighted_sum mod 10)) mod 10``.
+
+    A run that clears both gates is a near-certain real SEDOL; a coincidental
+    alphanumeric blob fails the no-vowel rule or the check digit with
+    overwhelming probability. Any malformed input returns ``False`` so the helper
+    is safe to reuse.
+    """
+    sedol = candidate.strip().upper()
+    if len(sedol) != _SEDOL_LEN:
+        return False
+    if not sedol[6].isdigit():
+        return False
+    total = 0
+    for weight, ch in zip(_SEDOL_WEIGHTS, sedol[:6]):
+        if ch.isdigit():
+            value = int(ch)
+        elif ch.isalpha() and ch not in _SEDOL_VOWELS:
+            # Same letter expansion as ISIN/CUSIP: A=10 ... Z=35. Vowels are
+            # structurally invalid in a SEDOL base and are rejected above.
+            value = ord(ch) - 55
+        else:
+            return False
+        total += weight * value
+    check = (10 - (total % 10)) % 10
+    return check == int(sedol[6])
+
+
+def _redact_sedol(sedol: str) -> str:
+    """Redact a SEDOL, preserving only the leading character for triage.
+
+    The first character hints at the issuing exchange family (useful for a
+    report) while the rest of the base and the check digit -- the part that pins
+    the leak to a specific security -- are masked.
+    """
+    sedol = sedol.upper()
+    return sedol[:1] + "X" * (len(sedol) - 1)
+
+
 def _redact_cusip(cusip: str) -> str:
     """Redact a CUSIP, preserving only the leading two characters for triage.
 
@@ -525,6 +610,42 @@ def _scan_text(
                 "securities holding.",
                 location=location,
                 evidence=_redact_cusip(compact),
+            )
+        )
+
+    # SEDOLs (UK/Ireland securities identifier) -- check after the longer ISIN
+    # and CUSIP identifiers (so the longest match wins for an overlapping run)
+    # and before the credit-card / account / routing scanners. The regex forbids
+    # vowels in the base and requires at least one letter, so a purely numeric
+    # 7-digit run is never reclassified here. A match is gated on the public
+    # SEDOL weighted modulus-10 check digit, so a coincidental 7-char alphanumeric
+    # run is vanishingly unlikely to be reported.
+    for m in _SEDOL_RE.finditer(text):
+        candidate = m.group(0)
+        if not _sedol_valid(candidate):
+            continue
+        compact = candidate.upper()
+        key = ("sedol", compact)
+        if key in seen:
+            continue
+        seen.add(key)
+        # Reserve any digit run inside the SEDOL under the account/card/routing
+        # namespaces so the scanners below never re-report a slice of the same
+        # identifier as a separate finding.
+        for run in re.findall(r"\d+", compact):
+            seen.add(("account_number", run))
+            seen.add(("credit_card", run))
+            seen.add(("routing_number", run))
+        findings.append(
+            Finding(
+                check="pii",
+                type="sedol",
+                severity="high",
+                message="SEDOL securities identifier (valid check digit) "
+                "leaking into a free-text field -- discloses a customer's "
+                "securities holding.",
+                location=location,
+                evidence=_redact_sedol(compact),
             )
         )
 

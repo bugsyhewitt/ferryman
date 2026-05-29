@@ -12,8 +12,8 @@ scanner that treats an OFX file as an attack surface and asks three questions:
   CDATA-terminator injection, SGML/XML format confusion, OFX v1 header
   injection / encoding mismatch, encoding tricks, oversized fields.
 - **Is this file leaking PII it should not?** SSNs, payment-card numbers
-  (PANs), IBANs, securities identifiers (ISIN/CUSIP), full account numbers, and
-  routing numbers smuggled into free-text transaction names and memos.
+  (PANs), IBANs, securities identifiers (ISIN/CUSIP/SEDOL), full account numbers,
+  and routing numbers smuggled into free-text transaction names and memos.
 - **Is this file anomalous?** Out-of-range posting dates, zero / sign-flipped /
   out-of-range transaction amounts, and other signs of tampering or a backend
   that accepts garbage.
@@ -53,7 +53,7 @@ ferryman [--check {malformed,pii,anomaly,all}] [--format {json,text,h1md,sarif}]
     injection / encoding mismatch, encoding tricks, oversized fields). Operates
     on raw bytes; never parses a hostile file.
   - `pii` &mdash; PII leaking into transaction free-text (SSN, payment-card
-    number, IBAN, ISIN, CUSIP, account number, routing number), including
+    number, IBAN, ISIN, CUSIP, SEDOL, account number, routing number), including
     investment memos and security ids. Evidence is always redacted before it
     leaves the tool.
   - `anomaly` &mdash; structurally valid but suspicious transactions
@@ -427,6 +427,45 @@ $ ferryman --check pii --format text leak.ofx
 ```
 
 **Remediation:** never echo a security's CUSIP into a statement memo or
+transaction name; keep security identifiers in the structured `SECID` field where
+they belong.
+
+### SEDOL leak detection
+
+A [SEDOL](https://en.wikipedia.org/wiki/SEDOL) is the seven-character UK/Ireland
+securities identifier issued by the London Stock Exchange &mdash; the NSIN that
+sits at the core of a `GB`/`IE` `ISIN` and the value that legitimately belongs in
+an OFX investment `SECID`. Like a CUSIP or ISIN, a SEDOL that leaks into a
+free-text **memo or transaction name** discloses which securities a customer holds
+&mdash; a brokerage-account privacy leak reportable on its own. The **pii** check
+flags a `sedol` finding (severity `high`) when a free-text field contains a string
+that clears **both** public gates:
+
+1. **shape** &mdash; exactly seven characters: a six-character base of digits or
+   **consonants** (the vowels `A` `E` `I` `O` `U` are never used in a SEDOL base)
+   plus one trailing decimal check digit. The base must contain at least one
+   letter, so a purely numeric seven-digit run &mdash; a common coincidental value
+   &mdash; is never misclassified as a SEDOL;
+2. **check digit** &mdash; the public SEDOL weighted modulus-10 algorithm: map
+   each base character to its value (digit-as-itself, `B`=11&hellip;`Z`=35),
+   multiply by the positional weights `(1, 3, 1, 7, 3, 9)`, and the check digit is
+   `(10 - (weighted sum mod 10)) mod 10`.
+
+Gating on the SEDOL check digit mirrors the ABA, Luhn, IBAN, ISIN, and CUSIP
+gates: a run that clears both is a near-certain real SEDOL, while a coincidental
+alphanumeric blob fails the no-vowel rule or the check digit with overwhelming
+probability and is left to the existing heuristics. The base and check digit never
+leave the tool &mdash; evidence is redacted to the leading character (`BXXXXXX`).
+A SEDOL sitting in its own `SECID` field is *not* flagged; only one bleeding into
+free text is. Because a UK/Ireland ISIN embeds a SEDOL as its NSIN, the longer
+twelve-character ISIN match takes precedence when an ISIN is present.
+
+```bash
+$ ferryman --check pii --format text leak.ofx
+  [HIGH] pii/sedol @ statement[0].transaction[0].memo: SEDOL securities identifier (valid check digit) leaking into a free-text field -- discloses a customer's securities holding.
+```
+
+**Remediation:** never echo a security's SEDOL into a statement memo or
 transaction name; keep security identifiers in the structured `SECID` field where
 they belong.
 
