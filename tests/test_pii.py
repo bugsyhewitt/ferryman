@@ -22,6 +22,7 @@ from ferryman.checks.pii import (
     _isin_valid,
     _itin_valid,
     _kr_giro_valid,
+    _kr_rrn_valid,
     _lei_valid,
     _luhn_valid,
     _redact_email,
@@ -2560,3 +2561,157 @@ def test_mx_curp_leak_fixture(mx_curp_file):
 def test_clean_file_no_mx_curp(clean_file):
     findings = check_pii(clean_file.read_bytes())
     assert "curp" not in {f.type for f in findings}
+
+
+# --- South Korean RRN (Resident Registration Number) -------------------------
+
+# Each VALID_KR_RRN value is a structurally complete 13-digit RRN in its
+# canonical YYMMDD-SNNNNNN (6-7) presentation whose embedded birth date is real
+# and whose mod-11 check digit verifies (these are synthetic, fictitious numbers
+# constructed only to pass the public checksum). The set spans the issued
+# century/sex markers (1-2 citizens born 1900s, 3-4 citizens born 2000s, 5-6 / 7-8
+# foreign residents). INVALID_KR_RRN collects near-miss tokens that must fail.
+VALID_KR_RRN = [
+    "900101-1123459",  # citizen, male, born 1900s
+    "780630-2123451",  # citizen, female, born 1900s
+    "050304-3123459",  # citizen, male, born 2000s
+    "991231-5123451",  # foreign resident, born 1900s
+    "850815-1010106",  # citizen, male, born 1900s
+    "201225-7890126",  # foreign resident, born 2000s
+]
+
+INVALID_KR_RRN = [
+    "900101-1123450",  # wrong check digit (off by one)
+    "901301-1123459",  # impossible month (13)
+    "900132-1123459",  # impossible day (32)
+    "900100-1123459",  # impossible day (00)
+    "900001-1123459",  # impossible month (00)
+    "123456-7890123",  # arbitrary run, fails the checksum
+]
+
+
+@pytest.mark.parametrize("code", VALID_KR_RRN)
+def test_kr_rrn_accepts_real_structure(code):
+    assert _kr_rrn_valid(code) is True
+
+
+@pytest.mark.parametrize("code", INVALID_KR_RRN)
+def test_kr_rrn_rejects_invalid(code):
+    assert _kr_rrn_valid(code) is False
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "",
+        "  ",
+        "90010-1123459",     # head too short (5 digits)
+        "9001010-123459",    # wrong split (7-6)
+        "900101-112345",     # tail too short (6 digits)
+        "900101-11234567",   # tail too long (8 digits)
+        "9001011123459",     # no hyphen -- contiguous run, not the RRN shape
+        "900101-112345a",    # non-digit in the tail
+        "abcdef-1123459",    # non-digit head
+    ],
+)
+def test_kr_rrn_rejects_garbage(bad):
+    # Defensive: empty / wrong-length / wrong-split / non-numeric input is never a
+    # valid RRN.
+    assert _kr_rrn_valid(bad) is False
+
+
+def test_kr_rrn_in_memo_detected():
+    findings = _scan("Verified holder RRN 900101-1123459 on file")
+    codes = [f for f in findings if f.type == "kr_rrn"]
+    assert len(codes) == 1
+    assert codes[0].severity == "high"
+    assert codes[0].check == "pii"
+    # Only the century/sex marker survives for triage; the rest is masked.
+    assert codes[0].evidence == "XXXXXX-1XXXXXX"
+
+
+def test_kr_rrn_redaction_masks_identity():
+    findings = _scan("co-signer 780630-2123451 logged")
+    codes = [f for f in findings if f.type == "kr_rrn"]
+    assert len(codes) == 1
+    assert codes[0].evidence == "XXXXXX-2XXXXXX"
+    # The birth date, the serial, and the check digit never leave the tool.
+    assert "780630" not in codes[0].evidence
+    assert "123451" not in codes[0].evidence
+
+
+def test_kr_rrn_wrong_check_digit_not_reported():
+    # A YYMMDD-SNNNNNN-shaped run with a wrong check digit fails the checksum.
+    findings = _scan("decoy reference 900101-1123450 ignored")
+    assert "kr_rrn" not in {f.type for f in findings}
+
+
+def test_kr_rrn_bad_birth_date_not_reported():
+    # An RRN-shaped run with an impossible month fails the date gate even though
+    # the checksum could pass for some such tokens.
+    findings = _scan("decoy 901301-1123459 here")
+    assert "kr_rrn" not in {f.type for f in findings}
+
+
+def test_kr_rrn_does_not_collide_with_digit_scanners():
+    # The hyphen breaks the token into a 6- and a 7-digit piece, neither of which
+    # the account (8+) / routing (9) / card (13+) scanners match, and the
+    # reservation keeps that guarantee explicit. The RRN is classified once.
+    findings = _scan("paid holder 900101-1123459 today")
+    types = [f.type for f in findings]
+    assert types.count("kr_rrn") == 1
+    assert "account_number" not in types
+    assert "routing_number" not in types
+    assert "credit_card" not in types
+
+
+def test_kr_rrn_does_not_collide_with_other_hyphenated_detectors():
+    # The 6-7 split is distinct from every other hyphenated detector, so an RRN is
+    # never mistaken for a Giro / sort code / routing / BSB / SSN and vice versa.
+    assert "kr_rrn" not in {f.type for f in _scan("giro 10005-20 here")}
+    assert "kr_rrn" not in {f.type for f in _scan("sort 20-00-00 here")}
+    assert "kr_rrn" not in {f.type for f in _scan("routing 12345-003 here")}
+    assert "kr_rrn" not in {f.type for f in _scan("bsb 062-000 here")}
+    assert "kr_rrn" not in {f.type for f in _scan("ssn 123-45-6789 here")}
+
+
+def test_kr_rrn_does_not_break_other_identifiers():
+    # The RRN scan must not interfere with other identifiers on their own.
+    card_findings = _scan("card 4111111111111111 today")
+    assert [f.type for f in card_findings] == ["credit_card"]
+    giro_findings = [f for f in _scan("giro 10005-20 today")
+                     if f.type == "kr_giro"]
+    assert len(giro_findings) == 1
+
+
+def test_same_kr_rrn_deduped_per_field():
+    findings = _scan(
+        "rrn 900101-1123459 and again 900101-1123459 in one memo"
+    )
+    codes = [f for f in findings if f.type == "kr_rrn"]
+    assert len(codes) == 1
+
+
+def test_kr_rrn_leak_fixture(kr_rrn_file):
+    findings = check_pii(kr_rrn_file.read_bytes())
+    codes = [f for f in findings if f.type == "kr_rrn"]
+    types = {f.type for f in findings}
+    assert "kr_rrn" in types, f"expected kr_rrn, got: {types}"
+    # The fixture leaks two valid RRNs in memos; the wrong-check-digit decoy
+    # (900101-1123450) must NOT be reported.
+    assert len(codes) == 2
+    assert all(c.severity == "high" for c in codes)
+    for c in codes:
+        # The masked shape preserves only the century/sex marker.
+        assert c.evidence.startswith("XXXXXX-")
+        assert c.evidence.endswith("XXXXXX")
+        assert c.type == "kr_rrn"
+    # The reservation guarantees the RRNs are never also reported as cards /
+    # account numbers.
+    assert "credit_card" not in types
+    assert "account_number" not in types
+
+
+def test_clean_file_no_kr_rrn(clean_file):
+    findings = check_pii(clean_file.read_bytes())
+    assert "kr_rrn" not in {f.type for f in findings}

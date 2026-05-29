@@ -144,6 +144,12 @@ def mx_curp_file() -> Path:
 
 
 @pytest.fixture
+def kr_rrn_file() -> Path:
+    """A bank statement leaking valid South Korean RRNs (YYMMDD-SNNNNNN)."""
+    return FIXTURES / "kr-rrn-leak.ofx"
+
+
+@pytest.fixture
 def entity_bomb_file() -> Path:
     return FIXTURES / "entity-bomb.ofx"
 

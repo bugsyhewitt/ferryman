@@ -18,7 +18,7 @@ scanner that treats an OFX file as an attack surface and asks three questions:
   codes, Canadian routing numbers, Australian BSB codes, Indian IFSC codes,
   Mexican CLABE numbers, South Korean Giro numbers, Thai national IDs
   (PromptPay proxy ids), Brazilian CPFs (Pix keys), Mexican CURPs (population
-  identity keys), full
+  identity keys), South Korean RRNs (resident-registration identity numbers), full
   account numbers, and routing numbers smuggled into free-text transaction names
   and memos.
 - **Is this file anomalous?** Out-of-range posting dates, zero / sign-flipped /
@@ -63,7 +63,7 @@ ferryman [--check {malformed,pii,anomaly,all}] [--format {json,text,h1md,sarif}]
     ITIN, payment-card number, IBAN, ISIN, CUSIP, SEDOL, LEI, BIC/SWIFT, UK sort
     code, Canadian routing number, Australian BSB code, Indian IFSC code, Mexican
     CLABE, South Korean Giro number, Thai national ID, Brazilian CPF, Mexican
-    CURP, account
+    CURP, South Korean RRN, account
     number, routing number), including investment memos and security ids.
     Evidence is always redacted before it leaves the tool.
   - `anomaly` &mdash; structurally valid but suspicious transactions
@@ -1017,6 +1017,50 @@ $ ferryman --check pii --format text leak.ofx
 **Remediation:** never echo a customer's CURP into a statement memo or transaction
 name; keep population-registry identity keys in structured, access-controlled
 fields rather than free text.
+
+### South Korean RRN (Resident Registration Number) leak detection
+
+A [South Korean RRN](https://en.wikipedia.org/wiki/Resident_registration_number)
+(주민등록번호) is the 13-digit national identity number every South Korean
+resident is issued &mdash; the single most sensitive personal identifier in
+Korea, used across banking, medical, tax, and employment records. Unlike a routing
+or account number it is **identity** PII: the value *encodes the person* &mdash;
+the full birth date and the century/sex are readable straight from the code &mdash;
+so an RRN echoed into free text discloses a named individual, not merely an
+account. Its canonical presentation is the grouped `YYMMDD-SNNNNNN` (6-7 split): a
+`YYMMDD` birth date, a hyphen, a century/sex marker (`1`–`2` citizens born 1900s,
+`3`–`4` citizens born 2000s, `5`–`6`/`7`–`8` foreign residents, `9`–`0` born
+1800s), a region-of-registration serial, and a final check digit. An RRN echoed
+into a free-text **memo or transaction name** is a direct South Korean
+identity-PII leak. The **pii** check flags a `kr_rrn` finding (severity `high`)
+when a free-text token clears three public, dependency-free gates:
+
+1. **shape** &mdash; exactly `YYMMDD-SNNNNNN`: six decimal digits, a hyphen, and
+   seven decimal digits.
+2. **birth date** &mdash; the first six digits must form a real month (`01`–`12`)
+   and day (`01`–`31`).
+3. **check digit** &mdash; multiply the first twelve digits by the positional
+   weights `2,3,4,5,6,7,8,9,2,3,4,5`, sum the products, and the thirteenth digit
+   must equal `(11 − (sum mod 11)) mod 10`.
+
+The hyphenated 6-7 shape is itself a precision lever: it is distinct from any
+contiguous digit run (so it never competes with the account-number (8+), routing
+(9), or card (13+) scanners) and from every other hyphenated detector &mdash; the
+SSN's 3-2-4, the UK sort code's 2-2-2, the Canadian routing number's 5-3, the
+Australian BSB's 3-3, the South Korean Giro's 5-2, and the Thai national ID's
+1-4-5-2-1 &mdash; so the detectors never collide; the compact 13-digit run is
+reserved under the numeric namespaces anyway so the guarantee stays explicit.
+Evidence is redacted to the single century/sex marker (`XXXXXX-1XXXXXX`); the
+birth date, the registration serial, and the check digit never leave the tool.
+
+```bash
+$ ferryman --check pii --format text leak.ofx
+  [HIGH] pii/kr_rrn @ statement[0].transaction[0].memo: South Korean RRN (Resident Registration Number; valid YYMMDD-SNNNNNN structure, birth date, and mod-11 check digit) leaking into a free-text field -- discloses a named individual's identity.
+```
+
+**Remediation:** never echo a customer's RRN into a statement memo or transaction
+name; keep resident-registration identity numbers in structured,
+access-controlled fields rather than free text.
 
 ## From finding to HackerOne report
 

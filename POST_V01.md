@@ -1254,6 +1254,92 @@ dependency-free, ~30 lines of Python.
 
 ---
 
+## Rank 27 — South Korean RRN (Resident Registration Number) Leak Detection, YYMMDD-SNNNNNN structure + birth date + mod-11 check-digit gated (HIGH signal, low effort) — ✅ IMPLEMENTED (2026-05-29, Phase 2 Rotation 29)
+
+**Pivot note:** Ranks 1–26 were all shipped. The R27 rotation brief named the
+**South Korean RRN** and the **Polish PESEL** as the two candidates, with the
+Russian INN / SNILS already deferred (low distinctiveness — contiguous digit runs
+that collide with the generic `\d{8,}` account scanner). A fresh read of
+`checks/pii.py` confirmed neither `kr_rrn`/`rrn` nor `pesel` was present. Both
+carry a verifiable checksum and both are direct *identity* PII, so the choice came
+down to ferryman's dominant precision criterion — **structural distinctiveness
+beyond the checksum**:
+
+- **Polish PESEL was rejected.** It is an 11-digit **contiguous run** (no
+  separator in its canonical presentation), so it collides head-on with the
+  account-number scanner (`\d{8,}`) and is close to the card matcher — the exact
+  low-distinctiveness problem that deferred the Russian INN at R26 and the
+  Indonesian NIK at R25. Its only structural shape beyond the mod-10 check digit is
+  an embedded `YYMMDD` birth date (with a month-offset century encoding), which the
+  RRN also carries. A contiguous 11-digit token that happens to encode a plausible
+  date and pass a single weighted checksum is not distinctive enough for
+  ferryman's precision bar.
+- **South Korean RRN was chosen.** Its canonical printed form is the hyphenated
+  **`YYMMDD-SNNNNNN` (6-7 split)** — a structural shape that is distinct from
+  *every* existing detector: the SSN's 3-2-4, the UK sort code's 2-2-2, the
+  Canadian routing number's 5-3, the Australian BSB's 3-3, the South Korean Giro's
+  5-2, and the Thai national ID's 1-4-5-2-1. The hyphen breaks the token into a
+  six- and a seven-digit piece, neither of which the 8+/9/13+ digit scanners
+  match, so the detector never competes with the contiguous-digit scanners — the
+  precise lever PESEL lacks. On top of the distinctive shape it carries a real
+  embedded `YYMMDD` birth date and the public **mod-11 weighted check digit**
+  (weights `2,3,4,5,6,7,8,9,2,3,4,5`, check `= (11 − (sum mod 11)) mod 10`). It is
+  also the most sensitive identity PII of the two: the RRN is the master personal
+  identifier in Korea (banking, medical, tax, employment all key off it), so a
+  free-text RRN echo discloses a named individual, not merely an account.
+  Structure *and* checksum clear the precision bar — strictly stronger than the
+  contiguous PESEL.
+
+**Worker decision (post-2020 check-digit note):** South Korea stopped encoding the
+classic mod-11 check digit into *newly issued* RRNs from October 2020 onward (the
+last seven digits of a new RRN are now randomized). The classic checksum therefore
+gates pre-2020 RRNs at full strength and is only a partial gate for post-2020
+numbers. This was judged acceptable and the checksum was kept as a gate because (a)
+the overwhelming majority of RRNs in circulation — and thus in legacy bank
+statements, the data ferryman scans — predate 2020, (b) ferryman's other two gates
+(the highly distinctive 6-7 hyphenated shape and the embedded real birth date)
+already clear the precision bar on their own, and (c) keeping the checksum can only
+*reduce* false positives, never increase them, on the pre-2020 corpus. Documented
+here and in the validator's docstring rather than surfaced to the operator.
+
+**Status:** Shipped. `checks/pii.py` gained `_kr_rrn_valid()` (gates on the exact
+`YYMMDD-SNNNNNN` 6-7 split — validated structurally in the helper, not only the
+regex; a real embedded `MM`/`DD` birth date; and the mod-11 weighted check digit)
+and `_redact_kr_rrn()` (evidence redacted to the single century/sex marker,
+`XXXXXX-1XXXXXX`). A new `kr_rrn` (high) finding runs in `_scan_text` immediately
+after the South Korean Giro block (logical grouping — both Korean) and reserves the
+compact 13-digit run under the `credit_card` / `account_number` / `routing_number`
+dedupe namespaces (the hyphen already breaks the run, but the reservation keeps the
+no-double-counting guarantee explicit, exactly as the Thai national ID and CURP
+scans do). The matcher `_KR_RRN_RE` is bounded by a non-digit/non-hyphen lookaround
+so an RRN embedded in a longer digit-and-hyphen blob is not partially matched. New
+fixture `tests/fixtures/kr-rrn-leak.ofx` (two valid RRNs in two memos + one
+wrong-check-digit `900101-1123450` decoy) plus 31 new test cases cover the
+validator (six valid RRNs spanning the citizen / foreign-resident century/sex
+markers, wrong-check-digit / impossible-month / impossible-day / arbitrary-run
+rejects, length / wrong-split / non-digit garbage guards), free-text detection,
+redaction, the wrong-check-digit and bad-birth-date non-detection guards, the
+no-collision-with-digit-scanners guarantee, the no-collision-with-other-hyphenated
+detectors guarantee, the no-interference-with-other-identifiers guard, per-field
+dedupe, the fixture, and the clean-file guard. README gained a South Korean RRN
+section and the two type-summary lists were updated. The SARIF mapping
+auto-generates the `pii/kr_rrn` rule with no changes. No new dependencies (stdlib
+`re` only). Full suite: 667 passing.
+
+**Research grounding:** South Korean RRN (주민등록번호) — the 13-digit
+resident-registration number every Korean resident is issued: a `YYMMDD` birth
+date, a century + sex marker (1-2 citizens born 1900s, 3-4 citizens born 2000s, 5-6
+/ 7-8 foreign residents by century, 9-0 born 1800s), a region-of-registration
+serial, and a mod-11 weighted check digit (classic algorithm; retired for newly
+issued numbers from Oct 2020). Unlike a routing / account number an RRN is direct
+*identity* PII — the value names the person's birth date and sex — and it is the
+master personal identifier in Korea, so a free-text RRN echo is a reportable South
+Korean PII disclosure. Public, dependency-free, ~30 lines of Python.
+
+**Estimated tokens:** 30–50K
+
+---
+
 ## Research notes
 
 **Sources consulted:**
