@@ -70,6 +70,15 @@ Detection classes:
                                 Canadian domestic equivalent of an ABA routing
                                 number / UK sort code, the value an Interac
                                 e-Transfer / EFT / PAD payment routes against.
+- ``au_bsb``                  : an Australian BSB (Bank-State-Branch) code in its
+                                canonical ``NNN-NNN`` presentation (a six-digit
+                                routing code -- a bank/institution prefix, a state
+                                identifier, and a branch) whose hyphenated structure
+                                and assigned bank-prefix range validate -- the
+                                Australian domestic equivalent of an ABA routing
+                                number / UK sort code / Canadian routing number, the
+                                value a BSB-and-account payment (BECS / PayTo /
+                                direct entry) routes against.
 - ``account_number``          : a long account-number-shaped digit run leaking
                                 into a transaction name/memo.
 - ``routing_number``          : a 9-digit run that passes the ABA weighted
@@ -364,6 +373,40 @@ _CA_INSTITUTION_RANGES = (
     (100, 399),  # Schedule II/III foreign banks, Bank of Canada, federal gov't
     (600, 699),  # trust and loan companies
     (800, 899),  # central credit-union / caisse-populaire groups
+)
+
+# Australian BSB (Bank-State-Branch) code candidate -- the canonical six-digit
+# routing code written ``NNN-NNN``: a leading bank/financial-institution prefix,
+# a state identifier, and a branch number. This is the value an Australian BECS
+# direct-entry / PayTo / direct-debit payment is routed against (paired with an
+# account number) -- the Australian domestic equivalent of an ABA routing number,
+# a UK sort code, or a Canadian routing number. The hyphenated 3-3 split is the
+# defining presentation and the precision lever: it is distinct from any
+# contiguous digit run (so it never competes with the account-number ``\d{8,}``,
+# routing ``\d{9}``, or card scanners), and distinct from every other hyphenated
+# detector -- the SSN's 3-2-4 split, the UK sort code's 2-2-2, and the Canadian
+# routing number's 5-3 -- so none of the hyphenated detectors ever collide. The
+# run is bounded by a non-digit/non-hyphen lookaround so a BSB embedded in a
+# longer digit-and-hyphen blob is not partially matched. A BSB has no published,
+# self-contained arithmetic check digit, so precision comes from the hyphenated
+# structure plus the assigned bank-prefix gate below. The caller validates both
+# before reporting.
+_AU_BSB_RE = re.compile(r"(?<![\d-])\d{3}-\d{3}(?![\d-])")
+# AusPayNet (the Australian Payments Network, formerly APCA) assigns the leading
+# digits of a BSB to a financial institution. The first two digits are the bank
+# code and the third is (broadly) the state. ``00`` is never an assigned bank
+# prefix, and the assigned space runs through the major banks and the mutual /
+# credit-union / building-society blocks. We gate on the assigned leading-pair
+# ranges below: the big-four and other ADIs occupy 01-19, the special
+# Reserve-Bank / government and other-ADI blocks occupy 20-79, and 80-89 is the
+# Cuscal-sponsored mutual / credit-union / fintech block. 00 (unassigned) and the
+# 90-99 reserved range are rejected. Gating the leading pair to the assigned
+# ranges is the structural precision lever that keeps a coincidental NNN-NNN token
+# (a stylised reference, a part number) from being misread as a BSB.
+_AU_BSB_PREFIX_RANGES = (
+    (1, 19),   # the big-four and other authorised deposit-taking institutions
+    (20, 79),  # Reserve Bank / government / other-ADI institution blocks
+    (80, 89),  # Cuscal-sponsored mutuals, credit unions, building societies, fintechs
 )
 
 
@@ -798,6 +841,54 @@ def _redact_ca_routing(code: str) -> str:
     """
     institution = code.split("-")[1]
     return "XXXXX-" + institution
+
+
+def _au_bsb_valid(candidate: str) -> bool:
+    """Return ``True`` if a string is a structurally valid Australian BSB code.
+
+    An Australian BSB (Bank-State-Branch) code is the six-digit routing code that
+    identifies an Australian bank, state, and branch -- the value that (paired
+    with an account number) drives a BECS direct-entry / PayTo / direct-debit
+    payment, the domestic equivalent of an ABA routing number, a UK sort code, or
+    a Canadian routing number. It is conventionally written in two
+    hyphen-separated triples, ``NNN-NNN``. Like the UK sort code and the Canadian
+    routing number it carries no published, self-contained arithmetic check digit,
+    so precision comes from two public, dependency-free structural gates:
+
+        1. **Shape** -- exactly ``NNN-NNN``: two hyphen-separated triples of
+           decimal digits.
+        2. **Assigned bank prefix** -- the leading two digits (the AusPayNet bank
+           code) must fall in an assigned range (01-19 the big-four / other ADIs,
+           20-79 the Reserve-Bank / government / other-ADI blocks, 80-89 the
+           Cuscal-sponsored mutual / credit-union / fintech block). ``00`` is
+           never assigned and the 90-99 range is reserved, so an all-zeros or an
+           out-of-range leading pair is never a live BSB.
+
+    The hyphenated 3-3 shape is itself the dominant precision lever: it is
+    distinct from any contiguous digit run and from the SSN's 3-2-4 split, the UK
+    sort code's 2-2-2, and the Canadian routing number's 5-3, so the gate never
+    competes with the account / routing / card scanners nor the other hyphenated
+    detectors. Any malformed input returns ``False`` so the helper is safe to
+    reuse.
+    """
+    code = candidate.strip()
+    parts = code.split("-")
+    if len(parts) != 2:
+        return False
+    if not all(len(p) == 3 and p.isdigit() for p in parts):
+        return False
+    prefix = int(parts[0][:2])
+    return any(low <= prefix <= high for low, high in _AU_BSB_PREFIX_RANGES)
+
+
+def _redact_au_bsb(code: str) -> str:
+    """Redact an Australian BSB code, preserving only the leading bank pair.
+
+    The first two digits identify the bank/financial institution (useful context
+    for a report) while the state digit and the three branch digits -- the part
+    that pins the leak to a specific branch's routing -- are masked.
+    """
+    return code[:2] + "X-XXX"
 
 
 def _redact_sedol(sedol: str) -> str:
@@ -1280,6 +1371,40 @@ def _scan_text(
                 "-- discloses the bank/branch routing of an account.",
                 location=location,
                 evidence=_redact_ca_routing(candidate),
+            )
+        )
+
+    # Australian BSB codes (NNN-NNN, the canonical Bank-State-Branch form) -- the
+    # Australian domestic routing code. Like the UK sort code and the Canadian
+    # routing number its hyphenated shape is distinct from any contiguous digit
+    # run, so this scan neither competes with nor is double-counted against the
+    # card / account / routing scanners below (those match contiguous digits; the
+    # hyphen breaks the token into two three-digit pieces, neither of which the
+    # 8+/9-digit scanners match). Its 3-3 split is also distinct from the SSN's
+    # 3-2-4, the UK sort code's 2-2-2, and the Canadian routing number's 5-3, so
+    # the four hyphenated detectors never collide. We gate on the NNN-NNN shape AND
+    # the assigned AusPayNet bank prefix, so a coincidental NNN-NNN token is
+    # unlikely to be reported. A BSB echoed into free text discloses the
+    # bank/branch routing of an account -- the Australian-domestic companion to the
+    # ABA, UK-sort-code, and Canadian-routing detectors.
+    for m in _AU_BSB_RE.finditer(text):
+        candidate = m.group(0)
+        if not _au_bsb_valid(candidate):
+            continue
+        key = ("au_bsb", candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        findings.append(
+            Finding(
+                check="pii",
+                type="au_bsb",
+                severity="high",
+                message="Australian BSB code (valid NNN-NNN structure and "
+                "assigned bank prefix) leaking into a free-text field -- "
+                "discloses the bank/branch routing of an account.",
+                location=location,
+                evidence=_redact_au_bsb(candidate),
             )
         )
 
