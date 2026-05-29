@@ -50,6 +50,14 @@ Detection classes:
                                 UK domestic equivalent of an ABA routing number,
                                 and (paired with an account number) the data a
                                 wire-fraud attacker needs.
+- ``ca_routing_number``       : a Canadian routing number in its MICR cheque
+                                presentation (``TTTTT-III`` -- a five-digit branch
+                                transit number and a three-digit Payments Canada
+                                institution number) whose hyphenated structure and
+                                assigned institution number validate -- the
+                                Canadian domestic equivalent of an ABA routing
+                                number / UK sort code, the value an Interac
+                                e-Transfer / EFT / PAD payment routes against.
 - ``account_number``          : a long account-number-shaped digit run leaking
                                 into a transaction name/memo.
 - ``routing_number``          : a 9-digit run that passes the ABA weighted
@@ -270,6 +278,41 @@ _UK_SORT_CODE_RE = re.compile(r"(?<![\d-])\d{2}-\d{2}-\d{2}(?![\d-])")
 # reference) from being misread as a sort code.
 _UK_SORT_FIRST_MIN = 1
 _UK_SORT_FIRST_MAX = 97
+
+# Canadian routing number candidate -- the MICR (cheque-encoding) presentation,
+# written ``TTTTT-III``: a five-digit branch *transit* number, a hyphen, and a
+# three-digit financial-*institution* number (the Payments Canada assigned bank
+# id, e.g. 003 = RBC, 004 = TD, 010 = CIBC). This is the value a Canadian
+# Interac e-Transfer / EFT / PAD payment is routed against -- the Canadian
+# domestic equivalent of an ABA routing number or a UK sort code. The MICR
+# hyphenated 5-3 shape is the defining presentation and the precision lever: it
+# is distinct from any contiguous digit run, so it never competes with the
+# account-number (``\d{8,}``), routing (``\d{9}``), or card scanners; it is also
+# distinct from the UK sort code (a 2-2-2 split) and the SSN (a 3-2-4 split), so
+# the three hyphenated detectors never collide. The run is bounded by a
+# non-digit/non-hyphen lookaround so a routing number embedded in a longer
+# digit-and-hyphen blob is not partially matched. The caller validates the shape
+# and the institution number against the Payments Canada assigned ranges before
+# reporting.
+_CA_ROUTING_RE = re.compile(r"(?<![\d-])\d{5}-\d{3}(?![\d-])")
+# Payments Canada assigns the three-digit institution number from documented
+# ranges. 000 is never a live institution; 001-039 are the chartered Schedule I
+# banks (001 BMO, 002 Scotiabank, 003 RBC, 004 TD, 006 National Bank, 010 CIBC,
+# 016 HSBC Canada, 030 Canadian Western, 039 Laurentian, etc.); 100-399 are
+# foreign-bank (Schedule II/III) and Bank of Canada / federal-government members;
+# 600-699 are the federally regulated trust/loan and other deposit-taking
+# institutions; 800-899 are the central/credit-union groups (815 Desjardins,
+# 809/828/839/849/879/889 the provincial credit-union centrals). Gating the
+# institution number to these assigned ranges (and rejecting 000) is the
+# structural precision lever that keeps a coincidental TTTTT-III token from being
+# misread as a routing number. Ranges are kept coarse on purpose so the table can
+# stay correct as individual institution numbers are reassigned within them.
+_CA_INSTITUTION_RANGES = (
+    (1, 39),     # Schedule I chartered banks
+    (100, 399),  # Schedule II/III foreign banks, Bank of Canada, federal gov't
+    (600, 699),  # trust and loan companies
+    (800, 899),  # central credit-union / caisse-populaire groups
+)
 
 
 def _luhn_valid(digits: str) -> bool:
@@ -655,6 +698,56 @@ def _redact_uk_sort_code(code: str) -> str:
     return code[:2] + "-XX-XX"
 
 
+def _ca_routing_valid(candidate: str) -> bool:
+    """Return ``True`` if a string is a structurally valid Canadian routing number.
+
+    A Canadian routing number is the value a domestic Interac e-Transfer / EFT /
+    pre-authorized-debit payment is routed against -- the Canadian equivalent of
+    an ABA routing number or a UK sort code. Its cheque-printed MICR presentation
+    is ``TTTTT-III``: a five-digit branch *transit* number, a hyphen, and a
+    three-digit financial-*institution* number. Like the UK sort code it carries
+    no published, self-contained arithmetic checksum (the only validation is the
+    bank's own account-modulus check, which needs the paired account number), so
+    precision comes from two public, dependency-free structural gates:
+
+        1. **Shape** -- exactly ``TTTTT-III``: five decimal digits, a hyphen, and
+           three decimal digits.
+        2. **Assigned institution number** -- the three-digit institution number
+           must fall in a Payments Canada assigned range (1-39 chartered banks,
+           100-399 foreign-bank / federal members, 600-699 trust & loan, 800-899
+           credit-union centrals). ``000`` is never a live institution, and an
+           out-of-range value (e.g. 999) is the classic decoy.
+
+    The hyphenated 5-3 shape is itself the dominant precision lever: it is
+    distinct from any contiguous digit run and from the UK sort code's 2-2-2 split
+    and the SSN's 3-2-4 split, so the gate never competes with the account /
+    routing / card scanners nor the other hyphenated detectors. Any malformed
+    input returns ``False`` so the helper is safe to reuse.
+    """
+    code = candidate.strip()
+    parts = code.split("-")
+    if len(parts) != 2:
+        return False
+    transit, institution = parts
+    if not (len(transit) == 5 and transit.isdigit()):
+        return False
+    if not (len(institution) == 3 and institution.isdigit()):
+        return False
+    inst = int(institution)
+    return any(low <= inst <= high for low, high in _CA_INSTITUTION_RANGES)
+
+
+def _redact_ca_routing(code: str) -> str:
+    """Redact a Canadian routing number, preserving only the institution number.
+
+    The trailing three-digit institution number identifies the bank (useful
+    context for a report -- 003 = RBC, 004 = TD, and so on) while the five-digit
+    branch transit number, which pins the leak to a specific branch, is masked.
+    """
+    institution = code.split("-")[1]
+    return "XXXXX-" + institution
+
+
 def _redact_sedol(sedol: str) -> str:
     """Redact a SEDOL, preserving only the leading character for triage.
 
@@ -983,6 +1076,40 @@ def _scan_text(
                 "discloses the bank/branch routing of an account.",
                 location=location,
                 evidence=_redact_uk_sort_code(candidate),
+            )
+        )
+
+    # Canadian routing numbers (TTTTT-III, the MICR cheque-encoding form) -- the
+    # Canadian domestic routing code. Like the UK sort code its hyphenated shape
+    # is distinct from any contiguous digit run, so this scan neither competes
+    # with nor is double-counted against the card / account / routing scanners
+    # below (those match contiguous digits; the hyphen breaks the token into a
+    # five- and a three-digit piece, neither of which the 8+/9-digit scanners
+    # match). Its 5-3 split is also distinct from the UK sort code's 2-2-2 and the
+    # SSN's 3-2-4, so the three hyphenated detectors never collide. We gate on the
+    # MICR shape AND the Payments Canada assigned institution number, so a
+    # coincidental TTTTT-III token is unlikely to be reported. A Canadian routing
+    # number echoed into free text discloses the bank/branch routing of an
+    # account -- the Canadian-domestic companion to the ABA and UK-sort-code
+    # detectors.
+    for m in _CA_ROUTING_RE.finditer(text):
+        candidate = m.group(0)
+        if not _ca_routing_valid(candidate):
+            continue
+        key = ("ca_routing_number", candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        findings.append(
+            Finding(
+                check="pii",
+                type="ca_routing_number",
+                severity="high",
+                message="Canadian routing number (valid TTTTT-III MICR structure "
+                "and assigned institution number) leaking into a free-text field "
+                "-- discloses the bank/branch routing of an account.",
+                location=location,
+                evidence=_redact_ca_routing(candidate),
             )
         )
 

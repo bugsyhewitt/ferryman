@@ -756,6 +756,70 @@ routing (sort code).
 
 ---
 
+## Rank 18 — Canadian Routing Number Leak Detection, TTTTT-III MICR structure + assigned-institution gated (HIGH signal, low effort) — ✅ IMPLEMENTED (2026-05-29, Phase 2 Rotation 19)
+
+**Status:** Shipped. `checks/pii.py` gained a `_ca_routing_valid()` helper that
+gates a Canadian routing-number candidate behind two independent public,
+dependency-free checks: the canonical MICR (cheque-encoding) **shape** (exactly
+`TTTTT-III` — a five-digit branch transit number, a hyphen, and a three-digit
+financial-institution number) and the assigned **institution number** (the
+three-digit institution must fall in a Payments Canada assigned range:
+`001`–`039` chartered Schedule I banks, `100`–`399` Schedule II/III foreign banks
+and federal members, `600`–`699` trust & loan companies, `800`–`899` credit-union
+/ caisse-populaire centrals; `000` is never a live institution and out-of-range
+values such as `999` are the classic decoy). Like the UK sort code, a Canadian
+routing number has no published, self-contained arithmetic checksum — the only
+validation is the bank's own account-modulus check, which requires the paired
+account number — so precision comes from the MICR structure plus the assigned
+institution number rather than a checksum. The `_CA_ROUTING_RE` matcher
+(`\d{5}-\d{3}`, non-digit/non-hyphen bounded) keys off the hyphenated 5-3
+presentation, which is the dominant precision lever: the hyphen breaks the token
+into a five- and a three-digit piece, so it is structurally distinct from any
+contiguous digit run and never competes with — nor is double-counted against —
+the account-number (`\d{8,}`), routing (`\d{9}`), or payment-card scanners. The
+5-3 split is also distinct from the UK sort code's 2-2-2 split and the SSN's 3-2-4
+split, so the three hyphenated detectors never collide. Findings are `high`
+severity; evidence is redacted to the trailing institution number via
+`_redact_ca_routing()` (`XXXXX-003`) so the branch-identifying transit number
+never leaves the tool. New fixture `tests/fixtures/ca-routing-leak.ofx` (two valid
+routing numbers in two memos plus an out-of-range `11111-999` decoy) plus 39 new
+tests in `tests/test_pii.py` cover the validator (real-format routing numbers
+across all four assigned institution ranges including range boundaries,
+unassigned-gap/zero/out-of-range/wrong-shape rejects, garbage guards), memo
+detection and institution-number redaction, the decoy and zero-institution
+non-detection guards, the contiguous-digit non-detection guard, the
+no-interference-with-other-identifiers guard, the no-collision-with-digit-scanners
+guarantee, the no-collision-with-UK-sort-code guarantee, the SSN-not-misread
+guard, per-field dedupe, the fixture, and the clean-file no-routing-number
+guarantee. README gained a "Canadian routing number leak detection" section and
+the PII type lists were updated. No new dependencies (stdlib `re` only).
+
+**What:** The pii check covered SSN, payment card (PAN), IBAN, ISIN, CUSIP,
+SEDOL, LEI, BIC, US account number, US ABA routing number, and the UK sort code.
+The Canadian routing number is the **Canadian** domestic routing code — the
+`TTTTT-III` MICR value that identifies a branch transit and a financial
+institution and that drives a domestic Interac e-Transfer / EFT / pre-authorized
+debit. A routing number echoed into a transaction memo discloses *which Canadian
+bank and branch* routes a customer's account; paired with a leaked account number
+it is the exact data a Canadian PAD-fraud or account-takeover attacker needs,
+making the free-text routing-number echo the natural domestic-routing companion
+to the already-shipped ABA routing-number and UK sort-code detectors. It
+completes the North-American + UK domestic-routing dimension: US (ABA), UK (sort
+code), and now Canada (routing number).
+
+**Research grounding:** The Canadian routing number's `TTTTT-III` MICR structure
+and the Payments Canada institution-number assignment ranges are public and
+documented. The only arithmetic validation is the individual bank's
+account-modulus check, which requires the paired account number and a per-bank
+weight table — out of scope for a single self-contained identifier — so the
+detector gates on the MICR structure plus the assigned institution number, with
+the hyphenated 5-3 presentation itself the precision lever against coincidental
+digit runs. ~20 lines of Python with no new dependency.
+
+**Estimated tokens:** 35–50K
+
+---
+
 ## Research notes
 
 **Sources consulted:**

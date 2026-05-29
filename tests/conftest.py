@@ -84,6 +84,12 @@ def uk_sort_code_file() -> Path:
 
 
 @pytest.fixture
+def ca_routing_file() -> Path:
+    """A bank statement leaking valid Canadian routing numbers (TTTTT-III)."""
+    return FIXTURES / "ca-routing-leak.ofx"
+
+
+@pytest.fixture
 def entity_bomb_file() -> Path:
     return FIXTURES / "entity-bomb.ofx"
 

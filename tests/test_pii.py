@@ -11,6 +11,7 @@ import pytest
 from ferryman.checks.pii import (
     _aba_checksum_valid,
     _bic_valid,
+    _ca_routing_valid,
     _cusip_valid,
     _iban_valid,
     _isin_valid,
@@ -1135,3 +1136,161 @@ def test_uk_sort_code_leak_fixture(uk_sort_code_file):
 def test_clean_file_no_uk_sort_code(clean_file):
     findings = check_pii(clean_file.read_bytes())
     assert "uk_sort_code" not in {f.type for f in findings}
+
+
+# --- Canadian routing number detection (TTTTT-III MICR structure + assigned
+# institution-number gated) ---
+
+# Real-format Canadian routing numbers in the MICR TTTTT-III presentation: a
+# five-digit branch transit number plus a three-digit Payments Canada institution
+# number. Each must pass the hyphenated structure and the assigned
+# institution-number gate. (Transit numbers are arbitrary five-digit branch ids;
+# the institution numbers below are the published Payments Canada bank ids.)
+VALID_CA_ROUTING = [
+    "00012-003",  # RBC (institution 003)
+    "12345-004",  # TD (institution 004)
+    "00001-001",  # BMO (institution 001 -- minimum chartered-bank range)
+    "98765-002",  # Scotiabank (institution 002)
+    "55501-010",  # CIBC (institution 010)
+    "00100-039",  # Laurentian (institution 039 -- top of chartered-bank range)
+    "30000-260",  # a Schedule II/III foreign-bank institution (100-399 range)
+    "44444-614",  # a trust/loan institution (600-699 range)
+    "12121-815",  # Desjardins (institution 815 -- credit-union central range)
+]
+
+# Strings shaped like a Canadian routing number but failing the structure or the
+# assigned institution-number gate -- they must NOT validate.
+INVALID_CA_ROUTING = [
+    "12345-000",  # institution 000 is never a live institution
+    "12345-040",  # institution 040 falls in an unassigned gap (40-99)
+    "12345-400",  # institution 400 falls in an unassigned gap (400-599)
+    "12345-700",  # institution 700 falls in an unassigned gap (700-799)
+    "12345-999",  # institution 999 is the classic decoy / out of range
+    "1234-003",   # transit not five digits
+    "123456-003", # transit too long
+    "12345-03",   # institution not three digits
+    "12345-0033", # institution too long
+    "12345003",   # no hyphen (not the MICR shape)
+    "12345-003-1",  # three parts -- wrong structure
+]
+
+
+@pytest.mark.parametrize("code", VALID_CA_ROUTING)
+def test_ca_routing_accepts_real_codes(code):
+    assert _ca_routing_valid(code) is True
+
+
+@pytest.mark.parametrize("code", INVALID_CA_ROUTING)
+def test_ca_routing_rejects_invalid(code):
+    assert _ca_routing_valid(code) is False
+
+
+@pytest.mark.parametrize(
+    "bad", ["", "  ", "abcde-fgh", "12345/003", "12345-00X", "------", "12345"]
+)
+def test_ca_routing_rejects_garbage(bad):
+    # Defensive: malformed / non-numeric / wrong-shape input is never a valid
+    # Canadian routing number.
+    assert _ca_routing_valid(bad) is False
+
+
+def test_ca_routing_in_memo_detected():
+    findings = _scan("EFT routed to 00012-003 RBC main branch")
+    codes = [f for f in findings if f.type == "ca_routing_number"]
+    assert len(codes) == 1
+    assert codes[0].severity == "high"
+    assert codes[0].check == "pii"
+    # Only the institution number survives for triage; the branch transit is masked.
+    assert codes[0].evidence == "XXXXX-003"
+
+
+def test_ca_routing_redaction_masks_transit():
+    findings = _scan("beneficiary at 12345-004 TD")
+    codes = [f for f in findings if f.type == "ca_routing_number"]
+    assert len(codes) == 1
+    assert codes[0].evidence == "XXXXX-004"
+    # The branch-identifying transit number never leaves the tool.
+    assert "12345" not in codes[0].evidence
+
+
+def test_ca_routing_decoy_institution_not_reported():
+    # 11111-999 has the right MICR shape but an out-of-range institution number,
+    # so it must NOT be reported.
+    findings = _scan("decoy reference 11111-999 logged")
+    assert "ca_routing_number" not in {f.type for f in findings}
+
+
+def test_ca_routing_zero_institution_not_reported():
+    findings = _scan("placeholder 12345-000 in the template")
+    assert "ca_routing_number" not in {f.type for f in findings}
+
+
+def test_contiguous_eight_digits_not_a_ca_routing():
+    # The hyphenated TTTTT-III shape is the defining feature: a plain digit run
+    # is never reclassified as a Canadian routing number.
+    findings = _scan("reference 12345003 noted")
+    assert "ca_routing_number" not in {f.type for f in findings}
+
+
+def test_ca_routing_does_not_break_other_identifiers():
+    # The hyphenated routing scan must not interfere with the other identifiers
+    # when those appear on their own.
+    isin_findings = _scan("US0378331005 holding")
+    assert [f.type for f in isin_findings] == ["isin"]
+    aba_findings = [f for f in _scan("routing 121000248 on file")
+                    if f.type == "routing_number"]
+    assert len(aba_findings) == 1
+
+
+def test_ca_routing_does_not_collide_with_digit_scanners():
+    # The hyphen breaks the run into a five- and a three-digit piece, so the
+    # 8+/9-digit account/routing scanners never also claim it.
+    findings = _scan("paid via 00012-003 to the account")
+    types = [f.type for f in findings]
+    assert types.count("ca_routing_number") == 1
+    assert "account_number" not in types
+    assert "routing_number" not in types
+    assert "credit_card" not in types
+
+
+def test_ca_routing_does_not_collide_with_uk_sort_code():
+    # A Canadian routing number (5-3 split) and a UK sort code (2-2-2 split) are
+    # distinct shapes: each is reported only as its own type.
+    ca = _scan("Canadian 00012-003 here")
+    assert [f.type for f in ca] == ["ca_routing_number"]
+    uk = _scan("British 20-00-00 here")
+    assert [f.type for f in uk] == ["uk_sort_code"]
+
+
+def test_ssn_not_misread_as_ca_routing():
+    # An SSN (NNN-NN-NNNN, a 3-2-4 split) is a different shape and must be
+    # reported as an SSN, never as a Canadian routing number.
+    findings = _scan("client ssn 123-45-6789 on file")
+    types = {f.type for f in findings}
+    assert "ssn" in types
+    assert "ca_routing_number" not in types
+
+
+def test_same_ca_routing_deduped_per_field():
+    findings = _scan("00012-003 and again 00012-003 in one memo")
+    codes = [f for f in findings if f.type == "ca_routing_number"]
+    assert len(codes) == 1
+
+
+def test_ca_routing_leak_fixture(ca_routing_file):
+    findings = check_pii(ca_routing_file.read_bytes())
+    codes = [f for f in findings if f.type == "ca_routing_number"]
+    types = {f.type for f in findings}
+    assert "ca_routing_number" in types, f"expected ca_routing_number, got: {types}"
+    # The fixture leaks two valid routing numbers in memos; the out-of-range
+    # 11111-999 decoy must NOT be reported.
+    assert len(codes) == 2
+    assert all(c.severity == "high" for c in codes)
+    for c in codes:
+        # No raw transit number remains in the evidence.
+        assert c.evidence.startswith("XXXXX-")
+
+
+def test_clean_file_no_ca_routing(clean_file):
+    findings = check_pii(clean_file.read_bytes())
+    assert "ca_routing_number" not in {f.type for f in findings}

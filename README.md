@@ -13,9 +13,9 @@ scanner that treats an OFX file as an attack surface and asks three questions:
   injection / encoding mismatch, encoding tricks, oversized fields.
 - **Is this file leaking PII it should not?** SSNs, payment-card numbers
   (PANs), IBANs, securities identifiers (ISIN/CUSIP/SEDOL), legal-entity
-  identifiers (LEI), bank identifier codes (BIC/SWIFT), UK sort codes, full
-  account numbers, and routing numbers smuggled into free-text transaction names
-  and memos.
+  identifiers (LEI), bank identifier codes (BIC/SWIFT), UK sort codes, Canadian
+  routing numbers, full account numbers, and routing numbers smuggled into
+  free-text transaction names and memos.
 - **Is this file anomalous?** Out-of-range posting dates, zero / sign-flipped /
   out-of-range transaction amounts, and other signs of tampering or a backend
   that accepts garbage.
@@ -55,8 +55,9 @@ ferryman [--check {malformed,pii,anomaly,all}] [--format {json,text,h1md,sarif}]
     injection / encoding mismatch, encoding tricks, oversized fields). Operates
     on raw bytes; never parses a hostile file.
   - `pii` &mdash; PII leaking into transaction free-text (SSN, payment-card
-    number, IBAN, ISIN, CUSIP, SEDOL, LEI, BIC/SWIFT, UK sort code, account
-    number, routing number), including investment memos and security ids.
+    number, IBAN, ISIN, CUSIP, SEDOL, LEI, BIC/SWIFT, UK sort code, Canadian
+    routing number, account number, routing number), including investment memos
+    and security ids.
     Evidence is always redacted before it leaves the tool.
   - `anomaly` &mdash; structurally valid but suspicious transactions
     (out-of-range dates; zero, sign-contradicting, or out-of-range transaction
@@ -589,6 +590,47 @@ $ ferryman --check pii --format text leak.ofx
 ```
 
 **Remediation:** never echo a customer's sort code into a statement memo or
+transaction name; keep bank/branch routing identifiers in structured,
+access-controlled fields rather than free text.
+
+### Canadian routing number leak detection
+
+A [Canadian routing number](https://en.wikipedia.org/wiki/Routing_number_(Canada))
+is the value a domestic Interac e-Transfer / EFT / pre-authorized-debit (PAD)
+payment is routed against &mdash; the Canadian equivalent of an ABA routing
+number or a UK sort code. Its cheque-printed MICR presentation is `TTTTT-III`: a
+five-digit branch **transit** number, a hyphen, and a three-digit Payments Canada
+**institution** number (e.g. `003` = RBC, `004` = TD, `010` = CIBC). A routing
+number echoed into a free-text **memo or transaction name** discloses the
+bank/branch routing of an account. The **pii** check flags a `ca_routing_number`
+finding (severity `high`) when a free-text field contains a string that clears
+**two** public, dependency-free gates:
+
+1. **shape** &mdash; exactly `TTTTT-III`: five decimal digits, a hyphen, and
+   three decimal digits. The hyphenated 5-3 presentation is the dominant
+   precision lever: it is distinct from any contiguous digit run, so it never
+   collides with the account number (`\d{8,}`), routing (`\d{9}`), or
+   payment-card scanners; it is also distinct from the UK sort code's 2-2-2 split
+   and the SSN's 3-2-4 split, so the three hyphenated detectors never collide;
+2. **assigned institution number** &mdash; the three-digit institution number
+   must fall in a Payments Canada assigned range (`001`&ndash;`039` chartered
+   banks, `100`&ndash;`399` foreign-bank / federal members, `600`&ndash;`699`
+   trust & loan, `800`&ndash;`899` credit-union centrals). `000` is never a live
+   institution, and an out-of-range value (e.g. `999`) is never reported.
+
+Like the UK sort code, a Canadian routing number carries no published,
+self-contained arithmetic checksum (the only validation is the bank's own
+account-modulus check, which needs the paired account number), so precision comes
+from the MICR structure plus the assigned institution number. Evidence is
+redacted to the institution number (`XXXXX-003`); the branch-identifying transit
+number never leaves the tool.
+
+```bash
+$ ferryman --check pii --format text leak.ofx
+  [HIGH] pii/ca_routing_number @ statement[0].transaction[0].memo: Canadian routing number (valid TTTTT-III MICR structure and assigned institution number) leaking into a free-text field -- discloses the bank/branch routing of an account.
+```
+
+**Remediation:** never echo a customer's routing number into a statement memo or
 transaction name; keep bank/branch routing identifiers in structured,
 access-controlled fields rather than free text.
 
