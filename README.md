@@ -12,8 +12,8 @@ scanner that treats an OFX file as an attack surface and asks three questions:
   CDATA-terminator injection, SGML/XML format confusion, OFX v1 header
   injection / encoding mismatch, encoding tricks, oversized fields.
 - **Is this file leaking PII it should not?** SSNs, payment-card numbers
-  (PANs), full account numbers, and routing numbers smuggled into free-text
-  transaction names and memos.
+  (PANs), IBANs, securities identifiers (ISIN/CUSIP), full account numbers, and
+  routing numbers smuggled into free-text transaction names and memos.
 - **Is this file anomalous?** Out-of-range posting dates, zero / sign-flipped /
   out-of-range transaction amounts, and other signs of tampering or a backend
   that accepts garbage.
@@ -53,8 +53,9 @@ ferryman [--check {malformed,pii,anomaly,all}] [--format {json,text,h1md,sarif}]
     injection / encoding mismatch, encoding tricks, oversized fields). Operates
     on raw bytes; never parses a hostile file.
   - `pii` &mdash; PII leaking into transaction free-text (SSN, payment-card
-    number, IBAN, ISIN, account number, routing number), including investment
-    memos and security ids. Evidence is always redacted before it leaves the tool.
+    number, IBAN, ISIN, CUSIP, account number, routing number), including
+    investment memos and security ids. Evidence is always redacted before it
+    leaves the tool.
   - `anomaly` &mdash; structurally valid but suspicious transactions
     (out-of-range dates; zero, sign-contradicting, or out-of-range transaction
     amounts; for investment statements, negative/implausible unit prices and
@@ -388,6 +389,44 @@ $ ferryman --check pii --format text leak.ofx
 ```
 
 **Remediation:** never echo a security's ISIN into a statement memo or
+transaction name; keep security identifiers in the structured `SECID` field where
+they belong.
+
+### CUSIP leak detection
+
+A [CUSIP](https://en.wikipedia.org/wiki/CUSIP) is the nine-character US/Canada
+securities identifier &mdash; the NSIN that forms the core of a US `ISIN` and the
+value that legitimately belongs in an OFX investment `SECID`. Like an ISIN, a
+CUSIP that leaks into a free-text **memo or transaction name** discloses which
+securities a customer holds &mdash; a brokerage-account privacy leak reportable on
+its own. The **pii** check flags a `cusip` finding (severity `high`) when a
+free-text field contains a string that clears **both** public gates:
+
+1. **shape** &mdash; exactly nine characters: an eight-character base (digits,
+   letters `A`&ndash;`Z`, or the legacy specials `*` `@` `#`) plus one trailing
+   decimal check digit. The base must contain at least one letter, so a purely
+   numeric nine-digit run &mdash; which lives in the ABA routing-number space
+   &mdash; is never misclassified as a CUSIP;
+2. **check digit** &mdash; the public CUSIP modulus-10 "double-add-double"
+   algorithm: map each base character to its value (`A`=10&hellip;`Z`=35,
+   `*`=36, `@`=37, `#`=38), double every value in an even position, sum the
+   decimal digits, and the check digit is `(10 - (sum mod 10)) mod 10`.
+
+Gating on the CUSIP check digit mirrors the ABA, Luhn, IBAN, and ISIN gates: a
+run that clears both is a near-certain real CUSIP, while a coincidental
+alphanumeric blob fails the check digit with overwhelming probability and is left
+to the existing heuristics. The base and check digit never leave the tool &mdash;
+evidence is redacted to the leading two characters (`17XXXXXXX`). A CUSIP sitting
+in its own `SECID` field is *not* flagged; only one bleeding into free text is.
+Because a US ISIN embeds a CUSIP as its NSIN, the longer twelve-character ISIN
+match takes precedence when an ISIN is present.
+
+```bash
+$ ferryman --check pii --format text leak.ofx
+  [HIGH] pii/cusip @ statement[0].transaction[0].memo: CUSIP securities identifier (valid check digit) leaking into a free-text field -- discloses a customer's securities holding.
+```
+
+**Remediation:** never echo a security's CUSIP into a statement memo or
 transaction name; keep security identifiers in the structured `SECID` field where
 they belong.
 

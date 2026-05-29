@@ -54,6 +54,12 @@ def isin_file() -> Path:
 
 
 @pytest.fixture
+def cusip_file() -> Path:
+    """An investment statement leaking valid CUSIPs in free-text memos."""
+    return FIXTURES / "cusip-leak.ofx"
+
+
+@pytest.fixture
 def entity_bomb_file() -> Path:
     return FIXTURES / "entity-bomb.ofx"
 

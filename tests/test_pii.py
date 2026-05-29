@@ -10,6 +10,7 @@ import pytest
 
 from ferryman.checks.pii import (
     _aba_checksum_valid,
+    _cusip_valid,
     _iban_valid,
     _isin_valid,
     _luhn_valid,
@@ -457,3 +458,141 @@ def test_isin_leak_fixture(isin_file):
 def test_clean_file_no_isin(clean_file):
     findings = check_pii(clean_file.read_bytes())
     assert "isin" not in {f.type for f in findings}
+
+
+# --- CUSIP detection (modulus-10 check-digit gated) ---
+
+# Real, published CUSIPs with a valid modulus-10 check digit. Several carry a
+# letter in the base (so the free-text regex detects them); IBM's all-numeric
+# CUSIP validates at the helper level too.
+VALID_CUSIPS = [
+    "17275R102",  # Cisco Systems
+    "88160R101",  # Tesla Inc.
+    "38259P508",  # Alphabet Inc. (Google) Class A
+    "30303M102",  # Meta Platforms Inc.
+    "02079K305",  # Alphabet Inc. Class C
+    "459200101",  # IBM (all-numeric base -- validator-level only)
+]
+
+# Strings shaped like a CUSIP but failing the modulus-10 check digit or the
+# 9-char shape -- they must NOT validate.
+INVALID_CUSIPS = [
+    "17275R103",  # Cisco CUSIP with the wrong check digit
+    "88160R102",  # Tesla CUSIP with the wrong check digit
+    "38259P509",  # Alphabet CUSIP with the wrong check digit
+    "17275R10",   # 8 chars -- too short
+    "17275R1023",  # 10 chars -- too long
+]
+
+
+@pytest.mark.parametrize("cusip", VALID_CUSIPS)
+def test_cusip_accepts_real_cusips(cusip):
+    assert _cusip_valid(cusip) is True
+
+
+@pytest.mark.parametrize("cusip", INVALID_CUSIPS)
+def test_cusip_rejects_invalid(cusip):
+    assert _cusip_valid(cusip) is False
+
+
+@pytest.mark.parametrize("bad", ["", "17275R", "  ", "17275R10A", "17275R!02"])
+def test_cusip_rejects_garbage(bad):
+    # Defensive: malformed / too-short input is never a valid CUSIP. A
+    # non-numeric check digit ("...0A") and a bad base char are both rejected.
+    assert _cusip_valid(bad) is False
+
+
+def test_cusip_char_value_table():
+    # The legacy specials (* @ #) carry fixed values 36/37/38; letters map
+    # A=10 ... Z=35; digits map to themselves; anything else is None.
+    from ferryman.checks.pii import _cusip_char_value
+
+    assert _cusip_char_value("*") == 36
+    assert _cusip_char_value("@") == 37
+    assert _cusip_char_value("#") == 38
+    assert _cusip_char_value("A") == 10
+    assert _cusip_char_value("Z") == 35
+    assert _cusip_char_value("7") == 7
+    assert _cusip_char_value("!") is None
+
+
+def test_cusip_in_memo_detected():
+    findings = _scan("sold security 17275R102 today")
+    cusips = [f for f in findings if f.type == "cusip"]
+    assert len(cusips) == 1
+    assert cusips[0].severity == "high"
+    assert cusips[0].check == "pii"
+    # The base / check digit never leave the scanner; only the leading two
+    # characters survive for triage.
+    assert "275R102" not in (cusips[0].evidence or "")
+    assert (cusips[0].evidence or "").startswith("17")
+
+
+def test_cusip_lowercase_detected():
+    # CUSIPs are case-insensitive; a lowercased value still validates and is
+    # reported (the regex matches the letter; the validator upper-cases).
+    findings = _scan("ticker cusip 17275r102 on file")
+    cusips = [f for f in findings if f.type == "cusip"]
+    assert len(cusips) == 1
+
+
+def test_numeric_cusip_not_matched_in_freetext():
+    # A purely numeric 9-digit run (e.g. Apple's 037833100) lives in the ABA
+    # routing-number space; the CUSIP regex requires a letter so it is NOT
+    # reported as a cusip -- it falls through to the routing/probable path.
+    findings = _scan("order 037833100 confirmed")
+    types = {f.type for f in findings}
+    assert "cusip" not in types
+    assert types & {"routing_number", "probable_routing_number"}
+
+
+def test_cusip_not_double_counted_as_account_number():
+    # A CUSIP must be classified once -- as a cusip -- and never also as an
+    # account_number / routing_number / credit_card finding.
+    findings = _scan("holding 88160R101 in the account")
+    types = [f.type for f in findings]
+    assert types.count("cusip") == 1
+    assert "account_number" not in types
+    assert "routing_number" not in types
+    assert "credit_card" not in types
+
+
+def test_invalid_cusip_not_reported():
+    # A wrong-check-digit CUSIP-shaped run must NOT be reported as a cusip.
+    findings = _scan("ref 17275R103 logged")
+    assert "cusip" not in {f.type for f in findings}
+
+
+def test_isin_wins_over_embedded_cusip():
+    # A US ISIN embeds a CUSIP as positions 3-11; the longer 12-char ISIN match
+    # claims the run, so a valid US ISIN reports as isin, not cusip.
+    findings = _scan("US0378331005 holding")
+    types = [f.type for f in findings]
+    assert types.count("isin") == 1
+    assert "cusip" not in types
+
+
+def test_same_cusip_deduped_per_field():
+    findings = _scan("17275R102 aka 17275r102 in two casings")
+    cusips = [f for f in findings if f.type == "cusip"]
+    assert len(cusips) == 1
+
+
+def test_cusip_leak_fixture(cusip_file):
+    findings = check_pii(cusip_file.read_bytes())
+    cusips = [f for f in findings if f.type == "cusip"]
+    types = {f.type for f in findings}
+    assert "cusip" in types, f"expected cusip, got: {types}"
+    # The fixture leaks two valid CUSIPs in memos; the wrong-check-digit decoy
+    # must NOT be reported, and the CUSIPs sitting in their own SECID fields are
+    # legitimate (not a leak) and must NOT be flagged from there.
+    assert len(cusips) == 2
+    assert all(c.severity == "high" for c in cusips)
+    for c in cusips:
+        # No raw base digits remain in the evidence.
+        assert "X" in (c.evidence or "")
+
+
+def test_clean_file_no_cusip(clean_file):
+    findings = check_pii(clean_file.read_bytes())
+    assert "cusip" not in {f.type for f in findings}
