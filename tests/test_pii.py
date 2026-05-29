@@ -15,6 +15,7 @@ from ferryman.checks.pii import (
     _cusip_valid,
     _iban_valid,
     _isin_valid,
+    _itin_valid,
     _lei_valid,
     _luhn_valid,
     _redact_email,
@@ -101,6 +102,121 @@ def _scan(text):
     findings = []
     _scan_text(text, location="t", findings=findings, seen=set())
     return findings
+
+
+# --- ITIN detection (US Individual Taxpayer Identification Number) ---
+
+# Structurally valid ITINs: area 900-999, middle group in 50-65 / 70-88 /
+# 90-92 / 94-99. These cover each assigned middle range and its boundaries.
+VALID_ITINS = [
+    "900-50-0000",  # lower bound of the 50-65 range
+    "912-65-1234",  # upper bound of 50-65
+    "999-70-9999",  # lower bound of 70-88, max area + serial
+    "900-88-0001",  # upper bound of 70-88
+    "934-90-4567",  # 90-92 range
+    "956-92-1111",  # upper bound of 90-92
+    "978-94-2222",  # lower bound of 94-99
+    "999-99-9999",  # upper bound of everything
+]
+
+# 9XX-shaped values that are NOT valid ITINs -- the reserved middle-group gaps
+# (66-69, 89, 93) the IRS never assigns to a live ITIN.
+INVALID_ITIN_MIDDLE = [
+    "900-66-0000",  # 66-69 gap
+    "900-69-0000",  # 66-69 gap
+    "900-89-0000",  # 89 reserved
+    "900-93-0000",  # 93 is the ATIN range, not an ITIN
+    "900-49-0000",  # below the 50-65 floor
+]
+
+
+@pytest.mark.parametrize("itin", VALID_ITINS)
+def test_itin_validator_accepts_real_itins(itin):
+    assert _itin_valid(itin) is True
+
+
+@pytest.mark.parametrize("itin", INVALID_ITIN_MIDDLE)
+def test_itin_validator_rejects_reserved_middle_groups(itin):
+    assert _itin_valid(itin) is False
+
+
+def test_itin_validator_rejects_non_nine_area():
+    # A leading area below 900 is a real SSN's space, never an ITIN.
+    assert _itin_valid("123-45-6789") is False
+    assert _itin_valid("899-70-0000") is False
+
+
+@pytest.mark.parametrize(
+    "bad",
+    ["", "900-7-0000", "9OO-70-0000", "12345678", "1234567890", "abc-de-fghi"],
+)
+def test_itin_validator_rejects_garbage(bad):
+    # Wrong length (after stripping separators) or non-numeric is never valid.
+    assert _itin_valid(bad) is False
+
+
+def test_itin_validator_works_on_stripped_digits():
+    # Like the ABA/Luhn helpers, the validator operates on the candidate's
+    # digits: a contiguous valid run validates; the NNN-NN-NNNN *presentation*
+    # is enforced by the scanning regex, not the validator.
+    assert _itin_valid("900700000") is True
+    assert _itin_valid("900 70 0000") is True
+    assert _itin_valid("900-70-0000") is True
+
+
+def test_itin_in_freetext_detected_as_itin_not_ssn():
+    findings = _scan("payroll for ITIN 900-70-0000")
+    types = {f.type for f in findings}
+    assert "itin" in types, f"expected itin, got: {types}"
+    # A valid ITIN must NOT also be reported as a generic SSN-shaped finding.
+    assert "ssn" not in types
+    itin = next(f for f in findings if f.type == "itin")
+    assert itin.severity == "critical"
+    # Evidence is redacted -- the raw number never leaves the scanner.
+    assert "900-70-0000" not in (itin.evidence or "")
+
+
+def test_real_ssn_still_reported_as_ssn_not_itin():
+    # A genuine SSN (area not 9XX) must fall through to the SSN detector.
+    findings = _scan("customer SSN 123-45-6789 on file")
+    types = {f.type for f in findings}
+    assert "ssn" in types
+    assert "itin" not in types
+
+
+def test_reserved_middle_group_not_reported_as_itin():
+    # 900-89-0000 is 9XX-shaped but in the reserved 89 group -- it is neither a
+    # valid ITIN nor a valid SSN (SSN areas never begin with 9), so it is
+    # claimed by the SSN detector's plain shape match but never as an ITIN.
+    findings = _scan("ref 900-89-0000")
+    types = {f.type for f in findings}
+    assert "itin" not in types
+
+
+def test_itin_deduped_per_field():
+    # The same ITIN in name and memo of one field-scan collapses to one finding.
+    findings = _scan("ITIN 900-70-0000 and again 900-70-0000")
+    itins = [f for f in findings if f.type == "itin"]
+    assert len(itins) == 1
+
+
+def test_itin_leak_fixture(itin_file):
+    findings = check_pii(itin_file.read_bytes())
+    types = {f.type for f in findings}
+    # The fixture carries two valid ITINs (in two fields) and one real SSN.
+    assert "itin" in types, f"expected itin, got: {types}"
+    assert "ssn" in types, f"expected ssn (the 123-45-6789 leak), got: {types}"
+    itins = [f for f in findings if f.type == "itin"]
+    assert len(itins) == 2
+    for f in itins:
+        assert f.severity == "critical"
+        assert "900-70-0000" not in (f.evidence or "")
+        assert "999-88-9999" not in (f.evidence or "")
+
+
+def test_clean_file_no_itin(clean_file):
+    findings = check_pii(clean_file.read_bytes())
+    assert not [f for f in findings if f.type == "itin"]
 
 
 def test_valid_aba_emits_high_severity_routing_number():

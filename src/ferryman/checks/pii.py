@@ -7,6 +7,13 @@ numbers that should never travel in a statement export.
 
 Detection classes:
 - ``ssn``                     : SSN-shaped strings (NNN-NN-NNNN) in free text.
+- ``itin``                    : a US Individual Taxpayer Identification Number --
+                                an SSN-shaped value (NNN-NN-NNNN) whose area is
+                                900-999 and whose middle group falls in the
+                                IRS-assigned ranges -- a distinct piece of US tax
+                                PII issued to people ineligible for an SSN.
+                                Checked before the SSN detector so an ITIN is
+                                named as the ITIN it is, not mislabelled "SSN".
 - ``email_address``           : an RFC-5321-shaped email address (a ``local@domain``
                                 with a dotted, registrable domain and a 2+ letter
                                 TLD) in free text -- a direct, high-precision PII
@@ -92,6 +99,26 @@ from ferryman.parsing import parse_statements
 # SSN: NNN-NN-NNNN, optionally with spaces. Word-bounded to avoid matching
 # inside longer digit runs.
 _SSN_RE = re.compile(r"\b\d{3}[-\s]\d{2}[-\s]\d{4}\b")
+
+# ITIN (US Individual Taxpayer Identification Number) candidate. An ITIN shares
+# the SSN nine-digit ``NNN-NN-NNNN`` presentation exactly, so this matcher is
+# deliberately identical to ``_SSN_RE``; the structural gate that distinguishes
+# an ITIN from an SSN lives in ``_itin_valid`` (area always begins with ``9``,
+# and the IRS-assigned middle-group ranges). The two detectors share the
+# ``ssn`` dedupe namespace so a matched run is classified exactly once.
+_ITIN_RE = re.compile(r"\b\d{3}[-\s]\d{2}[-\s]\d{4}\b")
+# IRS-assigned ITIN middle-group (4th-5th digit) ranges. An ITIN's area is
+# always 900-999, and the middle group is drawn only from these ranges; the
+# gaps (66-69, 89, 93) are reserved (89 and 93 for other IRS programs -- 93 is
+# the ATIN range) and never assigned to a live ITIN. Gating the middle group to
+# these ranges is the precision lever that keeps a coincidental 9XX-NN-NNNN
+# token from being reported as an ITIN.
+_ITIN_MIDDLE_RANGES = (
+    (50, 65),
+    (70, 88),
+    (90, 92),
+    (94, 99),
+)
 
 # Email address. A deliberately conservative, high-precision pattern -- the goal
 # is near-zero false positives, not RFC-5322 completeness. We require:
@@ -827,6 +854,44 @@ def _redact_email(email: str) -> str:
     return f"{masked}@{domain}"
 
 
+def _itin_valid(candidate: str) -> bool:
+    """Return ``True`` if a string is a structurally valid US ITIN.
+
+    An ITIN (Individual Taxpayer Identification Number) is the nine-digit tax
+    processing number the IRS issues to people who must file a US tax return but
+    are not eligible for an SSN -- a high-value piece of US tax PII, and the
+    direct counterpart to the SSN for the non-citizen / resident-alien
+    population a fintech serves. It shares the SSN ``NNN-NN-NNNN`` presentation,
+    so a plain SSN-shaped matcher cannot tell the two apart; the distinction is
+    purely structural and public (IRS Publication 4757):
+
+        1. **Area** -- the first three digits are always ``900``-``999``. An SSN
+           area never begins with ``9``, so a leading ``9`` is what cleanly
+           separates an ITIN from a real SSN with no overlap.
+        2. **Middle group** -- the 4th-5th digits fall only in the IRS-assigned
+           ranges ``50``-``65``, ``70``-``88``, ``90``-``92``, or ``94``-``99``.
+           The gaps (``66``-``69``, ``89``, ``93``) are reserved for other
+           programs (``93`` is the ATIN range) and never assigned to an ITIN.
+
+    A run that clears both gates is a near-certain real ITIN; an SSN (area not
+    ``9XX``) or a coincidental ``9XX-NN-NNNN`` token with an out-of-range middle
+    group fails one of them and is left to the SSN detector or dropped. Any
+    malformed input returns ``False`` so the helper is safe to reuse.
+    """
+    digits = re.sub(r"[-\s]", "", candidate.strip())
+    if len(digits) != 9 or not digits.isdigit():
+        return False
+    area = int(digits[:3])
+    if not (900 <= area <= 999):
+        return False
+    middle = int(digits[3:5])
+    return any(low <= middle <= high for low, high in _ITIN_MIDDLE_RANGES)
+
+
+def _redact_itin(text: str) -> str:
+    return _ITIN_RE.sub("9XX-XX-XXXX", text)
+
+
 def _redact_ssn(text: str) -> str:
     return _SSN_RE.sub("XXX-XX-XXXX", text)
 
@@ -866,6 +931,33 @@ def _scan_text(
     """Scan a single free-text field for leaked secrets."""
     if not text:
         return
+
+    # ITINs (US Individual Taxpayer Identification Number) -- check BEFORE the
+    # SSN detector. An ITIN shares the exact ``NNN-NN-NNNN`` presentation of an
+    # SSN, but it is a structurally distinct identifier (area always 900-999,
+    # IRS-assigned middle group). We claim a valid ITIN here and reserve its run
+    # under the ``ssn`` namespace so the SSN detector below never re-reports the
+    # same value as a generic "SSN-shaped" finding. A real SSN (area not 9XX)
+    # fails the ITIN gate and falls through to the SSN detector unchanged.
+    for m in _ITIN_RE.finditer(text):
+        if not _itin_valid(m.group(0)):
+            continue
+        key = ("ssn", m.group(0))
+        if key in seen:
+            continue
+        seen.add(key)
+        findings.append(
+            Finding(
+                check="pii",
+                type="itin",
+                severity="critical",
+                message="US Individual Taxpayer Identification Number (ITIN, "
+                "valid 9XX area and IRS-assigned middle group) leaking into a "
+                "free-text field -- direct US tax PII.",
+                location=location,
+                evidence=_redact_itin(m.group(0)),
+            )
+        )
 
     for m in _SSN_RE.finditer(text):
         key = ("ssn", m.group(0))
@@ -1311,6 +1403,29 @@ def _scan_secid(
     """
     if not secid:
         return
+
+    # ITINs -- checked before the SSN detector, sharing the ``ssn`` dedupe
+    # namespace, exactly as in the free-text scanner. A valid ITIN smuggled into
+    # a security id is reported as the ITIN it is; a real SSN falls through.
+    for m in _ITIN_RE.finditer(secid):
+        if not _itin_valid(m.group(0)):
+            continue
+        key = ("ssn", m.group(0))
+        if key in seen:
+            continue
+        seen.add(key)
+        findings.append(
+            Finding(
+                check="pii",
+                type="itin",
+                severity="critical",
+                message="US Individual Taxpayer Identification Number (ITIN, "
+                "valid 9XX area and IRS-assigned middle group) found in an "
+                "investment security id -- direct US tax PII.",
+                location=location,
+                evidence=_redact_itin(m.group(0)),
+            )
+        )
 
     for m in _SSN_RE.finditer(secid):
         key = ("ssn", m.group(0))
