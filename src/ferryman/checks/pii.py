@@ -147,6 +147,18 @@ Detection classes:
                                 18-character Mexican identifiers never collide; the
                                 value encodes a named individual, so it is reported
                                 as an identity disclosure, not an account leak.
+- ``kr_rrn``                  : a South Korean RRN (주민등록번호, Resident
+                                Registration Number) -- the 13-digit national
+                                identity number (a YYMMDD birth date + a
+                                century/sex marker + a registration serial + a
+                                mod-11 check digit) in its canonical YYMMDD-SNNNNNN
+                                6-7 grouped form -- whose structure, embedded birth
+                                date, and check digit all validate, a near-certain
+                                South Korean identity-PII leak. The hyphenated 6-7
+                                shape never collides with the digit scanners nor the
+                                other hyphenated detectors; the value encodes a
+                                named individual, so it is reported as an identity
+                                disclosure, not an account leak.
 - ``account_number``          : a long account-number-shaped digit run leaking
                                 into a transaction name/memo.
 - ``routing_number``          : a 9-digit run that passes the ABA weighted
@@ -655,6 +667,44 @@ _CURP_STATES = frozenset(
     "AS BC BS CC CL CM CS CH DF DG GT GR HG JC MC MN MS NT NL OC PL QT QR "
     "SP SL SR TC TS TL VZ YN ZS NE".split()
 )
+
+
+# South Korean RRN (주민등록번호 / Resident Registration Number) candidate -- the
+# 13-digit national identity number every South Korean resident is issued, written
+# in its canonical grouped presentation ``YYMMDD-SNNNNNN`` (a six-digit block, a
+# hyphen, then a seven-digit block). It is a direct, high-value piece of identity
+# PII: unlike a routing or account number, the RRN *encodes* the person -- the full
+# birth date and the sex/century are readable from the value itself -- so an RRN
+# echoed into a statement memo discloses a named individual's identity (and is the
+# single most sensitive personal identifier in Korea, used for everything from
+# banking to medical records). Its layout::
+#
+#     YYMMDD - S NNNNNN
+#     ^^^^^^             YYMMDD birth date (6 digits)
+#              ^         century + sex marker (1-4 citizens, 5-8 foreign
+#                        residents, 9-0 born in the 1800s)
+#                ^^^^^^  region-of-registration serial + a final mod-11 check digit
+#
+# The hyphenated 6-7 split is the defining presentation and the first precision
+# lever: it is distinct from any contiguous digit run (so it never competes with
+# the account-number ``\d{8,}``, routing ``\d{9}``, or card scanners), and distinct
+# from every other hyphenated detector -- the SSN's 3-2-4, the UK sort code's
+# 2-2-2, the Canadian routing number's 5-3, the Australian BSB's 3-3, the South
+# Korean Giro's 5-2, and the Thai national ID's 1-4-5-2-1 -- so none of the
+# hyphenated detectors ever collide. The run is bounded by a non-digit/non-hyphen
+# lookaround so an RRN embedded in a longer digit-and-hyphen blob is not partially
+# matched. Unlike the routing codes an RRN carries a public, self-contained mod-11
+# weighted check digit, so precision comes from a real arithmetic checksum plus an
+# embedded birth date and a valid century/sex marker -- on a par with the CURP /
+# CPF / national-ID-gated identifiers. The caller validates all three before
+# reporting.
+_KR_RRN_RE = re.compile(r"(?<![\d-])\d{6}-\d{7}(?![\d-])")
+# A South Korean RRN is exactly 13 digits.
+_KR_RRN_LEN = 13
+# Mod-11 check-digit weights, applied positionally to the first twelve digits of
+# the thirteen-digit number. The trailing thirteenth digit is the check digit
+# being verified.
+_KR_RRN_WEIGHTS = (2, 3, 4, 5, 6, 7, 8, 9, 2, 3, 4, 5)
 
 
 def _curp_check_digit(first17: str) -> int:
@@ -1513,6 +1563,80 @@ def _redact_curp(curp: str) -> str:
     return curp[:4] + "X" * (len(curp) - 4)
 
 
+def _kr_rrn_valid(candidate: str) -> bool:
+    """Return ``True`` if a string is a structurally valid South Korean RRN.
+
+    A South Korean RRN (주민등록번호, Resident Registration Number) is the
+    13-digit national identity number every Korean resident is issued -- the most
+    sensitive personal identifier in Korea, used for banking, medical, tax, and
+    employment records, so an RRN echoed into a statement memo discloses a named
+    individual's identity, not merely an account. Its canonical card presentation
+    is the grouped ``YYMMDD-SNNNNNN`` (6-7 split). Unlike the routing codes it
+    carries a public, self-contained mod-11 weighted check digit, so precision
+    comes from three public, dependency-free gates:
+
+        1. **Shape** -- exactly ``YYMMDD-SNNNNNN``: six decimal digits, a hyphen,
+           and seven decimal digits.
+        2. **Birth date + century/sex marker** -- the first six digits must form a
+           real ``MM`` (01-12) and ``DD`` (01-31) pair, and the seventh digit (the
+           first after the hyphen) -- the century + sex marker -- must be ``1``-``9``
+           or ``0`` per the issued ranges (1-2 citizens born 1900s, 3-4 citizens
+           born 2000s, 5-6 foreign residents born 1900s, 7-8 foreign residents born
+           2000s, 9-0 born in the 1800s). A token with an impossible month/day is
+           never a live RRN.
+        3. **Check digit** -- multiply each of the first twelve digits by the
+           repeating positional weights ``(2,3,4,5,6,7,8,9,2,3,4,5)``, sum the
+           products, and the thirteenth (final) digit must equal
+           ``(11 - (sum mod 11)) mod 10``.
+
+    The hyphenated 6-7 shape is itself a precision lever: it is distinct from every
+    other hyphenated detector -- the SSN's 3-2-4, the UK sort code's 2-2-2, the
+    Canadian routing number's 5-3, the Australian BSB's 3-3, the South Korean
+    Giro's 5-2, and the Thai national ID's 1-4-5-2-1 -- so the detectors never
+    collide. A run that clears all three gates is a near-certain real RRN; a
+    coincidental ``YYMMDD-SNNNNNN`` token fails the date or the check digit with
+    overwhelming probability. Any malformed input returns ``False`` so the helper
+    is safe to reuse.
+    """
+    code = candidate.strip()
+    parts = code.split("-")
+    if len(parts) != 2:
+        return False
+    head, tail = parts
+    if not (len(head) == 6 and head.isdigit()):
+        return False
+    if not (len(tail) == 7 and tail.isdigit()):
+        return False
+    digits = head + tail
+    # Birth date: a real MM (01-12) and DD (01-31). The two-digit year is
+    # ambiguous across centuries (the seventh digit disambiguates), so we do not
+    # gate on it -- but an impossible month or day is never a live RRN.
+    month = int(digits[2:4])
+    day = int(digits[4:6])
+    if not (1 <= month <= 12 and 1 <= day <= 31):
+        return False
+    # Century/sex marker: every digit 0-9 is an issued marker value (1-2 / 3-4 /
+    # 5-6 / 7-8 citizens & foreign residents by century, 9-0 born 1800s), so the
+    # check is structural -- the digit class is already guaranteed by the regex.
+    total = sum(w * int(d) for w, d in zip(_KR_RRN_WEIGHTS, digits[:12]))
+    check = (11 - (total % 11)) % 10
+    return check == int(digits[12])
+
+
+def _redact_kr_rrn(code: str) -> str:
+    """Redact a South Korean RRN, preserving only the century/sex marker.
+
+    The seventh digit (the century + sex marker) survives so a reporter can tell
+    the broad demographic apart, while the birth date, the registration serial,
+    and the check digit -- the part that pins the leak to a specific identified
+    person -- are masked. The hyphen grouping is preserved so the masked shape
+    still reads as an RRN::
+
+        900101-1234567 -> XXXXXX-1XXXXXX
+    """
+    return "XXXXXX-" + code[7] + "XXXXXX"
+
+
 def _redact_sedol(sedol: str) -> str:
     """Redact a SEDOL, preserving only the leading character for triage.
 
@@ -2181,6 +2305,53 @@ def _scan_text(
                 "payment.",
                 location=location,
                 evidence=_redact_kr_giro(candidate),
+            )
+        )
+
+    # South Korean RRNs (YYMMDD-SNNNNNN, the canonical 6-7 grouped form) -- the
+    # South Korean Resident Registration Number, the single most sensitive personal
+    # identifier in Korea. Like the UK sort code / Canadian routing number / Korean
+    # Giro its hyphenated shape is distinct from any contiguous digit run, so this
+    # scan neither competes with nor is double-counted against the card / account /
+    # routing scanners below (those match contiguous digits; the hyphen breaks the
+    # token into a six- and a seven-digit piece, neither of which the 8+/9/13+
+    # scanners match). Its 6-7 split is also distinct from the SSN's 3-2-4, the UK
+    # sort code's 2-2-2, the Canadian routing number's 5-3, the Australian BSB's
+    # 3-3, the South Korean Giro's 5-2, and the Thai national ID's 1-4-5-2-1, so the
+    # hyphenated detectors never collide. We gate on the YYMMDD-SNNNNNN shape, a
+    # real embedded birth date, AND the public mod-11 weighted check digit, so a
+    # coincidental token is vanishingly unlikely to be reported. An RRN echoed into
+    # free text discloses a named individual's identity -- a direct, high-value
+    # South Korean identity-PII leak, reported as an identity disclosure (not an
+    # account leak) exactly as the CURP / CPF / national-ID detectors are.
+    for m in _KR_RRN_RE.finditer(text):
+        candidate = m.group(0)
+        if not _kr_rrn_valid(candidate):
+            continue
+        key = ("kr_rrn", candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        # Reserve the compact 13-digit run under the card / account / routing
+        # namespaces so the scanners below never re-report a slice of the same RRN
+        # (the hyphen already breaks the token, but the reservation keeps the
+        # no-double-counting guarantee explicit, exactly as the Thai national ID
+        # and CURP scans do).
+        compact = candidate.replace("-", "")
+        seen.add(("credit_card", compact))
+        seen.add(("account_number", compact))
+        seen.add(("routing_number", compact))
+        findings.append(
+            Finding(
+                check="pii",
+                type="kr_rrn",
+                severity="high",
+                message="South Korean RRN (Resident Registration Number; valid "
+                "YYMMDD-SNNNNNN structure, birth date, and mod-11 check digit) "
+                "leaking into a free-text field -- discloses a named individual's "
+                "identity.",
+                location=location,
+                evidence=_redact_kr_rrn(candidate),
             )
         )
 
