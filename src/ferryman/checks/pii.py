@@ -159,6 +159,21 @@ Detection classes:
                                 other hyphenated detectors; the value encodes a
                                 named individual, so it is reported as an identity
                                 disclosure, not an account leak.
+- ``tr_tckn``                 : a Turkish T.C. Kimlik Numarasi (TCKN) -- the
+                                11-digit national identification number every
+                                Turkish citizen carries -- whose non-zero leading
+                                digit and dual public check digits (d10 derived
+                                from the weighted odd/even split of d1..d9, d11
+                                the mod-10 sum of d1..d10) both validate, a
+                                near-certain Turkish identity-PII leak. Like the
+                                CLABE the TCKN is a contiguous digit run, so it
+                                is checked before the generic account-number
+                                scanner and the matched run is reserved under
+                                the numeric namespaces so it is never also
+                                reported as a plain account number; the dual
+                                check digit gives a ~1/100 random-token pass
+                                rate, the same precision lever the CPF's dual
+                                mod-11 gives.
 - ``account_number``          : a long account-number-shaped digit run leaking
                                 into a transaction name/memo.
 - ``routing_number``          : a 9-digit run that passes the ABA weighted
@@ -705,6 +720,18 @@ _KR_RRN_LEN = 13
 # the thirteen-digit number. The trailing thirteenth digit is the check digit
 # being verified.
 _KR_RRN_WEIGHTS = (2, 3, 4, 5, 6, 7, 8, 9, 2, 3, 4, 5)
+
+# Turkish national ID (T.C. Kimlik No / TCKN): exactly 11 contiguous decimal
+# digits. The canonical printed form is the contiguous run with no separator, so
+# this regex keys off the 11-digit token bounded by non-digits. Like the CLABE
+# (also a contiguous digit run) this detector must run before the generic
+# account-number scanner (\d{8,}) and reserve the run under the numeric dedupe
+# namespaces so the same leak is never re-classified as a plain account number.
+# The card scanner's 13-digit floor sits above this 11-digit window, so the two
+# never overlap, and the routing scanner's exact-9-digit window is below it.
+_TR_TCKN_RE = re.compile(r"(?<!\d)\d{11}(?!\d)")
+# A Turkish TCKN is exactly 11 digits.
+_TR_TCKN_LEN = 11
 
 
 def _curp_check_digit(first17: str) -> int:
@@ -1637,6 +1664,69 @@ def _redact_kr_rrn(code: str) -> str:
     return "XXXXXX-" + code[7] + "XXXXXX"
 
 
+def _tr_tckn_valid(candidate: str) -> bool:
+    """Return ``True`` if a string is a structurally valid Turkish TCKN.
+
+    A Turkish T.C. Kimlik Numarasi (TCKN) is the 11-digit national-identification
+    number every Turkish citizen carries -- the master personal identifier
+    keying banking, tax, healthcare, and government services -- so a TCKN echoed
+    into a statement memo discloses a named individual's identity, on a par with
+    a US SSN, a Brazilian CPF, a Mexican CURP, or a South Korean RRN. Unlike
+    those identifiers a TCKN has no separator in its canonical printed form: it
+    is a contiguous 11-digit run. Precision comes from three public,
+    dependency-free gates:
+
+        1. **Shape** -- exactly 11 decimal digits.
+        2. **Non-zero leading digit** -- ``d1`` must be 1-9. A TCKN never begins
+           with ``0``, so an all-zeros or zero-prefixed run is never a live
+           national ID -- a structural lever that rejects a coincidental token.
+        3. **Dual check digits** -- the public TCKN algorithm derives both the
+           tenth and the eleventh digits from the first nine:
+             * ``d10 = ((d1+d3+d5+d7+d9)*7 - (d2+d4+d6+d8)) mod 10``
+             * ``d11 = (d1+d2+...+d10) mod 10``
+           Both must match. This is two independent constraints on top of the
+           first-digit rule, so the probability of a random 11-digit run passing
+           is ~1/100 -- the same precision lever the CPF's dual mod-11 gives,
+           strong enough that a coincidental token is vanishingly unlikely to
+           be reported.
+
+    Because the canonical form is contiguous the detector cannot rely on a
+    distinctive structural shape (the way the hyphenated UK sort code / CA
+    routing / TH national ID detectors do). The CLABE solves the same problem
+    by running before the generic account-number scanner and reserving the run
+    -- the TCKN detector follows that pattern. Any malformed input returns
+    ``False`` so the helper is safe to reuse.
+    """
+    tckn = candidate.strip()
+    if len(tckn) != _TR_TCKN_LEN or not tckn.isdigit():
+        return False
+    # Structural lever: the leading digit must be 1-9. A TCKN never begins with
+    # ``0``, so an all-zeros or zero-prefixed run is never a live national ID.
+    if tckn[0] == "0":
+        return False
+    digits = [int(c) for c in tckn]
+    odd_sum = digits[0] + digits[2] + digits[4] + digits[6] + digits[8]
+    even_sum = digits[1] + digits[3] + digits[5] + digits[7]
+    d10 = (odd_sum * 7 - even_sum) % 10
+    if d10 != digits[9]:
+        return False
+    d11 = sum(digits[:10]) % 10
+    return d11 == digits[10]
+
+
+def _redact_tr_tckn(code: str) -> str:
+    """Redact a Turkish TCKN, preserving only the leading digit for triage.
+
+    The first digit (1-9) survives so a report retains a coarse triage hint
+    while the body of the number and the two check digits -- the part that pins
+    the leak to a specific identified person -- are masked. The 11-digit shape
+    is preserved so the masked form still reads as a TCKN::
+
+        12345678950 -> 1XXXXXXXXXX
+    """
+    return code[0] + "X" * (len(code) - 1)
+
+
 def _redact_sedol(sedol: str) -> str:
     """Redact a SEDOL, preserving only the leading character for triage.
 
@@ -2434,6 +2524,51 @@ def _scan_text(
                 "payer routes a transfer against.",
                 location=location,
                 evidence=_redact_br_cpf(candidate),
+            )
+        )
+
+    # Turkish national IDs (TCKN: 11 contiguous digits) -- the master Turkish
+    # personal identifier and a direct, high-value identity-PII leak class on a
+    # par with the SSN, CPF, CURP, and KR_RRN detectors. Unlike those identifiers
+    # a TCKN has no separator in its canonical printed form: it is a contiguous
+    # 11-digit run, so -- exactly like the CLABE -- it would otherwise be claimed
+    # by the generic account-number (8+ digit) scanner below. We check it BEFORE
+    # the card / account / routing scanners, gate on the non-zero leading digit
+    # AND the public dual-check-digit algorithm (d10 derived from the weighted
+    # odd / even split of d1..d9, d11 the mod-10 sum of d1..d10), and reserve the
+    # run under every numeric namespace so the same leak is never re-reported as
+    # an account number. The card scanner's 13-digit floor sits above the 11-
+    # digit TCKN window, so the two never overlap. The dual gate gives a
+    # ~1/100 random-token pass rate -- the same precision lever the CPF's dual
+    # mod-11 gives -- so a coincidental 11-digit run is vanishingly unlikely to
+    # be reported. A TCKN echoed into free text discloses a named individual --
+    # a reportable Turkish PII disclosure.
+    for m in _TR_TCKN_RE.finditer(text):
+        digits = m.group(0)
+        if not _tr_tckn_valid(digits):
+            continue
+        key = ("tr_tckn", digits)
+        if key in seen:
+            continue
+        seen.add(key)
+        # Reserve the 11-digit run under the account / routing / card namespaces
+        # so the scanners below never re-report a slice of the same TCKN as a
+        # plain account number (the card scanner's 13-digit floor already
+        # excludes this length, but the reservation keeps the no-double-counting
+        # guarantee explicit, exactly as the CLABE scan does).
+        seen.add(("account_number", digits))
+        seen.add(("credit_card", digits))
+        seen.add(("routing_number", digits))
+        findings.append(
+            Finding(
+                check="pii",
+                type="tr_tckn",
+                severity="high",
+                message="Turkish national ID / TCKN (valid 11-digit structure, "
+                "non-zero leading digit, and dual check digits) leaking into a "
+                "free-text field -- discloses a named individual's identity.",
+                location=location,
+                evidence=_redact_tr_tckn(digits),
             )
         )
 

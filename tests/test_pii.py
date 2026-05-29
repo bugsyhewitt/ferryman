@@ -28,6 +28,7 @@ from ferryman.checks.pii import (
     _redact_email,
     _sedol_valid,
     _th_natid_valid,
+    _tr_tckn_valid,
     _uk_sort_code_valid,
     check_pii,
 )
@@ -2715,3 +2716,154 @@ def test_kr_rrn_leak_fixture(kr_rrn_file):
 def test_clean_file_no_kr_rrn(clean_file):
     findings = check_pii(clean_file.read_bytes())
     assert "kr_rrn" not in {f.type for f in findings}
+
+
+# --- Turkish TCKN (T.C. Kimlik Numarasi, national identification number) ----
+
+# Each VALID_TR_TCKN value is a structurally complete 11-digit TCKN whose
+# leading digit is 1-9 and whose two check digits both verify (these are
+# synthetic, fictitious numbers constructed only to pass the public dual
+# checksum, not real TCKNs of identified people). INVALID_TR_TCKN collects
+# near-miss tokens that must fail the validator.
+VALID_TR_TCKN = [
+    "12345678950",  # d1..d9 = 1..9; A=25,B=20 -> d10=5; sum=50 -> d11=0
+    "98765432150",  # d1..d9 = 9..1; A=25,B=20 -> d10=5; sum=50 -> d11=0
+    "10000000078",  # d1=1, rest 0; A=1,B=0 -> d10=7; sum=8 -> d11=8
+    "29722072102",  # mixed; A=19,B=13 -> d10=0; sum=32 -> d11=2
+]
+
+INVALID_TR_TCKN = [
+    "12345678951",  # wrong d11 (expected 0, given 1)
+    "12345678940",  # wrong d10 (expected 5, given 4)
+    "00000000000",  # leading zero -- never a live TCKN
+    "01234567899",  # leading zero -- never a live TCKN
+    "11111111111",  # repeated digit -- fails the d10 check
+    "12345678900",  # wrong both check digits
+]
+
+
+@pytest.mark.parametrize("code", VALID_TR_TCKN)
+def test_tr_tckn_accepts_real_structure(code):
+    assert _tr_tckn_valid(code) is True
+
+
+@pytest.mark.parametrize("code", INVALID_TR_TCKN)
+def test_tr_tckn_rejects_invalid(code):
+    assert _tr_tckn_valid(code) is False
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "",
+        "  ",
+        "1234567895",       # 10 digits -- too short
+        "123456789500",     # 12 digits -- too long
+        "1234567895a",      # non-digit character
+        "12345-67-8950",    # hyphenated -- not the canonical contiguous form
+        "abcdefghijk",      # all letters
+    ],
+)
+def test_tr_tckn_rejects_garbage(bad):
+    # Defensive: empty / wrong-length / non-numeric input is never a valid TCKN.
+    assert _tr_tckn_valid(bad) is False
+
+
+def test_tr_tckn_in_memo_detected():
+    findings = _scan("Verified holder TCKN 12345678950 on file")
+    codes = [f for f in findings if f.type == "tr_tckn"]
+    assert len(codes) == 1
+    assert codes[0].severity == "high"
+    assert codes[0].check == "pii"
+    # Only the leading digit survives for triage; the rest is masked.
+    assert codes[0].evidence == "1XXXXXXXXXX"
+
+
+def test_tr_tckn_redaction_masks_identity():
+    findings = _scan("Co-signer 98765432150 logged")
+    codes = [f for f in findings if f.type == "tr_tckn"]
+    assert len(codes) == 1
+    assert codes[0].evidence == "9XXXXXXXXXX"
+    # The body of the TCKN and both check digits never leave the tool.
+    assert "98765432150" not in codes[0].evidence
+    assert "8765432150" not in codes[0].evidence
+
+
+def test_tr_tckn_wrong_check_digit_not_reported_as_tckn():
+    # An 11-digit token with a wrong check digit fails the gate and is NOT a
+    # TCKN finding; the contiguous run still falls through to the
+    # account-number scanner, which is the correct downgraded classification.
+    findings = _scan("decoy reference 12345678951 ignored")
+    types = {f.type for f in findings}
+    assert "tr_tckn" not in types
+    assert "account_number" in types
+
+
+def test_tr_tckn_leading_zero_not_reported():
+    # A leading zero is never a live TCKN; the validator rejects it and the run
+    # falls through to the account-number scanner.
+    findings = _scan("decoy reference 01234567899 ignored")
+    assert "tr_tckn" not in {f.type for f in findings}
+
+
+def test_tr_tckn_does_not_collide_with_digit_scanners():
+    # Like the CLABE, the 11-digit TCKN run would otherwise be claimed by the
+    # account-number scanner. The reservation guarantees it is reported once,
+    # as a TCKN, and never also as an account number or a card or a routing
+    # number. (The card scanner's 13-digit floor sits above the 11-digit TCKN
+    # window, so no card collision is possible to begin with.)
+    findings = _scan("paid holder 12345678950 today")
+    types = [f.type for f in findings]
+    assert types.count("tr_tckn") == 1
+    assert "account_number" not in types
+    assert "credit_card" not in types
+    assert "routing_number" not in types
+
+
+def test_tr_tckn_does_not_collide_with_hyphenated_detectors():
+    # The TCKN is a contiguous 11-digit run; the hyphenated detectors all key
+    # off a hyphenated presentation, so neither side mis-classifies the other.
+    assert "tr_tckn" not in {f.type for f in _scan("ssn 123-45-6789 here")}
+    assert "tr_tckn" not in {f.type for f in _scan("rrn 900101-1123459 here")}
+    assert "tr_tckn" not in {f.type for f in _scan("cpf 111.444.777-35 here")}
+
+
+def test_tr_tckn_does_not_break_other_identifiers():
+    # The TCKN scan must not interfere with other identifiers on their own.
+    card_findings = _scan("card 4111111111111111 today")
+    assert [f.type for f in card_findings] == ["credit_card"]
+    routing_findings = _scan("routing 121000248 today")
+    assert any(f.type == "routing_number" for f in routing_findings)
+
+
+def test_same_tr_tckn_deduped_per_field():
+    findings = _scan(
+        "tckn 12345678950 and again 12345678950 in one memo"
+    )
+    codes = [f for f in findings if f.type == "tr_tckn"]
+    assert len(codes) == 1
+
+
+def test_tr_tckn_leak_fixture(tr_tckn_file):
+    findings = check_pii(tr_tckn_file.read_bytes())
+    codes = [f for f in findings if f.type == "tr_tckn"]
+    types = {f.type for f in findings}
+    assert "tr_tckn" in types, f"expected tr_tckn, got: {types}"
+    # The fixture leaks two valid TCKNs in memos; the wrong-check-digit decoy
+    # (12345678951) must NOT be reported as a TCKN. The decoy still falls
+    # through to the generic account-number scanner -- that is correct and the
+    # promised downgrade behaviour.
+    assert len(codes) == 2
+    assert all(c.severity == "high" for c in codes)
+    for c in codes:
+        assert c.evidence.endswith("XXXXXXXXXX")
+        assert c.type == "tr_tckn"
+    # The reservation guarantees the two valid TCKNs are never also reported
+    # as account numbers.
+    leading_digits = {c.evidence[0] for c in codes}
+    assert leading_digits == {"1", "9"}
+
+
+def test_clean_file_no_tr_tckn(clean_file):
+    findings = check_pii(clean_file.read_bytes())
+    assert "tr_tckn" not in {f.type for f in findings}

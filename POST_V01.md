@@ -1340,6 +1340,77 @@ Korean PII disclosure. Public, dependency-free, ~30 lines of Python.
 
 ---
 
+## Rank 28 — Turkish T.C. Kimlik (TCKN) Leak Detection, 11-digit structure + non-zero leading + dual check-digit gated (HIGH signal, low effort) — ✅ IMPLEMENTED (2026-05-29, Phase 2 Rotation 30)
+
+**Pivot note:** Ranks 1–27 were all shipped. The R28 rotation brief named the
+**Turkish TCKN** and the **Argentine DNI** as the two candidates. A fresh read
+of `checks/pii.py` confirmed neither was present. Both are direct identity PII,
+but the choice came down to ferryman's dominant precision criterion —
+**checksum distinctiveness**:
+
+- **Argentine DNI was rejected on the precision bar.** A DNI is a 7–8-digit
+  number with **no self-contained checksum** — it can only be validated against
+  RENAPER, an external registry. Its only gates would be a length window and a
+  contiguous digit run, which collides head-on with the generic account-number
+  scanner (`\d{8,}`) and gives ferryman no arithmetic precision lever at all —
+  the same low-distinctiveness problem that got the Japanese Zengin code, the
+  bare South African branch code, the Indonesian NIK, the Russian INN, and the
+  Polish PESEL rejected in earlier rotations.
+- **Turkish TCKN was chosen.** It carries TWO public, self-contained check
+  digits derived from the first nine by a documented odd/even weighted split
+  algorithm — two independent constraints on top of a non-zero-leading-digit
+  rule, so the probability of a random 11-digit run passing is ~1/100, the
+  same precision lever the Brazilian CPF's dual mod-11 gives. The CPF cleared
+  the precision bar on a *dotted-and-dashed* presentation; the TCKN is
+  contiguous, but the CLABE has already shown the contiguous-run pattern works
+  if the detector runs before the generic account-number scanner and reserves
+  the matched run. The TCKN is the strongest *identity*-PII item available in
+  this rotation — the master Turkish personal identifier keying banking, tax,
+  healthcare, and government services — and it clears the precision bar on
+  shape + structural-zero rejection + dual checksum, strictly stronger than the
+  checksum-less DNI.
+
+**Status:** Shipped. `checks/pii.py` gained `_tr_tckn_valid()` (gates on the
+exact 11-digit shape; a non-zero leading digit — `d1` is always 1–9, never
+`0`; and the dual public check digits:
+`d10 = ((d1+d3+d5+d7+d9)*7 - (d2+d4+d6+d8)) mod 10` and
+`d11 = (d1+d2+...+d10) mod 10`, both of which must match) and
+`_redact_tr_tckn()` (evidence redacted to the leading digit, `1XXXXXXXXXX`).
+A new `tr_tckn` (high) finding runs in `_scan_text` **before** the credit-card
+scanner — like the CLABE the TCKN is a contiguous digit run, so the
+account-number (8+) scanner below would otherwise claim it — and reserves the
+11-digit run under the `credit_card` / `account_number` / `routing_number`
+dedupe namespaces so the same leak is never re-reported. The card scanner's
+13-digit floor sits above the 11-digit TCKN window, so the two never overlap.
+An 11-digit token that fails the dual-checksum gate is not a TCKN but still
+falls through to the `account_number` finding, so no leak is silently dropped.
+New fixture `tests/fixtures/tr-tckn-leak.ofx` (two valid TCKNs in two memos +
+one wrong-check-digit `12345678951` decoy) plus 27 new test cases cover the
+validator (synthetic checksum-valid TCKNs, wrong-d10 / wrong-d11 /
+leading-zero / all-zeros / all-ones / contiguous-but-bad rejects, wrong-length
+/ non-numeric / hyphenated garbage guards), free-text detection, redaction,
+the wrong-check-digit and leading-zero non-detection guards, the
+no-collision-with-digit-scanners guarantee, the
+no-collision-with-hyphenated-detectors guarantee, the
+no-interference-with-other-identifiers guard, per-field dedupe, the fixture,
+and the clean-file guard. README gained a Turkish TCKN section and the type
+lists were updated. The SARIF mapping auto-generates the `pii/tr_tckn` rule
+with no changes. No new dependencies (stdlib `re` only). Full suite: 667 → 694
+passing.
+
+**Research grounding:** Turkish T.C. Kimlik Numarasi (TCKN), administered by
+the Nüfus ve Vatandaşlık İşleri Genel Müdürlüğü — an 11-digit national
+identification number where the first digit is non-zero (1–9), the tenth is a
+weighted check digit derived from the odd/even split of the first nine, and
+the eleventh is a mod-10 sum of the first ten. The algorithm is publicly
+documented and dependency-free, ~10 lines of Python. The TCKN is the master
+personal identifier in Turkey, keying banking, tax, healthcare, and government
+services, so a free-text TCKN echo is a reportable Turkish PII disclosure.
+
+**Estimated tokens:** 30–50K
+
+---
+
 ## Research notes
 
 **Sources consulted:**

@@ -18,7 +18,8 @@ scanner that treats an OFX file as an attack surface and asks three questions:
   codes, Canadian routing numbers, Australian BSB codes, Indian IFSC codes,
   Mexican CLABE numbers, South Korean Giro numbers, Thai national IDs
   (PromptPay proxy ids), Brazilian CPFs (Pix keys), Mexican CURPs (population
-  identity keys), South Korean RRNs (resident-registration identity numbers), full
+  identity keys), South Korean RRNs (resident-registration identity numbers),
+  Turkish TCKNs (national identification numbers), full
   account numbers, and routing numbers smuggled into free-text transaction names
   and memos.
 - **Is this file anomalous?** Out-of-range posting dates, zero / sign-flipped /
@@ -63,7 +64,7 @@ ferryman [--check {malformed,pii,anomaly,all}] [--format {json,text,h1md,sarif}]
     ITIN, payment-card number, IBAN, ISIN, CUSIP, SEDOL, LEI, BIC/SWIFT, UK sort
     code, Canadian routing number, Australian BSB code, Indian IFSC code, Mexican
     CLABE, South Korean Giro number, Thai national ID, Brazilian CPF, Mexican
-    CURP, South Korean RRN, account
+    CURP, South Korean RRN, Turkish TCKN, account
     number, routing number), including investment memos and security ids.
     Evidence is always redacted before it leaves the tool.
   - `anomaly` &mdash; structurally valid but suspicious transactions
@@ -1060,6 +1061,51 @@ $ ferryman --check pii --format text leak.ofx
 
 **Remediation:** never echo a customer's RRN into a statement memo or transaction
 name; keep resident-registration identity numbers in structured,
+access-controlled fields rather than free text.
+
+### Turkish national ID (T.C. Kimlik Numarasi / TCKN) leak detection
+
+A [Turkish T.C. Kimlik Numarasi](https://en.wikipedia.org/wiki/Turkish_Identification_Number)
+(TCKN) is the 11-digit national identification number every Turkish citizen is
+issued &mdash; the master personal identifier keying banking, tax, healthcare,
+and government services. Like the South Korean RRN, the Mexican CURP, and the
+Brazilian CPF it is **identity** PII: a TCKN echoed into free text discloses a
+named individual, not merely an account. Unlike those identifiers a TCKN has
+**no separator** in its canonical printed form: it is a contiguous 11-digit run
+&mdash; the same shape as the Mexican CLABE (18 digits) but eleven digits long.
+A TCKN echoed into a free-text **memo or transaction name** is a direct Turkish
+identity-PII leak. The **pii** check flags a `tr_tckn` finding (severity `high`)
+when a free-text token clears three public, dependency-free gates:
+
+1. **shape** &mdash; exactly 11 decimal digits.
+2. **non-zero leading digit** &mdash; the first digit must be 1&ndash;9. A TCKN
+   never begins with `0`, so an all-zeros or zero-prefixed run is never a live
+   national ID &mdash; the structural lever that rejects a coincidental token.
+3. **dual check digits** &mdash; the public TCKN algorithm derives both the
+   tenth and the eleventh digits from the first nine:
+   * `d10 = ((d1+d3+d5+d7+d9)*7 - (d2+d4+d6+d8)) mod 10`
+   * `d11 = (d1+d2+...+d10) mod 10`
+
+   Both must match. This is two independent constraints on top of the
+   first-digit rule, so the probability of a random 11-digit run passing is
+   ~1/100 &mdash; the same precision lever the CPF's dual mod-11 gives.
+
+Because the canonical TCKN form is contiguous the detector cannot key off a
+distinctive structural shape the way the hyphenated UK sort code / Canadian
+routing / Thai national ID detectors do. The CLABE solves the same problem by
+running before the generic account-number scanner and reserving the run &mdash;
+the TCKN detector follows that pattern. The card scanner's 13-digit floor sits
+above the 11-digit TCKN window, so the two never overlap. Evidence is redacted
+to the leading digit (`1XXXXXXXXXX`); the body of the number and both check
+digits never leave the tool.
+
+```bash
+$ ferryman --check pii --format text leak.ofx
+  [HIGH] pii/tr_tckn @ statement[0].transaction[0].memo: Turkish national ID / TCKN (valid 11-digit structure, non-zero leading digit, and dual check digits) leaking into a free-text field -- discloses a named individual's identity.
+```
+
+**Remediation:** never echo a customer's TCKN into a statement memo or
+transaction name; keep national identification numbers in structured,
 access-controlled fields rather than free text.
 
 ## From finding to HackerOne report
