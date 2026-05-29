@@ -515,6 +515,65 @@ the bare-CUSIP free-text echo the natural, in-scope next detector.
 
 ---
 
+## Rank 14 — SEDOL Leak Detection, weighted modulus-10 check-digit gated (HIGH signal, low effort) — ✅ IMPLEMENTED (2026-05-28, Phase 2 Rotation 15)
+
+**Status:** Shipped. `checks/pii.py` gained a `_sedol_valid()` helper that gates a
+SEDOL candidate behind two independent public checks: the 7-character shape
+(6-character base of digits / consonants — the vowels `A E I O U` are never used
+in a SEDOL base — plus one trailing decimal check digit) and the public SEDOL
+weighted modulus-10 check digit (map each base character to its value, digit
+as-itself / `B`=11…`Z`=35 via the same `ord-55` letter expansion the ISIN and
+CUSIP gates use; multiply by the positional weights `(1, 3, 1, 7, 3, 9)`; the
+check digit is `(10 - (weighted sum mod 10)) mod 10`). A `_SEDOL_RE` matcher finds
+7-char candidates in free text **but requires at least one consonant in the
+base** (the vowel-excluding character class plus a letter-forcing pattern), so a
+purely numeric 7-digit run — a common coincidental value — is never reclassified
+as a SEDOL. In `_scan_text`, SEDOL detection runs **after** the longer 12-char
+ISIN and 9-char CUSIP (a UK/Ireland ISIN embeds a SEDOL as its NSIN, so the
+longer match wins) and **before** the credit-card / routing / account scanners,
+and every digit run inside a detected SEDOL is reserved under the
+`account_number`/`credit_card`/`routing_number` dedupe namespaces so the same
+identifier is never double-counted. Findings are `high` severity; evidence is
+redacted to the leading character via `_redact_sedol()` so the base and check
+digit never leave the tool. Crucially, a SEDOL sitting in its own structured
+`SECID` field is **not** flagged (the narrow `_scan_secid` path is unchanged) —
+only a SEDOL bleeding into a free-text memo/name, which discloses a customer's
+securities holdings, is reported. New fixture `tests/fixtures/sedol-leak.ofx`
+(two valid SEDOLs in two memos plus a wrong-check-digit decoy, with the same
+SEDOLs sitting legitimately in their `SECID` fields) plus 25 new tests in
+`tests/test_pii.py` cover the validator (published registry SEDOLs incl.
+all-numeric helper-level acceptance, wrong-check-digit / vowel-in-base /
+wrong-length / non-numeric-check-digit / garbage rejects, lowercase acceptance),
+memo detection and redaction, the numeric-run guard, per-field dedupe, the
+no-double-count guarantee, the no-interference-with-CUSIP/ISIN guard, the
+invalid-SEDOL no-report case, the fixture, and the clean-file no-SEDOL guarantee.
+README gained a "SEDOL leak detection" section and the PII type list was updated.
+No new dependencies (stdlib `re` only).
+
+**What:** The pii check covered SSN, payment card (PAN), IBAN, ISIN, CUSIP, US
+account number, and US ABA routing number, but not the **SEDOL** — the
+seven-character UK/Ireland securities identifier and a brokerage-account PII leak
+class. The SEDOL is the NSIN at the core of a UK/Ireland ISIN; many OFX
+investment statements from UK brokers use a SEDOL rather than a CUSIP in their
+`SECID`. Like the ABA (Rank 1), Luhn (Rank 10), IBAN (Rank 11), ISIN (Rank 12),
+and CUSIP (Rank 13) gates, the SEDOL carries a public check digit (weighted
+modulus-10), so gating on shape + no-vowel rule + check digit yields a
+high-precision, zero-dependency detector. A SEDOL echoed into a transaction memo
+reveals which securities a customer holds — reportable on its own in fintech
+bug-bounty programs.
+
+**Research grounding:** The SEDOL check-digit algorithm (London Stock Exchange,
+ISO 6166 NSIN for UK & Ireland) is public and documented, ~15 lines of Python
+with no new dependency. It completes the three major NSIN families ferryman now
+detects: CUSIP (US/Canada), SEDOL (UK/Ireland), and ISIN (international, which
+wraps the local NSIN). The project already parses INVSTMTRS investment statements
+(Rank 4) and detects ISIN/CUSIP free-text leaks (Ranks 12–13), making the
+free-text SEDOL echo the natural, in-scope next detector.
+
+**Estimated tokens:** 35–50K
+
+---
+
 ## Research notes
 
 **Sources consulted:**

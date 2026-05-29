@@ -14,6 +14,7 @@ from ferryman.checks.pii import (
     _iban_valid,
     _isin_valid,
     _luhn_valid,
+    _sedol_valid,
     check_pii,
 )
 
@@ -596,3 +597,133 @@ def test_cusip_leak_fixture(cusip_file):
 def test_clean_file_no_cusip(clean_file):
     findings = check_pii(clean_file.read_bytes())
     assert "cusip" not in {f.type for f in findings}
+
+
+# --- SEDOL detection (weighted modulus-10 check-digit gated) ---
+
+# Real, published SEDOLs with a valid weighted check digit, each carrying a
+# letter in the base (so the free-text regex detects them). Vowels are never
+# present in a SEDOL base.
+VALID_SEDOLS = [
+    "B16GWD5",
+    "B0YBKL9",
+    "B1YW440",
+    "BH4HKS3",
+]
+
+# All-numeric SEDOLs validate at the helper level (the check digit is correct)
+# but are deliberately NOT matched in free text -- a pure 7-digit run lives in
+# the coincidental-digit space, so the regex requires a letter in the base.
+VALID_NUMERIC_SEDOLS = [
+    "0263494",
+    "0540528",
+]
+
+# Strings shaped like a SEDOL but failing the weighted check digit, carrying a
+# vowel in the base, or the wrong length -- they must NOT validate.
+INVALID_SEDOLS = [
+    "B16GWD6",  # right base, wrong check digit
+    "B0YBKL0",  # right base, wrong check digit
+    "BA6GWD5",  # vowel (A) in the base -- structurally impossible
+    "B16GWD",   # 6 chars -- too short
+    "B16GWD53",  # 8 chars -- too long
+]
+
+
+@pytest.mark.parametrize("sedol", VALID_SEDOLS + VALID_NUMERIC_SEDOLS)
+def test_sedol_accepts_real_sedols(sedol):
+    assert _sedol_valid(sedol) is True
+
+
+@pytest.mark.parametrize("sedol", INVALID_SEDOLS)
+def test_sedol_rejects_invalid(sedol):
+    assert _sedol_valid(sedol) is False
+
+
+@pytest.mark.parametrize("bad", ["", "B16GW", "  ", "B16GWDA", "B16GW!5"])
+def test_sedol_rejects_garbage(bad):
+    # Defensive: malformed / too-short input is never a valid SEDOL. A
+    # non-numeric check digit ("...DA") and a bad base char are both rejected.
+    assert _sedol_valid(bad) is False
+
+
+def test_sedol_in_memo_detected():
+    findings = _scan("sold security B16GWD5 today")
+    sedols = [f for f in findings if f.type == "sedol"]
+    assert len(sedols) == 1
+    assert sedols[0].severity == "high"
+    assert sedols[0].check == "pii"
+    # The base / check digit never leave the scanner; only the leading character
+    # survives for triage.
+    assert "16GWD5" not in (sedols[0].evidence or "")
+    assert (sedols[0].evidence or "").startswith("B")
+
+
+def test_sedol_lowercase_detected():
+    # SEDOLs are case-insensitive; a lowercased value still validates and is
+    # reported (the regex matches the letter; the validator upper-cases).
+    findings = _scan("ticker sedol b16gwd5 on file")
+    sedols = [f for f in findings if f.type == "sedol"]
+    assert len(sedols) == 1
+
+
+def test_numeric_sedol_not_matched_in_freetext():
+    # A purely numeric 7-digit run validates at the helper level but the SEDOL
+    # regex requires a letter, so it is NOT reported as a sedol. A 7-digit run is
+    # too short for the account-number scanner (8+) and not 9 digits, so it
+    # produces no pii finding at all -- which is the correct, quiet behaviour.
+    findings = _scan("order 0263494 confirmed")
+    types = {f.type for f in findings}
+    assert "sedol" not in types
+
+
+def test_sedol_not_double_counted_as_account_number():
+    # A SEDOL must be classified once -- as a sedol -- and never also as an
+    # account_number / routing_number / credit_card finding.
+    findings = _scan("holding B0YBKL9 in the account")
+    types = [f.type for f in findings]
+    assert types.count("sedol") == 1
+    assert "account_number" not in types
+    assert "routing_number" not in types
+    assert "credit_card" not in types
+
+
+def test_invalid_sedol_not_reported():
+    # A wrong-check-digit SEDOL-shaped run must NOT be reported as a sedol.
+    findings = _scan("ref B16GWD6 logged")
+    assert "sedol" not in {f.type for f in findings}
+
+
+def test_sedol_does_not_break_cusip_or_isin():
+    # The 7-char SEDOL regex must not partially match inside a longer 9-char
+    # CUSIP or 12-char ISIN run (the non-alphanumeric lookarounds prevent it).
+    cusip_findings = _scan("sold security 17275R102 today")
+    assert [f.type for f in cusip_findings] == ["cusip"]
+    isin_findings = _scan("US0378331005 holding")
+    assert [f.type for f in isin_findings] == ["isin"]
+
+
+def test_same_sedol_deduped_per_field():
+    findings = _scan("B16GWD5 aka b16gwd5 in two casings")
+    sedols = [f for f in findings if f.type == "sedol"]
+    assert len(sedols) == 1
+
+
+def test_sedol_leak_fixture(sedol_file):
+    findings = check_pii(sedol_file.read_bytes())
+    sedols = [f for f in findings if f.type == "sedol"]
+    types = {f.type for f in findings}
+    assert "sedol" in types, f"expected sedol, got: {types}"
+    # The fixture leaks two valid SEDOLs in memos; the wrong-check-digit decoy
+    # must NOT be reported, and the SEDOLs sitting in their own SECID fields are
+    # legitimate (not a leak) and must NOT be flagged from there.
+    assert len(sedols) == 2
+    assert all(s.severity == "high" for s in sedols)
+    for s in sedols:
+        # No raw base characters remain in the evidence.
+        assert "X" in (s.evidence or "")
+
+
+def test_clean_file_no_sedol(clean_file):
+    findings = check_pii(clean_file.read_bytes())
+    assert "sedol" not in {f.type for f in findings}

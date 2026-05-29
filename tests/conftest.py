@@ -60,6 +60,12 @@ def cusip_file() -> Path:
 
 
 @pytest.fixture
+def sedol_file() -> Path:
+    """An investment statement leaking valid SEDOLs in free-text memos."""
+    return FIXTURES / "sedol-leak.ofx"
+
+
+@pytest.fixture
 def entity_bomb_file() -> Path:
     return FIXTURES / "entity-bomb.ofx"
 
