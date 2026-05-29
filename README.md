@@ -11,11 +11,11 @@ scanner that treats an OFX file as an attack surface and asks three questions:
   declarations, recursive entity-expansion (Billion Laughs) DoS chains,
   CDATA-terminator injection, SGML/XML format confusion, OFX v1 header
   injection / encoding mismatch, encoding tricks, oversized fields.
-- **Is this file leaking PII it should not?** SSNs, payment-card numbers
-  (PANs), IBANs, securities identifiers (ISIN/CUSIP/SEDOL), legal-entity
-  identifiers (LEI), bank identifier codes (BIC/SWIFT), UK sort codes, Canadian
-  routing numbers, full account numbers, and routing numbers smuggled into
-  free-text transaction names and memos.
+- **Is this file leaking PII it should not?** Email addresses, SSNs,
+  payment-card numbers (PANs), IBANs, securities identifiers (ISIN/CUSIP/SEDOL),
+  legal-entity identifiers (LEI), bank identifier codes (BIC/SWIFT), UK sort
+  codes, Canadian routing numbers, full account numbers, and routing numbers
+  smuggled into free-text transaction names and memos.
 - **Is this file anomalous?** Out-of-range posting dates, zero / sign-flipped /
   out-of-range transaction amounts, and other signs of tampering or a backend
   that accepts garbage.
@@ -54,10 +54,10 @@ ferryman [--check {malformed,pii,anomaly,all}] [--format {json,text,h1md,sarif}]
     "Billion Laughs" DoS, CDATA injection, SGML/XML confusion, OFX v1 header
     injection / encoding mismatch, encoding tricks, oversized fields). Operates
     on raw bytes; never parses a hostile file.
-  - `pii` &mdash; PII leaking into transaction free-text (SSN, payment-card
-    number, IBAN, ISIN, CUSIP, SEDOL, LEI, BIC/SWIFT, UK sort code, Canadian
-    routing number, account number, routing number), including investment memos
-    and security ids.
+  - `pii` &mdash; PII leaking into transaction free-text (email address, SSN,
+    payment-card number, IBAN, ISIN, CUSIP, SEDOL, LEI, BIC/SWIFT, UK sort code,
+    Canadian routing number, account number, routing number), including
+    investment memos and security ids.
     Evidence is always redacted before it leaves the tool.
   - `anomaly` &mdash; structurally valid but suspicious transactions
     (out-of-range dates; zero, sign-contradicting, or out-of-range transaction
@@ -301,6 +301,35 @@ $ ferryman --check anomaly --format text crafted-amounts.ofx
 **Remediation:** validate `TRNAMT` against the declared transaction type's sign
 convention, reject zero-value postings, and bound the per-transaction magnitude
 before applying the amount to a balance.
+
+### Email-address leak detection
+
+An email address is the most common piece of direct PII to leak through a
+statement export &mdash; "personal data" under GDPR and "personal information"
+under CCPA, and a textbook reportable disclosure when it surfaces in a field that
+should carry only a transaction description. The **pii** check flags an
+`email_address` finding (severity `high`) when a free-text **name or memo**
+contains a string shaped like an email: a `local@domain` whose domain is a
+dotted, registrable name ending in a top-level domain of at least two letters
+(e.g. `john.doe@example.com`, `billing+stmt@sub.corp.co.uk`).
+
+Unlike the numeric identifiers, an email needs no checksum: the `@` plus the
+dotted, letter-TLD domain make it structurally unambiguous, so the detector is
+high-precision with near-zero false positives. A bare `@handle` mention, a
+domain with no TLD (`user@localhost`), or a one-character TLD is **not** flagged.
+The address never leaves the tool intact &mdash; evidence is redacted to the
+first character of the local part plus the domain (`j*******@example.com`,
+`*@example.com`) so a reporter can tell two leaks apart without exfiltrating the
+identity.
+
+```bash
+$ ferryman --check pii --format text leak.ofx
+  [HIGH] pii/email_address @ statement[0].transaction[0].name (fitid 0001): Email address leaking into a free-text field -- direct PII (GDPR/CCPA personal data) that should not travel in a statement export.
+```
+
+**Remediation:** never echo a customer's (or counterparty's) email address into a
+statement export or transaction memo; keep contact details in structured,
+access-controlled fields rather than free text.
 
 ### Payment-card (PAN) leak detection
 
