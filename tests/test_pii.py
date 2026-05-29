@@ -12,6 +12,7 @@ from ferryman.checks.pii import (
     _aba_checksum_valid,
     _au_bsb_valid,
     _bic_valid,
+    _br_cpf_valid,
     _ca_routing_valid,
     _clabe_valid,
     _cusip_valid,
@@ -2251,3 +2252,157 @@ def test_th_natid_leak_fixture(th_natid_file):
 def test_clean_file_no_th_natid(clean_file):
     findings = check_pii(clean_file.read_bytes())
     assert "th_natid" not in {f.type for f in findings}
+
+
+# Real-format Brazilian CPFs (11 digits, written NNN.NNN.NNN-NN: a 3.3.3-2
+# dotted-and-dashed grouping ending in two trailing mod-11 weighted check
+# digits). Each pair of check digits was computed from the public weighted
+# algorithm (descending weights 10..2 then 11..2), so each must pass the gate.
+VALID_BR_CPF = [
+    "111.444.777-35",
+    "123.456.789-09",
+    "529.982.247-25",
+    "398.273.113-52",
+    "468.613.100-69",
+]
+
+# NNN.NNN.NNN-NN-shaped runs that must NOT validate -- wrong check digit or a
+# repeated-digit placeholder that passes the arithmetic but is an invalid CPF.
+INVALID_BR_CPF = [
+    "111.444.777-34",  # wrong second check digit (real one is ...35)
+    "123.456.789-00",  # wrong check digits (real one is ...09)
+    "111.111.111-11",  # all-same-digit placeholder -- passes arithmetic, invalid
+    "000.000.000-00",  # all-zero placeholder -- passes arithmetic, invalid
+    "529.982.247-24",  # one off from a real CPF -- checksum must catch it
+]
+
+
+@pytest.mark.parametrize("code", VALID_BR_CPF)
+def test_br_cpf_accepts_real_numbers(code):
+    assert _br_cpf_valid(code) is True
+
+
+@pytest.mark.parametrize("code", INVALID_BR_CPF)
+def test_br_cpf_rejects_invalid(code):
+    assert _br_cpf_valid(code) is False
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "",
+        "  ",
+        "11144477735",        # contiguous (no dotted grouping) is not the canonical form
+        "111-444-777-35",     # hyphens, not the dotted CPF presentation
+        "11.1444.777-35",     # wrong split
+        "111.444.777.35",     # final separator is a dot, not a dash
+        "111.444.77-35",      # short middle/last block
+        "a11.444.777-35",     # non-numeric
+        "111..444.777-35",    # double dot
+    ],
+)
+def test_br_cpf_rejects_garbage(bad):
+    # Defensive: empty / wrong split / contiguous / hyphenated / non-numeric /
+    # double-separator input is never a valid CPF in the canonical form.
+    assert _br_cpf_valid(bad) is False
+
+
+def test_br_cpf_in_memo_detected():
+    findings = _scan("Pix payee CPF 111.444.777-35 Joao")
+    codes = [f for f in findings if f.type == "br_cpf"]
+    assert len(codes) == 1
+    assert codes[0].severity == "high"
+    assert codes[0].check == "pii"
+    # Only the leading block survives for triage; the rest is masked.
+    assert codes[0].evidence == "111.XXX.XXX-XX"
+
+
+def test_br_cpf_redaction_masks_identity():
+    findings = _scan("chave 529.982.247-25 on file")
+    codes = [f for f in findings if f.type == "br_cpf"]
+    assert len(codes) == 1
+    assert codes[0].evidence == "529.XXX.XXX-XX"
+    # The identity-bearing digits and the check digits never leave the tool.
+    assert "982" not in codes[0].evidence
+    assert "247" not in codes[0].evidence
+
+
+def test_br_cpf_wrong_check_digit_not_reported():
+    # A NNN.NNN.NNN-NN run with the CPF shape but a wrong check digit fails the
+    # checksum -- not reported.
+    findings = _scan("decoy reference 111.444.777-34 logged")
+    assert "br_cpf" not in {f.type for f in findings}
+
+
+def test_br_cpf_repeated_digit_placeholder_not_reported():
+    # The all-same-digit placeholders pass the checksum arithmetic but are
+    # well-known invalid CPFs, so even a checksum-shaped run is not reported.
+    assert "br_cpf" not in {f.type for f in _scan("ref 111.111.111-11 here")}
+    assert "br_cpf" not in {f.type for f in _scan("ref 000.000.000-00 here")}
+
+
+def test_br_cpf_does_not_collide_with_digit_scanners():
+    # The CPF's dotted-and-dashed presentation breaks the 11-digit run, so the
+    # contiguous account / routing scanners never see it; the reservation keeps
+    # that guarantee explicit. The CPF is classified exactly once.
+    findings = _scan("paid 111.444.777-35 to payee")
+    types = [f.type for f in findings]
+    assert types.count("br_cpf") == 1
+    assert "account_number" not in types
+    assert "routing_number" not in types
+    assert "credit_card" not in types
+
+
+def test_br_cpf_does_not_collide_with_other_separated_detectors():
+    # The dotted 3.3.3-2 CPF split must not be confused with any hyphenated
+    # detector -- the UK sort code (2-2-2), the Canadian routing number (5-3),
+    # the Australian BSB (3-3), the South Korean Giro (5-2), the Thai national ID
+    # (1-4-5-2-1), or the SSN (3-2-4); each of those must be classified as itself,
+    # never as a CPF.
+    assert "br_cpf" not in {f.type for f in _scan("sort 20-00-00 here")}
+    assert "br_cpf" not in {f.type for f in _scan("routing 12345-003 here")}
+    assert "br_cpf" not in {f.type for f in _scan("bsb 062-000 here")}
+    assert "br_cpf" not in {f.type for f in _scan("giro 10005-20 here")}
+    assert "br_cpf" not in {f.type for f in _scan("natid 1-1017-00522-00-8 here")}
+    assert "br_cpf" not in {f.type for f in _scan("ssn 123-45-6789 here")}
+
+
+def test_br_cpf_does_not_break_other_identifiers():
+    # The CPF scan must not interfere with other identifiers on their own.
+    card_findings = _scan("card 4111111111111111 today")
+    assert [f.type for f in card_findings] == ["credit_card"]
+    natid_findings = [f for f in _scan("natid 1-1017-00522-00-8 today")
+                      if f.type == "th_natid"]
+    assert len(natid_findings) == 1
+
+
+def test_same_br_cpf_deduped_per_field():
+    findings = _scan(
+        "cpf 111.444.777-35 and again 111.444.777-35 in one memo"
+    )
+    codes = [f for f in findings if f.type == "br_cpf"]
+    assert len(codes) == 1
+
+
+def test_br_cpf_leak_fixture(br_cpf_file):
+    findings = check_pii(br_cpf_file.read_bytes())
+    codes = [f for f in findings if f.type == "br_cpf"]
+    types = {f.type for f in findings}
+    assert "br_cpf" in types, f"expected br_cpf, got: {types}"
+    # The fixture leaks two valid CPFs in memos; the wrong-check-digit decoy
+    # (111.444.777-34) must NOT be reported.
+    assert len(codes) == 2
+    assert all(c.severity == "high" for c in codes)
+    for c in codes:
+        # Only the leading block survives in the evidence.
+        assert c.evidence.endswith(".XXX.XXX-XX")
+        assert "br_cpf" == c.type
+    # The reservation guarantees the CPFs are never also reported as cards /
+    # account numbers.
+    assert "credit_card" not in types
+    assert "account_number" not in types
+
+
+def test_clean_file_no_br_cpf(clean_file):
+    findings = check_pii(clean_file.read_bytes())
+    assert "br_cpf" not in {f.type for f in findings}

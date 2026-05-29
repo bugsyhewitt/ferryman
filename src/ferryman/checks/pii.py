@@ -113,6 +113,18 @@ Detection classes:
                                 compact 13-digit run is reserved under the card /
                                 account namespaces so the card scanner never
                                 re-reports it.
+- ``br_cpf``                  : a Brazilian CPF (Cadastro de Pessoas Físicas) --
+                                the 11-digit individual taxpayer registry number
+                                that is both a national tax id and the most common
+                                Pix payee "chave" (key) -- printed in its canonical
+                                ``NNN.NNN.NNN-NN`` (3.3.3-2 dotted-and-dashed) form,
+                                whose dotted structure, all-same-digit rejection, and
+                                two public mod-11 weighted check digits all validate,
+                                a near-certain Brazilian PII / Pix payment-routing
+                                leak. The dotted-and-dashed presentation is distinct
+                                from every other detector -- it is the only one that
+                                uses ``.`` separators -- so it never collides with the
+                                hyphenated routing codes or the contiguous digit runs.
 - ``clabe``                   : a Mexican CLABE (Clave Bancaria Estandarizada) --
                                 the 18-digit standardized bank-account number
                                 (3-digit bank code + 3-digit branch/plaza code +
@@ -551,6 +563,32 @@ _TH_NATID_LEN = 13
 # the thirteen-digit number (the leading digit gets weight 13, descending to 2).
 # The trailing thirteenth digit is the check digit being verified.
 _TH_NATID_WEIGHTS = (13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2)
+
+# Brazilian CPF (Cadastro de Pessoas Físicas) candidate -- the 11-digit individual
+# taxpayer registry number every Brazilian resident carries, and the most common
+# Pix payee "chave" (key) a payer routes an instant interbank transfer against, so
+# a CPF echoed into a statement memo discloses the exact value needed to push funds
+# to that person -- a direct, high-value Brazilian PII / payment-routing leak. Its
+# canonical printed presentation is the dotted-and-dashed ``NNN.NNN.NNN-NN``
+# (3.3.3-2 split) seen on every CPF card and Pix receipt. The dotted presentation
+# is the defining shape and the dominant precision lever: it is the ONLY detector
+# that uses ``.`` separators, so it is distinct from every hyphenated detector --
+# the SSN's 3-2-4, the UK sort code's 2-2-2, the Canadian routing number's 5-3, the
+# Australian BSB's 3-3, the South Korean Giro's 5-2, and the Thai national ID's
+# 1-4-5-2-1 -- and from any contiguous digit run, so the detectors never collide.
+# Unlike the routing codes a CPF carries TWO public, self-contained mod-11 weighted
+# check digits, so precision comes from a real double checksum plus an
+# all-same-digit rejection (the eleven repeated-digit values pass the checksum but
+# are well-known invalid placeholder CPFs) -- on a par with the IBAN / ABA / Luhn /
+# CLABE / Giro / national-ID-gated identifiers. The run is bounded by a
+# non-digit/non-dot/non-hyphen lookaround so a CPF embedded in a longer
+# digit-and-separator blob is not partially matched. The caller validates the
+# structure, the all-same-digit rejection, and both check digits before reporting.
+_BR_CPF_RE = re.compile(
+    r"(?<![\d.\-])\d{3}\.\d{3}\.\d{3}-\d{2}(?![\d.\-])"
+)
+# A Brazilian CPF is exactly 11 digits.
+_BR_CPF_LEN = 11
 
 
 def _luhn_valid(digits: str) -> bool:
@@ -1246,6 +1284,81 @@ def _redact_th_natid(code: str) -> str:
     return code[0] + "-XXXX-XXXXX-XX-X"
 
 
+def _br_cpf_valid(candidate: str) -> bool:
+    """Return ``True`` if a string is a structurally valid Brazilian CPF.
+
+    A CPF (Cadastro de Pessoas Físicas) is the 11-digit individual taxpayer
+    registry number every Brazilian resident carries -- and the most common Pix
+    "chave" (key) a payer routes an instant interbank transfer against, so a CPF
+    echoed into a statement memo discloses the exact value needed to push funds to
+    that person. Its canonical card / receipt presentation is the
+    dotted-and-dashed ``NNN.NNN.NNN-NN`` (3.3.3-2 split). Unlike the UK / Canadian
+    / Australian / Indian routing codes it carries TWO public, self-contained
+    arithmetic check digits, so precision comes from three public,
+    dependency-free gates:
+
+        1. **Shape** -- exactly ``NNN.NNN.NNN-NN``: eleven decimal digits in the
+           3.3.3-2 dotted-and-dashed grouping.
+        2. **All-same-digit rejection** -- the eleven repeated-digit values
+           (``000.000.000-00`` ... ``999.999.999-99``) all satisfy the checksum
+           arithmetic but are well-known invalid placeholder CPFs that the official
+           validator rejects. Rejecting them is the precision lever that keeps a
+           coincidental repeated-digit run from being reported.
+        3. **Check digits** -- the first check digit is computed over the first
+           nine digits with descending weights ``10, 9, ... , 2``; the second over
+           the first ten digits with descending weights ``11, 10, ... , 2``. For
+           each, ``r = (weighted_sum mod 11)`` and the check digit is ``0`` when
+           ``r < 2`` else ``11 - r``. Both must match.
+
+    A run that clears all three gates is a near-certain real CPF; a coincidental
+    token fails the all-same-digit gate or one of the check digits with
+    overwhelming probability. Any malformed input returns ``False`` so the helper
+    is safe to reuse.
+    """
+    code = candidate.strip()
+    # Enforce the canonical dotted-and-dashed NNN.NNN.NNN-NN grouping exactly --
+    # three dot-separated triples then a dash and the two check digits. The
+    # structure is validated here (not only in the regex) so the helper rejects a
+    # contiguous, hyphenated, or wrong-split run on its own.
+    dash_parts = code.split("-")
+    if len(dash_parts) != 2:
+        return False
+    body, check_block = dash_parts
+    if not (len(check_block) == 2 and check_block.isdigit()):
+        return False
+    triples = body.split(".")
+    if len(triples) != 3:
+        return False
+    if not all(len(t) == 3 and t.isdigit() for t in triples):
+        return False
+    digits = "".join(triples) + check_block
+    if len(digits) != _BR_CPF_LEN:
+        return False
+    # Eleven repeated-digit CPFs pass the checksum arithmetic but are invalid
+    # placeholders -- the official validator rejects them.
+    if len(set(digits)) == 1:
+        return False
+    for n in (9, 10):
+        total = sum(int(d) * (n + 1 - i) for i, d in enumerate(digits[:n]))
+        remainder = total % 11
+        check = 0 if remainder < 2 else 11 - remainder
+        if check != int(digits[n]):
+            return False
+    return True
+
+
+def _redact_br_cpf(code: str) -> str:
+    """Redact a Brazilian CPF, preserving only the leading block for triage.
+
+    The first three digits (and the dotted-and-dashed shape) survive so a reporter
+    can tell two distinct leaks apart, while the rest of the number and both check
+    digits -- the part that pins the leak to a specific person -- are masked::
+
+        111.444.777-35 -> 111.XXX.XXX-XX
+    """
+    return code[:3] + ".XXX.XXX-XX"
+
+
 def _redact_sedol(sedol: str) -> str:
     """Redact a SEDOL, preserving only the leading character for triage.
 
@@ -1914,6 +2027,46 @@ def _scan_text(
                 "a PromptPay transfer routes against.",
                 location=location,
                 evidence=_redact_th_natid(candidate),
+            )
+        )
+
+    # Brazilian CPFs (NNN.NNN.NNN-NN, the canonical 3.3.3-2 dotted-and-dashed
+    # form) -- the Brazilian individual taxpayer registry number and Pix payee
+    # key. The dotted presentation is the ONLY detector that uses ``.``
+    # separators, so it is distinct from every hyphenated detector (the SSN's
+    # 3-2-4, the UK sort code's 2-2-2, the Canadian routing number's 5-3, the
+    # Australian BSB's 3-3, the South Korean Giro's 5-2, and the Thai national
+    # ID's 1-4-5-2-1) and from any contiguous digit run, so the detectors never
+    # collide. We gate on the 3.3.3-2 shape, the all-same-digit rejection, AND the
+    # two public mod-11 weighted check digits, so a coincidental token is
+    # vanishingly unlikely to be reported. A CPF echoed into free text discloses
+    # the Pix key a payer routes an instant transfer against -- a direct Brazilian
+    # PII / payment-routing leak. We reserve the compact 11-digit run under the
+    # account / routing namespaces so the digit scanners below never re-report a
+    # slice of the same id (the dotted presentation already breaks the run, but
+    # the reservation keeps the guarantee explicit and robust).
+    for m in _BR_CPF_RE.finditer(text):
+        candidate = m.group(0)
+        if not _br_cpf_valid(candidate):
+            continue
+        key = ("br_cpf", candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        compact = re.sub(r"[.\-]", "", candidate)
+        seen.add(("account_number", compact))
+        seen.add(("routing_number", compact))
+        findings.append(
+            Finding(
+                check="pii",
+                type="br_cpf",
+                severity="high",
+                message="Brazilian CPF (valid NNN.NNN.NNN-NN structure, "
+                "all-same-digit rejection, and two mod-11 check digits) leaking "
+                "into a free-text field -- discloses the taxpayer id / Pix key a "
+                "payer routes a transfer against.",
+                location=location,
+                evidence=_redact_br_cpf(candidate),
             )
         )
 
