@@ -13,8 +13,8 @@ scanner that treats an OFX file as an attack surface and asks three questions:
   injection / encoding mismatch, encoding tricks, oversized fields.
 - **Is this file leaking PII it should not?** SSNs, payment-card numbers
   (PANs), IBANs, securities identifiers (ISIN/CUSIP/SEDOL), legal-entity
-  identifiers (LEI), full account numbers, and routing numbers smuggled into
-  free-text transaction names and memos.
+  identifiers (LEI), bank identifier codes (BIC/SWIFT), full account numbers, and
+  routing numbers smuggled into free-text transaction names and memos.
 - **Is this file anomalous?** Out-of-range posting dates, zero / sign-flipped /
   out-of-range transaction amounts, and other signs of tampering or a backend
   that accepts garbage.
@@ -54,9 +54,9 @@ ferryman [--check {malformed,pii,anomaly,all}] [--format {json,text,h1md,sarif}]
     injection / encoding mismatch, encoding tricks, oversized fields). Operates
     on raw bytes; never parses a hostile file.
   - `pii` &mdash; PII leaking into transaction free-text (SSN, payment-card
-    number, IBAN, ISIN, CUSIP, SEDOL, LEI, account number, routing number),
-    including investment memos and security ids. Evidence is always redacted
-    before it leaves the tool.
+    number, IBAN, ISIN, CUSIP, SEDOL, LEI, BIC/SWIFT, account number, routing
+    number), including investment memos and security ids. Evidence is always
+    redacted before it leaves the tool.
   - `anomaly` &mdash; structurally valid but suspicious transactions
     (out-of-range dates; zero, sign-contradicting, or out-of-range transaction
     amounts; for investment statements, negative/implausible unit prices and
@@ -511,6 +511,46 @@ $ ferryman --check pii --format text leak.ofx
 **Remediation:** never echo a counterparty's or issuer's LEI into a statement
 memo or transaction name; keep entity identifiers in structured, access-controlled
 fields rather than free text.
+
+### BIC / SWIFT code leak detection
+
+A [BIC](https://en.wikipedia.org/wiki/ISO_9362) (Bank Identifier Code, also called
+a SWIFT code, ISO 9362) is the public eight- or eleven-character code that
+identifies a financial institution &mdash; the value printed alongside an IBAN on
+a wire instruction. A BIC echoed into a free-text **memo or transaction name**
+discloses the bank behind a transaction, and paired with an IBAN it fully
+identifies a counterparty's account: a counterparty-confidentiality leak
+reportable on its own. The **pii** check flags a `bic` finding (severity `high`)
+when a free-text field contains an **upper-case** string that clears **three**
+public gates:
+
+1. **shape** &mdash; exactly eight or eleven characters: four letters (the
+   institution / bank code), two letters (the country code), two alphanumerics
+   (the location code), and &mdash; for the eleven-character form &mdash; three
+   alphanumerics (the branch code);
+2. **country** &mdash; the fifth and sixth characters must be a registered
+   ISO 3166-1 alpha-2 country code (the same registry-gating idea the IBAN check
+   uses, and the primary precision lever);
+3. **location-code rules** &mdash; per ISO 9362, the first location character is
+   never `0` or `1` (reserved) and the second is never the letter `O` (to avoid
+   confusion with zero).
+
+ISO 9362 defines no arithmetic checksum, so precision comes from the strict
+structure plus the registered country code. Detection is deliberately **upper-case
+only**: a BIC is always transmitted in upper case, and matching lower-case
+all-letter runs would flood reports with ordinary English words (for instance
+`beneficiary` is eleven letters whose fifth-sixth characters are `FI`, Finland).
+The location and branch codes never leave the tool &mdash; evidence is redacted to
+the six-character bank-plus-country prefix (`BOFAUSXX`, `DEUTDEXXXXX`).
+
+```bash
+$ ferryman --check pii --format text leak.ofx
+  [HIGH] pii/bic @ statement[0].transaction[0].memo: Bank Identifier Code (BIC/SWIFT, valid ISO 9362 structure and country code) leaking into a free-text field -- identifies the financial institution behind a transaction.
+```
+
+**Remediation:** never echo a counterparty's BIC/SWIFT code into a statement memo
+or transaction name; keep institution identifiers in structured,
+access-controlled fields rather than free text.
 
 ## From finding to HackerOne report
 

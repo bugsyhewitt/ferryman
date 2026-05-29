@@ -634,6 +634,68 @@ entity-identity dimension: account (IBAN/account number), security
 
 ---
 
+## Rank 16 — BIC / SWIFT Code Leak Detection, ISO 9362 structure + country-code gated (HIGH signal, low effort) — ✅ IMPLEMENTED (2026-05-29, Phase 2 Rotation 17)
+
+**Status:** Shipped. `checks/pii.py` gained a `_bic_valid()` helper that gates a
+BIC (Bank Identifier Code / SWIFT code) candidate behind three independent public
+checks: the ISO 9362 shape (exactly 8 or 11 characters — four letters for the
+institution/bank code, two letters for the country code, two alphanumerics for the
+location code, and an optional three-alphanumeric branch code), a registered
+**ISO 3166-1 alpha-2 country code** at positions 5–6 (the new `_ISO_3166_1`
+frozenset, the primary precision lever, mirroring how the IBAN gate uses the
+country registry), and the ISO 9362 **location-code rules** (the first location
+character is never `0` or `1`, the second is never the letter `O`). ISO 9362
+defines no arithmetic checksum, so precision comes from the strict structure plus
+the registered country code rather than a check digit. A `_BIC_RE` matcher is
+deliberately **upper-case only** (`[A-Z]{6}[A-Z0-9]{2}(?:[A-Z0-9]{3})?`,
+non-alphanumeric bounded): a BIC is always transmitted in upper case, and matching
+lower-case all-letter runs would flood reports with ordinary English words — the
+canonical collision being `beneficiary` (eleven letters whose 5th–6th characters
+are `FI`, Finland, with a passing location code). The `_bic_valid` helper itself
+stays case-insensitive so it is safe to reuse. In `_scan_text`, BIC detection runs
+**before** the securities identifiers and the credit-card / routing / account
+scanners, and any digit run inside a detected BIC's location/branch code is
+reserved under the `account_number`/`credit_card`/`routing_number` dedupe
+namespaces so the same identifier is never double-counted. Findings are `high`
+severity; evidence is redacted to the six-character bank-plus-country prefix via
+`_redact_bic()` so the location and branch codes never leave the tool. New fixture
+`tests/fixtures/bic-leak.ofx` (an 8-char and an 11-char valid BIC in two memos
+plus a bad-country `DEUTXXFF` decoy) plus 32 new tests in `tests/test_pii.py` cover
+the validator (real 8- and 11-char registry BICs, bad-country / reserved-location
+/ forbidden-`O` / digit-in-country / wrong-length rejects, garbage guards,
+lowercase-validator acceptance), upper-case-only memo detection and six-char
+redaction, the lowercase-word (`beneficiary` / `deutdeff`) non-detection guards,
+the no-double-count guarantee, the no-interference-with-ISIN/LEI guard, per-field
+dedupe, the invalid-BIC no-report case, the fixture, and the clean-file no-BIC
+guarantee. README gained a "BIC / SWIFT code leak detection" section and the PII
+type lists were updated. No new dependencies (stdlib `re` only).
+
+**What:** The pii check covered SSN, payment card (PAN), IBAN, ISIN, CUSIP,
+SEDOL, LEI, US account number, and US ABA routing number — identifiers naming an
+*account*, a *security*, or a *legal entity*, but none naming the **financial
+institution** that processes a transaction. The BIC (ISO 9362) is the global
+identifier for that institution — the SWIFT code printed alongside an IBAN on a
+wire instruction. Unlike the prior gates, ISO 9362 has no arithmetic checksum, so
+the detector gates on structure + a registered ISO 3166-1 country code + the
+ISO 9362 location-code rules, with upper-case-only matching as the precision lever
+against English-word collisions. A BIC echoed into a transaction memo discloses
+*which bank* a customer transacted with, and paired with a leaked IBAN it fully
+identifies a counterparty account — a counterparty-confidentiality leak reportable
+on its own.
+
+**Research grounding:** ISO 9362 (BIC structure, the 8/11-char head-office /
+branch forms) and ISO 3166-1 alpha-2 (the country-code registry) are public and
+documented, ~15 lines of Python with no new dependency. The BIC completes the
+counterparty/institution dimension alongside the LEI: account (IBAN / account
+number), security (ISIN / CUSIP / SEDOL), legal entity (LEI), and now institution
+(BIC). A leaked IBAN + BIC pair is the exact data a wire-fraud or
+account-takeover attacker needs, making the free-text BIC echo a natural, in-scope
+next detector.
+
+**Estimated tokens:** 35–50K
+
+---
+
 ## Research notes
 
 **Sources consulted:**
