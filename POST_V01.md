@@ -898,6 +898,51 @@ direct-entry / PayTo payment routes against, paired with an account number.
 
 ---
 
+## Rank 21 — Indian IFSC Code Leak Detection, BBBB0BRANCH structure gated (HIGH signal, low effort) — ✅ IMPLEMENTED (2026-05-29, Phase 2 Rotation 23)
+
+**Pivot note:** Ranks 1–20 were all shipped, and the originally-suggested R23
+candidate (IBAN) was confirmed already implemented by a codebase read. A fresh
+read of `checks/pii.py` showed the pii check covered the US (SSN, ITIN, ABA
+routing, account number), the UK (sort code, SEDOL), Canada (routing number),
+Australia (BSB), Europe (IBAN), and the global securities / entity / bank
+identifiers (ISIN, CUSIP, LEI, BIC) — but had **no domestic routing detector for
+India**, the world's largest real-time-payments market by volume (UPI). The
+Indian **IFSC (Indian Financial System Code)** is the direct domestic-routing
+companion to the already-shipped ABA / UK sort code / Canadian routing / Australian
+BSB detectors, and it carries an exceptionally clean public structural gate (a
+mandatory reserved zero in the fifth position), so it was the highest-value
+genuinely-unimplemented item.
+
+**Status:** Shipped. `checks/pii.py` gained `_ifsc_valid()` (gates on the exact
+11-char `BBBB0BRANCH` shape: four-letter bank code, the mandatory reserved `0` in
+the fifth position, and a six-char alphanumeric branch code) and `_redact_ifsc()`
+(evidence redacted to the leading four-letter bank code, `SBINXXXXXXX`). A new
+`ifsc` (high) finding runs in `_scan_text` before the contiguous-digit scanners,
+reserving the branch digit run under the account/card/routing namespaces so a
+slice of the same leak is never re-reported. The regex is upper-case-only and the
+mandatory fifth-position zero is the dominant precision lever; the structure is
+distinct from a BIC (first six chars all letters) and from the hyphenated routing
+codes, so the detectors never collide. New fixture
+`tests/fixtures/ifsc-leak.ofx` (two valid IFSCs in two memos + one no-reserved-zero
+`HDFCX001234` decoy) and 29 new test cases cover the validator (real RBI bank
+codes, alphanumeric and all-letter branch codes, lower-case acceptance, the
+no-zero / short / long / non-letter-prefix / non-alnum-branch rejections, garbage
+input), free-text detection, redaction, the no-reserved-zero non-detection guard,
+non-collision with the digit scanners and the BIC detector, per-field dedupe, the
+fixture, and the clean-file guard. README gained an Indian IFSC section and the
+type lists were updated. The SARIF mapping auto-generates the `pii/ifsc` rule with
+no changes. No new dependencies (stdlib `re` only). Test count 467 → 496.
+
+**Research grounding:** Reserve Bank of India IFSC specification — an IFSC is an
+11-character alphanumeric code, `BBBB0BRANCH`: the first four characters are the
+bank code, the fifth is `0` (reserved for future use), and the last six are the
+branch code. Public, dependency-free, ~10 lines of Python. It is the value a
+NEFT / RTGS / IMPS / UPI transfer routes against, paired with an account number.
+
+**Estimated tokens:** 30–50K
+
+---
+
 ## Research notes
 
 **Sources consulted:**

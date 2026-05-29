@@ -15,6 +15,7 @@ from ferryman.checks.pii import (
     _ca_routing_valid,
     _cusip_valid,
     _iban_valid,
+    _ifsc_valid,
     _isin_valid,
     _itin_valid,
     _lei_valid,
@@ -1568,6 +1569,139 @@ def test_au_bsb_leak_fixture(au_bsb_file):
 def test_clean_file_no_au_bsb(clean_file):
     findings = check_pii(clean_file.read_bytes())
     assert "au_bsb" not in {f.type for f in findings}
+
+
+# --- Indian IFSC code detection (BBBB0BRANCH structure gated) ---
+
+# Real-format Indian IFSC codes in the canonical BBBB0BRANCH presentation: a
+# four-letter bank code, the mandatory reserved zero in the fifth position, and
+# a six-character alphanumeric branch code. Each must pass the structure gate.
+# (The leading four letters are real RBI-assigned bank codes; branch codes are
+# arbitrary, as the IFSC carries no arithmetic check digit.)
+VALID_IFSC = [
+    "SBIN0000123",  # State Bank of India
+    "HDFC0001234",  # HDFC Bank
+    "ICIC0005678",  # ICICI Bank
+    "PUNB0123456",  # Punjab National Bank
+    "UTIB0000ABC",  # Axis Bank -- alphanumeric branch code
+    "KKBK0ABCDEF",  # Kotak Mahindra -- all-letter branch code
+    "YESB0000001",  # Yes Bank
+]
+
+# Strings shaped like an IFSC but failing the structure gate -- they must NOT
+# validate.
+INVALID_IFSC = [
+    "HDFCX001234",  # fifth character is not the mandatory reserved zero
+    "HDF00001234",  # only three letters in the bank code
+    "1DFC0001234",  # bank code contains a digit
+    "HDFC000123",   # 10 characters -- too short
+    "HDFC00012345", # 12 characters -- too long
+    "HDFC0001-23",  # non-alphanumeric in the branch code
+    "HDFC1001234",  # fifth character is 1, not 0
+]
+
+
+@pytest.mark.parametrize("code", VALID_IFSC)
+def test_ifsc_accepts_real_codes(code):
+    assert _ifsc_valid(code) is True
+
+
+@pytest.mark.parametrize("code", INVALID_IFSC)
+def test_ifsc_rejects_invalid(code):
+    assert _ifsc_valid(code) is False
+
+
+@pytest.mark.parametrize("bad", ["", "  ", "abcdefghijk", "SBIN0", "0000000000000"])
+def test_ifsc_rejects_garbage(bad):
+    # Defensive: empty / wrong-length / wrong-shape input is never a valid IFSC.
+    assert _ifsc_valid(bad) is False
+
+
+def test_ifsc_in_memo_detected():
+    findings = _scan("NEFT routed via SBIN0000123 Mumbai branch")
+    codes = [f for f in findings if f.type == "ifsc"]
+    assert len(codes) == 1
+    assert codes[0].severity == "high"
+    assert codes[0].check == "pii"
+    # Only the four-letter bank code survives for triage; the branch is masked.
+    assert codes[0].evidence == "SBINXXXXXXX"
+
+
+def test_ifsc_redaction_masks_branch():
+    findings = _scan("beneficiary at HDFC0001234")
+    codes = [f for f in findings if f.type == "ifsc"]
+    assert len(codes) == 1
+    assert codes[0].evidence == "HDFCXXXXXXX"
+    # The branch-identifying digits never leave the tool.
+    assert "001234" not in codes[0].evidence
+
+
+def test_ifsc_lowercase_accepted():
+    # IFSC codes are case-insensitive at validation time even though they are
+    # conventionally upper-case.
+    assert _ifsc_valid("sbin0000123") is True
+
+
+def test_ifsc_no_reserved_zero_not_reported():
+    # An 11-char token with the right letter prefix but no zero in the fifth
+    # position has the IFSC shape but fails the structure gate -- not reported.
+    findings = _scan("decoy reference HDFCX001234 logged")
+    assert "ifsc" not in {f.type for f in findings}
+
+
+def test_ifsc_does_not_break_other_identifiers():
+    # The IFSC scan must not interfere with the other identifiers when those
+    # appear on their own.
+    isin_findings = _scan("US0378331005 holding")
+    assert [f.type for f in isin_findings] == ["isin"]
+    aba_findings = [f for f in _scan("routing 121000248 on file")
+                    if f.type == "routing_number"]
+    assert len(aba_findings) == 1
+
+
+def test_ifsc_does_not_collide_with_digit_scanners():
+    # The IFSC's branch digit run is reserved, so the 8+/9-digit account/routing
+    # scanners never also claim it as a separate finding.
+    findings = _scan("paid via SBIN0000123 to the account")
+    types = [f.type for f in findings]
+    assert types.count("ifsc") == 1
+    assert "account_number" not in types
+    assert "routing_number" not in types
+    assert "credit_card" not in types
+
+
+def test_ifsc_does_not_collide_with_bic():
+    # A BIC is 8 or 11 chars but its first six are all letters; an IFSC's fifth
+    # character is a digit, so each is reported only as its own type.
+    ifsc = _scan("Indian SBIN0000123 here")
+    assert [f.type for f in ifsc] == ["ifsc"]
+    bic = _scan("SWIFT DEUTDEFF here")
+    assert [f.type for f in bic] == ["bic"]
+
+
+def test_same_ifsc_deduped_per_field():
+    findings = _scan("SBIN0000123 and again SBIN0000123 in one memo")
+    codes = [f for f in findings if f.type == "ifsc"]
+    assert len(codes) == 1
+
+
+def test_ifsc_leak_fixture(ifsc_file):
+    findings = check_pii(ifsc_file.read_bytes())
+    codes = [f for f in findings if f.type == "ifsc"]
+    types = {f.type for f in findings}
+    assert "ifsc" in types, f"expected ifsc, got: {types}"
+    # The fixture leaks two valid IFSCs in memos; the no-reserved-zero
+    # HDFCX001234 decoy must NOT be reported.
+    assert len(codes) == 2
+    assert all(c.severity == "high" for c in codes)
+    for c in codes:
+        # No raw branch characters remain in the evidence.
+        assert c.evidence.endswith("XXXXXXX")
+
+
+def test_clean_file_no_ifsc(clean_file):
+    findings = check_pii(clean_file.read_bytes())
+    assert "ifsc" not in {f.type for f in findings}
 
 
 # --- Email-address leak detection ---------------------------------------------

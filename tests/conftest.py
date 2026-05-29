@@ -108,6 +108,12 @@ def au_bsb_file() -> Path:
 
 
 @pytest.fixture
+def ifsc_file() -> Path:
+    """A bank statement leaking valid Indian IFSC codes (BBBB0BRANCH)."""
+    return FIXTURES / "ifsc-leak.ofx"
+
+
+@pytest.fixture
 def entity_bomb_file() -> Path:
     return FIXTURES / "entity-bomb.ofx"
 
