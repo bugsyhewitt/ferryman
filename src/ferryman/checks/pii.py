@@ -43,6 +43,13 @@ Detection classes:
                                 forbidden in the base and a letter is required so
                                 a purely numeric 7-digit run is never confused
                                 with a coincidental digit run.
+- ``uk_sort_code``            : a UK sort code (the six-digit ``NN-NN-NN``
+                                hyphenated routing code that identifies a UK
+                                bank and branch) whose hyphenated structure and
+                                assigned clearing-range prefix validate -- the
+                                UK domestic equivalent of an ABA routing number,
+                                and (paired with an account number) the data a
+                                wire-fraud attacker needs.
 - ``account_number``          : a long account-number-shaped digit run leaking
                                 into a transaction name/memo.
 - ``routing_number``          : a 9-digit run that passes the ABA weighted
@@ -241,6 +248,28 @@ _SEDOL_LEN = 7
 _SEDOL_WEIGHTS = (1, 3, 1, 7, 3, 9)
 # Vowels are never valid in a SEDOL base -- a defining structural rule.
 _SEDOL_VOWELS = frozenset("AEIOU")
+
+# UK sort code candidate: the canonical six-digit routing code written in three
+# hyphen-separated pairs (``NN-NN-NN``, e.g. ``20-00-00`` for Barclays). The
+# hyphenated presentation is the defining shape -- and the precision lever: it is
+# distinct from any contiguous digit run, so it never collides with the
+# account-number (``\d{8,}``), routing (``\d{9}``), or card scanners, and ordinary
+# prose almost never contains an ``NN-NN-NN`` token. The run is bounded by a
+# non-digit/non-hyphen lookaround so a sort code embedded in a longer
+# digit-and-hyphen blob is not partially matched. A sort code has no published,
+# self-contained check digit (the VocaLink modulus check requires the paired
+# account number), so precision comes from the hyphenated structure plus the
+# assigned clearing-range prefix below. The caller validates both before
+# reporting.
+_UK_SORT_CODE_RE = re.compile(r"(?<![\d-])\d{2}-\d{2}-\d{2}(?![\d-])")
+# UK sort codes are issued from the clearing range whose leading pair is 01-97.
+# 00 is unassigned; 98 and 99 are reserved (Bank of England / non-clearing and
+# test ranges), and the all-zeros and all-nines values are never live sort codes.
+# Gating the leading pair to the assigned range is the structural precision lever
+# that keeps a coincidental NN-NN-NN token (a date written 12-05-26, a stylised
+# reference) from being misread as a sort code.
+_UK_SORT_FIRST_MIN = 1
+_UK_SORT_FIRST_MAX = 97
 
 
 def _luhn_valid(digits: str) -> bool:
@@ -582,6 +611,50 @@ def _sedol_valid(candidate: str) -> bool:
     return check == int(sedol[6])
 
 
+def _uk_sort_code_valid(candidate: str) -> bool:
+    """Return ``True`` if a string is a structurally valid UK sort code.
+
+    A UK sort code is the six-digit routing code that identifies a UK bank and
+    branch -- the domestic equivalent of an ABA routing number, and the value
+    that (paired with an account number) drives a Faster Payments / BACS / CHAPS
+    transfer. It is conventionally written in three hyphen-separated pairs,
+    ``NN-NN-NN``. Unlike the ABA number it has no published, self-contained check
+    digit -- the VocaLink modulus check that validates a sort code requires the
+    paired account number and a weight table -- so precision comes from two
+    public, dependency-free structural gates:
+
+        1. **Shape** -- exactly ``NN-NN-NN``: three hyphen-separated pairs of
+           decimal digits.
+        2. **Clearing-range prefix** -- the leading pair (the bank/clearing
+           identifier) must be in the assigned range 01-97. ``00`` is unassigned
+           and ``98``/``99`` are reserved (Bank of England / non-clearing and
+           test ranges), so an all-zeros, all-nines, or otherwise out-of-range
+           leading pair is never a live sort code.
+
+    The hyphenated shape is itself the dominant precision lever: it is distinct
+    from any contiguous digit run, so the gate never competes with the account /
+    routing / card scanners, and prose almost never contains an ``NN-NN-NN``
+    token. Any malformed input returns ``False`` so the helper is safe to reuse.
+    """
+    code = candidate.strip()
+    parts = code.split("-")
+    if len(parts) != 3:
+        return False
+    if not all(len(p) == 2 and p.isdigit() for p in parts):
+        return False
+    return _UK_SORT_FIRST_MIN <= int(parts[0]) <= _UK_SORT_FIRST_MAX
+
+
+def _redact_uk_sort_code(code: str) -> str:
+    """Redact a UK sort code, preserving only the leading bank pair for triage.
+
+    The first pair identifies the clearing bank (useful context for a report)
+    while the branch-identifying middle and final pairs -- the part that pins the
+    leak to a specific account's routing -- are masked.
+    """
+    return code[:2] + "-XX-XX"
+
+
 def _redact_sedol(sedol: str) -> str:
     """Redact a SEDOL, preserving only the leading character for triage.
 
@@ -880,6 +953,36 @@ def _scan_text(
                 "securities holding.",
                 location=location,
                 evidence=_redact_sedol(compact),
+            )
+        )
+
+    # UK sort codes (NN-NN-NN) -- the hyphenated UK routing code. The hyphenated
+    # shape is distinct from any contiguous digit run, so this scan neither
+    # competes with nor is double-counted against the card / account / routing
+    # scanners below (those match contiguous digits; a sort code's hyphens break
+    # the run into three two-digit pieces, none of which the 8+/9-digit scanners
+    # will match). We gate on the hyphenated shape AND the assigned clearing-range
+    # leading pair, so a coincidental NN-NN-NN token is unlikely to be reported. A
+    # sort code echoed into free text discloses the UK bank/branch routing of an
+    # account -- the domestic equivalent of an ABA routing-number leak.
+    for m in _UK_SORT_CODE_RE.finditer(text):
+        candidate = m.group(0)
+        if not _uk_sort_code_valid(candidate):
+            continue
+        key = ("uk_sort_code", candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        findings.append(
+            Finding(
+                check="pii",
+                type="uk_sort_code",
+                severity="high",
+                message="UK sort code (valid NN-NN-NN structure and assigned "
+                "clearing-range prefix) leaking into a free-text field -- "
+                "discloses the bank/branch routing of an account.",
+                location=location,
+                evidence=_redact_uk_sort_code(candidate),
             )
         )
 

@@ -13,8 +13,9 @@ scanner that treats an OFX file as an attack surface and asks three questions:
   injection / encoding mismatch, encoding tricks, oversized fields.
 - **Is this file leaking PII it should not?** SSNs, payment-card numbers
   (PANs), IBANs, securities identifiers (ISIN/CUSIP/SEDOL), legal-entity
-  identifiers (LEI), bank identifier codes (BIC/SWIFT), full account numbers, and
-  routing numbers smuggled into free-text transaction names and memos.
+  identifiers (LEI), bank identifier codes (BIC/SWIFT), UK sort codes, full
+  account numbers, and routing numbers smuggled into free-text transaction names
+  and memos.
 - **Is this file anomalous?** Out-of-range posting dates, zero / sign-flipped /
   out-of-range transaction amounts, and other signs of tampering or a backend
   that accepts garbage.
@@ -54,9 +55,9 @@ ferryman [--check {malformed,pii,anomaly,all}] [--format {json,text,h1md,sarif}]
     injection / encoding mismatch, encoding tricks, oversized fields). Operates
     on raw bytes; never parses a hostile file.
   - `pii` &mdash; PII leaking into transaction free-text (SSN, payment-card
-    number, IBAN, ISIN, CUSIP, SEDOL, LEI, BIC/SWIFT, account number, routing
-    number), including investment memos and security ids. Evidence is always
-    redacted before it leaves the tool.
+    number, IBAN, ISIN, CUSIP, SEDOL, LEI, BIC/SWIFT, UK sort code, account
+    number, routing number), including investment memos and security ids.
+    Evidence is always redacted before it leaves the tool.
   - `anomaly` &mdash; structurally valid but suspicious transactions
     (out-of-range dates; zero, sign-contradicting, or out-of-range transaction
     amounts; for investment statements, negative/implausible unit prices and
@@ -550,6 +551,45 @@ $ ferryman --check pii --format text leak.ofx
 
 **Remediation:** never echo a counterparty's BIC/SWIFT code into a statement memo
 or transaction name; keep institution identifiers in structured,
+access-controlled fields rather than free text.
+
+### UK sort code leak detection
+
+A [UK sort code](https://en.wikipedia.org/wiki/Sort_code) is the six-digit
+routing code &mdash; written in three hyphen-separated pairs, `NN-NN-NN` &mdash;
+that identifies a UK bank and branch. It is the domestic equivalent of an ABA
+routing number, and paired with an account number it is the exact data a Faster
+Payments / BACS / CHAPS transfer (or a wire-fraud attacker) needs. A sort code
+echoed into a free-text **memo or transaction name** discloses the bank/branch
+routing of an account. The **pii** check flags a `uk_sort_code` finding (severity
+`high`) when a free-text field contains a string that clears **two** public,
+dependency-free gates:
+
+1. **shape** &mdash; exactly `NN-NN-NN`: three hyphen-separated pairs of decimal
+   digits. The hyphenated presentation is the dominant precision lever: it is
+   distinct from any contiguous digit run, so it never collides with the account
+   number (`\d{8,}`), routing (`\d{9}`), or payment-card scanners, and ordinary
+   prose almost never contains an `NN-NN-NN` token;
+2. **clearing-range prefix** &mdash; the leading pair (the bank/clearing
+   identifier) must be in the assigned range `01`&ndash;`97`. `00` is unassigned
+   and `98`/`99` are reserved (Bank of England / non-clearing and test ranges),
+   so an all-zeros, all-nines (`99-99-99`), or otherwise out-of-range leading
+   pair is never reported.
+
+Unlike the ABA number, a UK sort code has no published, self-contained check
+digit &mdash; the VocaLink modulus check that validates a sort code requires the
+paired account number and a weight table &mdash; so precision comes from the
+hyphenated structure plus the assigned clearing-range prefix. Evidence is redacted
+to the leading bank pair (`20-XX-XX`); the branch-identifying pairs never leave
+the tool.
+
+```bash
+$ ferryman --check pii --format text leak.ofx
+  [HIGH] pii/uk_sort_code @ statement[0].transaction[0].memo: UK sort code (valid NN-NN-NN structure and assigned clearing-range prefix) leaking into a free-text field -- discloses the bank/branch routing of an account.
+```
+
+**Remediation:** never echo a customer's sort code into a statement memo or
+transaction name; keep bank/branch routing identifiers in structured,
 access-controlled fields rather than free text.
 
 ## From finding to HackerOne report

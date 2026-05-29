@@ -78,6 +78,12 @@ def bic_file() -> Path:
 
 
 @pytest.fixture
+def uk_sort_code_file() -> Path:
+    """A bank statement leaking valid UK sort codes (NN-NN-NN) in free text."""
+    return FIXTURES / "uk-sort-code-leak.ofx"
+
+
+@pytest.fixture
 def entity_bomb_file() -> Path:
     return FIXTURES / "entity-bomb.ofx"
 

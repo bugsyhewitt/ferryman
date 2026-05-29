@@ -696,6 +696,66 @@ next detector.
 
 ---
 
+## Rank 17 — UK Sort Code Leak Detection, NN-NN-NN structure + clearing-range gated (HIGH signal, low effort) — ✅ IMPLEMENTED (2026-05-29, Phase 2 Rotation 18)
+
+**Status:** Shipped. `checks/pii.py` gained a `_uk_sort_code_valid()` helper that
+gates a UK sort code candidate behind two independent public, dependency-free
+checks: the canonical hyphenated **shape** (exactly `NN-NN-NN` — three
+hyphen-separated pairs of decimal digits) and the assigned **clearing-range
+prefix** (the leading pair must be in the range `01`–`97`; `00` is unassigned and
+`98`/`99` are reserved for the Bank of England / non-clearing and test ranges, so
+the all-zeros and the classic `99-99-99` decoy never validate). A UK sort code has
+no published, self-contained check digit — the VocaLink modulus check that
+validates a sort code requires the paired account number and a weight table — so
+precision comes from the structure plus the clearing-range prefix rather than an
+arithmetic checksum. The `_UK_SORT_CODE_RE` matcher (`\d{2}-\d{2}-\d{2}`,
+non-digit/non-hyphen bounded) keys off the hyphenated presentation, which is the
+dominant precision lever: the hyphens break the token into three two-digit pieces,
+so it is structurally distinct from any contiguous digit run and never competes
+with — nor is double-counted against — the account-number (`\d{8,}`), routing
+(`\d{9}`), or payment-card scanners, and the SSN shape (`NNN-NN-NNNN`, a 3-2-4
+split) cannot collide with it either. Findings are `high` severity; evidence is
+redacted to the leading bank pair via `_redact_uk_sort_code()` (`20-XX-XX`) so the
+branch-identifying pairs never leave the tool. New fixture
+`tests/fixtures/uk-sort-code-leak.ofx` (two valid sort codes in two memos plus a
+reserved `99-99-99` decoy) plus 35 new tests in `tests/test_pii.py` cover the
+validator (real clearing sort codes including the min/max assigned leading pairs,
+unassigned/reserved/out-of-range/wrong-shape rejects, garbage guards), memo
+detection and leading-pair redaction, the reserved-value and all-zeros
+non-detection guards, the contiguous-six-digit non-detection guard, the
+no-interference-with-other-identifiers guard, the no-collision-with-digit-scanners
+guarantee, the SSN-not-misread guard, per-field dedupe, the fixture, and the
+clean-file no-sort-code guarantee. README gained a "UK sort code leak detection"
+section and the PII type lists were updated. No new dependencies (stdlib `re`
+only).
+
+**What:** The pii check covered SSN, payment card (PAN), IBAN, ISIN, CUSIP,
+SEDOL, LEI, BIC, US account number, and US ABA routing number — identifiers
+naming an account, a security, a legal entity, and the institution, plus the
+**US** domestic routing code. The UK sort code is the **UK** domestic routing
+code — the six-digit `NN-NN-NN` value that identifies a bank and branch and that,
+paired with an account number, drives a Faster Payments / BACS / CHAPS transfer.
+A sort code echoed into a transaction memo discloses *which UK bank and branch*
+routes a customer's account; paired with a leaked account number it is the exact
+data a UK wire-fraud or account-takeover attacker needs, making the free-text sort
+code echo the natural domestic-routing companion to the already-shipped ABA
+routing-number detector.
+
+**Research grounding:** The UK sort code's `NN-NN-NN` structure and the assigned
+clearing range (leading pair `01`–`97`, with `00` unassigned and `98`/`99`
+reserved) are public and documented. The full VocaLink modulus check (the only
+arithmetic validation) requires the paired account number and a published weight
+table — out of scope for a single self-contained identifier — so the detector
+gates on the hyphenated structure plus the clearing-range prefix, with the
+hyphenated presentation itself the precision lever against coincidental digit
+runs. ~15 lines of Python with no new dependency. The sort code completes the
+domestic-routing dimension alongside the ABA number: US routing (ABA) and now UK
+routing (sort code).
+
+**Estimated tokens:** 35–50K
+
+---
+
 ## Research notes
 
 **Sources consulted:**

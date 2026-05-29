@@ -17,6 +17,7 @@ from ferryman.checks.pii import (
     _lei_valid,
     _luhn_valid,
     _sedol_valid,
+    _uk_sort_code_valid,
     check_pii,
 )
 
@@ -991,3 +992,146 @@ def test_bic_leak_fixture(bic_file):
 def test_clean_file_no_bic(clean_file):
     findings = check_pii(clean_file.read_bytes())
     assert "bic" not in {f.type for f in findings}
+
+
+# --- UK sort code detection (NN-NN-NN structure + clearing-range gated) ---
+
+# Real, published UK clearing sort codes (public information). Each must pass the
+# hyphenated NN-NN-NN structure and the assigned clearing-range leading-pair gate.
+VALID_UK_SORT_CODES = [
+    "20-00-00",  # Barclays
+    "60-16-13",  # NatWest
+    "40-02-50",  # HSBC
+    "30-00-00",  # Lloyds
+    "09-01-29",  # Santander (leading pair 09 -- low but assigned)
+    "77-91-23",  # Lloyds / TSB family
+    "01-02-03",  # minimum assigned leading pair
+    "97-99-99",  # maximum assigned leading pair
+]
+
+# Strings shaped like a sort code but failing the structure or the assigned
+# clearing-range leading pair -- they must NOT validate.
+INVALID_UK_SORT_CODES = [
+    "00-00-00",  # leading pair 00 is unassigned
+    "00-12-34",  # leading pair 00 is unassigned
+    "98-01-02",  # leading pair 98 is reserved (out of assigned range)
+    "99-99-99",  # leading pair 99 is reserved (the classic test/decoy value)
+    "1-23-45",   # first part not two digits
+    "20-0-00",   # middle part not two digits
+    "20-00-0",   # last part not two digits
+    "200000",    # no hyphens (not the canonical shape)
+    "20-00-00-1",  # four parts -- wrong structure
+]
+
+
+@pytest.mark.parametrize("code", VALID_UK_SORT_CODES)
+def test_uk_sort_code_accepts_real_codes(code):
+    assert _uk_sort_code_valid(code) is True
+
+
+@pytest.mark.parametrize("code", INVALID_UK_SORT_CODES)
+def test_uk_sort_code_rejects_invalid(code):
+    assert _uk_sort_code_valid(code) is False
+
+
+@pytest.mark.parametrize(
+    "bad", ["", "  ", "ab-cd-ef", "20/00/00", "20-00-0X", "----", "20-00"]
+)
+def test_uk_sort_code_rejects_garbage(bad):
+    # Defensive: malformed / non-numeric / wrong-shape input is never a valid
+    # sort code.
+    assert _uk_sort_code_valid(bad) is False
+
+
+def test_uk_sort_code_in_memo_detected():
+    findings = _scan("standing order to sort code 20-00-00 today")
+    codes = [f for f in findings if f.type == "uk_sort_code"]
+    assert len(codes) == 1
+    assert codes[0].severity == "high"
+    assert codes[0].check == "pii"
+    # Only the leading bank pair survives for triage; the branch pairs are masked.
+    assert codes[0].evidence == "20-XX-XX"
+
+
+def test_uk_sort_code_redaction_masks_branch():
+    findings = _scan("beneficiary at 60-16-13 NatWest")
+    codes = [f for f in findings if f.type == "uk_sort_code"]
+    assert len(codes) == 1
+    assert codes[0].evidence == "60-XX-XX"
+    # The branch-identifying pairs never leave the tool.
+    assert "16" not in codes[0].evidence
+    assert "13" not in codes[0].evidence
+
+
+def test_uk_sort_code_reserved_value_not_reported():
+    # 99-99-99 is the reserved/test value: it has the right shape but an
+    # out-of-range leading pair, so it must NOT be reported.
+    findings = _scan("decoy reference 99-99-99 logged")
+    assert "uk_sort_code" not in {f.type for f in findings}
+
+
+def test_uk_sort_code_all_zero_not_reported():
+    findings = _scan("placeholder 00-00-00 in the template")
+    assert "uk_sort_code" not in {f.type for f in findings}
+
+
+def test_contiguous_six_digits_not_a_sort_code():
+    # The hyphenated NN-NN-NN shape is the defining feature: a plain six-digit
+    # run is never reclassified as a sort code.
+    findings = _scan("reference 200000 noted")
+    assert "uk_sort_code" not in {f.type for f in findings}
+
+
+def test_uk_sort_code_does_not_break_other_identifiers():
+    # The hyphenated sort-code scan must not interfere with the other
+    # identifiers when those appear on their own.
+    isin_findings = _scan("US0378331005 holding")
+    assert [f.type for f in isin_findings] == ["isin"]
+    aba_findings = [f for f in _scan("routing 121000248 on file")
+                    if f.type == "routing_number"]
+    assert len(aba_findings) == 1
+
+
+def test_uk_sort_code_does_not_collide_with_digit_scanners():
+    # A sort code's hyphens break the run into three two-digit pieces, so the
+    # 8+/9-digit account/routing scanners never also claim it.
+    findings = _scan("paid via 20-00-00 to the account")
+    types = [f.type for f in findings]
+    assert types.count("uk_sort_code") == 1
+    assert "account_number" not in types
+    assert "routing_number" not in types
+    assert "credit_card" not in types
+
+
+def test_ssn_not_misread_as_sort_code():
+    # An SSN (NNN-NN-NNNN, a 3-2-4 split) is a different shape and must be
+    # reported as an SSN, never as a sort code.
+    findings = _scan("client ssn 123-45-6789 on file")
+    types = {f.type for f in findings}
+    assert "ssn" in types
+    assert "uk_sort_code" not in types
+
+
+def test_same_uk_sort_code_deduped_per_field():
+    findings = _scan("20-00-00 and again 20-00-00 in one memo")
+    codes = [f for f in findings if f.type == "uk_sort_code"]
+    assert len(codes) == 1
+
+
+def test_uk_sort_code_leak_fixture(uk_sort_code_file):
+    findings = check_pii(uk_sort_code_file.read_bytes())
+    codes = [f for f in findings if f.type == "uk_sort_code"]
+    types = {f.type for f in findings}
+    assert "uk_sort_code" in types, f"expected uk_sort_code, got: {types}"
+    # The fixture leaks two valid sort codes in memos; the reserved 99-99-99
+    # decoy must NOT be reported.
+    assert len(codes) == 2
+    assert all(c.severity == "high" for c in codes)
+    for c in codes:
+        # No raw branch pairs remain in the evidence.
+        assert c.evidence.endswith("-XX-XX")
+
+
+def test_clean_file_no_uk_sort_code(clean_file):
+    findings = check_pii(clean_file.read_bytes())
+    assert "uk_sort_code" not in {f.type for f in findings}
