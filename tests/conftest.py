@@ -138,6 +138,12 @@ def br_cpf_file() -> Path:
 
 
 @pytest.fixture
+def mx_curp_file() -> Path:
+    """A bank statement leaking valid Mexican CURPs (18-char identity keys)."""
+    return FIXTURES / "mx-curp-leak.ofx"
+
+
+@pytest.fixture
 def entity_bomb_file() -> Path:
     return FIXTURES / "entity-bomb.ofx"
 

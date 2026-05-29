@@ -1179,6 +1179,81 @@ Public, dependency-free, ~25 lines of Python.
 
 ---
 
+## Rank 26 — Mexican CURP Leak Detection, 18-char structure + birth date + registered state code + mod-10 check-digit gated (HIGH signal, low effort) — ✅ IMPLEMENTED (2026-05-29, Phase 2 Rotation 28)
+
+**Pivot note:** Ranks 1–25 were all shipped. The R26 candidates named in the
+rotation brief were the **Mexican CURP** and the **Russian INN / SNILS**. A fresh
+read of `checks/pii.py` confirmed none of `curp`, `inn`, or `snils` was present.
+All three carry a verifiable checksum, so the choice came down to PII value and
+collision-precision:
+
+- **Russian INN (12-digit individual)** — dual weighted mod-11 check digits, a
+  genuinely strong arithmetic gate, *but* it is a **contiguous 12-digit run** that
+  collides head-on with the generic account-number scanner (`\d{8,}`) and the
+  card matcher (13–19 digits is close), and a bare 12-digit number carries no
+  structural shape beyond the checksum — the same low-distinctiveness problem that
+  kept the Indonesian NIK out at R25. The legal-entity 10-digit INN is even
+  weaker (single check digit).
+- **Russian SNILS** — 9 digits + a 2-digit weighted mod-101 check, again a
+  contiguous run with the same digit-scanner-collision problem, and the
+  ">100 ⇒ 00 / ==100 ⇒ 00" edge-case rule has documented variants.
+- **Mexican CURP was chosen.** It is the strongest *identity*-PII item of the
+  three: the value **encodes the person** (four name initials, full birth date,
+  sex, birth state are all readable from the code itself), so a leak discloses a
+  named individual, not merely an account. Crucially for ferryman's precision bar
+  it has **three independent structural gates on top of the checksum** — the fixed
+  18-character `AAAA NNNNNN S EE CCC X D` layout, a real embedded `YYMMDD` birth
+  date, and a **registered two-letter state code** (the 31 states + `DF` + `NE`),
+  the last of which is the dominant precision lever exactly as the BIC's ISO
+  3166-1 country gate is — plus the public RENAPO **mod-10 check digit** over the
+  base-37 alphabet. Because a CURP **leads with four letters** it is structurally
+  distinct from the Mexican CLABE (18 *digits*), so the two 18-character Mexican
+  identifiers never collide, and its only contiguous digit run (the six-digit
+  birth date) is too short for the account / routing / card scanners. It clears
+  the precision bar on structure *and* checksum — strictly stronger than the bare
+  Russian contiguous-digit candidates.
+
+**Status:** Shipped. `checks/pii.py` gained `_curp_check_digit()` (the RENAPO
+mod-10 over the base-37 alphabet `0123456789ABCDEFGHIJKLMNÑOPQRSTUVWXYZ` with
+descending positional weights `18…2`), `_curp_valid()` (gates on the exact
+18-char `AAAA NNNNNN S EE CCC X D` shape — validated structurally in the helper,
+not only the regex; a real embedded `MM`/`DD` birth date; the registered
+`_CURP_STATES` two-letter code in positions 12–13; and the mod-10 check digit),
+and `_redact_curp()` (evidence redacted to the four leading name initials,
+`HEGGXXXXXXXXXXXXXX`). A new `curp` (high) finding runs in `_scan_text`
+immediately after the CLABE block and reserves every embedded digit run under the
+`account_number` / `credit_card` / `routing_number` dedupe namespaces (the
+six-digit date can never reach the 8+/9/13+ scanners, but the reservation keeps
+the no-double-counting guarantee explicit, exactly as the IFSC / LEI scans do).
+The matcher `_CURP_RE` is **upper-case only** (the precision lever, mirroring the
+BIC / IFSC gates), so a lower-case run in prose is left for the prose. New fixture
+`tests/fixtures/mx-curp-leak.ofx` (two valid CURPs in two memos + one
+wrong-check-digit `HEGG560427MVZRRL09` decoy) plus 27 new test cases cover the
+validator (real-structure CURPs incl. a foreign-born `NE` + letter-homoclave case,
+wrong-check-digit / bad-state / impossible-month / impossible-day / bad-sex /
+digit-name-block rejects, length / wrong-position-type / non-letter-name garbage
+guards), free-text detection, redaction, the wrong-check-digit and bad-state
+non-detection guards, the lower-case non-detection guard, the
+no-collision-with-CLABE guarantee, the no-collision-with-digit-scanners guarantee,
+the no-interference-with-other-identifiers guard, per-field dedupe, the fixture,
+and the clean-file guard. README gained a Mexican CURP section and the type lists
+were updated. The SARIF mapping auto-generates the `pii/curp` rule with no
+changes. No new dependencies (stdlib `re` only). Full suite: 636 passing.
+
+**Research grounding:** Mexican CURP (Clave Única de Registro de Población) — the
+18-character RENAPO-issued population-registry key: four name letters, a `YYMMDD`
+birth date, a sex marker (`H`/`M`), a two-letter birth-state code, three internal
+consonants, a homoclave (a disambiguator — a digit for people born before 2000, a
+letter from 2000 onward), and a mod-10 check digit computed over the first 17
+characters with the base-37 alphabet and descending weights. Unlike a routing /
+account number a CURP is direct *identity* PII — the value names the person — so a
+free-text CURP echo is a reportable Mexican PII disclosure. Public,
+dependency-free, ~30 lines of Python.
+
+**Estimated tokens:** 30–50K
+
+---
+
 ## Research notes
 
 **Sources consulted:**
