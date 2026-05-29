@@ -79,6 +79,14 @@ Detection classes:
                                 number / UK sort code / Canadian routing number, the
                                 value a BSB-and-account payment (BECS / PayTo /
                                 direct entry) routes against.
+- ``ifsc``                    : an Indian Financial System Code (the RBI-defined
+                                11-character ``BBBB0BRANCH`` routing code -- a
+                                four-letter bank code, a mandatory reserved ``0``,
+                                and a six-character alphanumeric branch code) whose
+                                structure validates -- the Indian domestic
+                                equivalent of an ABA routing number / UK sort code /
+                                Australian BSB, the value a NEFT / RTGS / IMPS
+                                payment routes against.
 - ``account_number``          : a long account-number-shaped digit run leaking
                                 into a transaction name/memo.
 - ``routing_number``          : a 9-digit run that passes the ABA weighted
@@ -408,6 +416,28 @@ _AU_BSB_PREFIX_RANGES = (
     (20, 79),  # Reserve Bank / government / other-ADI institution blocks
     (80, 89),  # Cuscal-sponsored mutuals, credit unions, building societies, fintechs
 )
+
+# Indian IFSC (Indian Financial System Code) candidate -- the RBI-defined
+# 11-character routing code that identifies a specific bank branch and is the
+# value a NEFT / RTGS / IMPS / UPI transfer is routed against, the Indian
+# domestic equivalent of an ABA routing number, a UK sort code, an Australian
+# BSB, or a Canadian routing number. Its canonical presentation is
+# ``BBBB0BRANCH``: a four-letter bank code (e.g. ``SBIN`` State Bank of India,
+# ``HDFC``, ``ICIC``, ``PUNB``), a single reserved character that is always
+# ``0`` (set aside by the RBI for future use), and a six-character alphanumeric
+# branch code. The structure is the precision lever: the mandatory zero in the
+# fifth position is a hard structural gate that almost no coincidental 11-char
+# token satisfies, and the match is restricted to UPPER-CASE (an IFSC is always
+# transmitted upper-case, while an 11-character all-letter shape is otherwise
+# easy to collide with ordinary mixed-case prose). The run is bounded by a
+# non-alphanumeric lookaround so an IFSC embedded in a longer alphanumeric blob
+# is not partially matched. The caller validates the full structure before
+# reporting.
+_IFSC_RE = re.compile(
+    r"(?<![A-Za-z0-9])[A-Z]{4}0[A-Z0-9]{6}(?![A-Za-z0-9])"
+)
+# An IFSC is exactly 11 characters (4 bank + 1 reserved zero + 6 branch).
+_IFSC_LEN = 11
 
 
 def _luhn_valid(digits: str) -> bool:
@@ -889,6 +919,53 @@ def _redact_au_bsb(code: str) -> str:
     that pins the leak to a specific branch's routing -- are masked.
     """
     return code[:2] + "X-XXX"
+
+
+def _ifsc_valid(candidate: str) -> bool:
+    """Return ``True`` if a string is a structurally valid Indian IFSC code.
+
+    An IFSC (Indian Financial System Code) is the RBI-defined 11-character code
+    that identifies a specific bank branch -- the value a domestic NEFT / RTGS /
+    IMPS / UPI transfer is routed against, the Indian equivalent of an ABA
+    routing number, a UK sort code, an Australian BSB, or a Canadian routing
+    number. Like those it carries no published, self-contained arithmetic check
+    digit, so precision comes from a strict, public, dependency-free structure:
+
+        1. **Shape** -- exactly 11 characters: ``BBBB0BRANCH``.
+        2. **Bank code** -- the first four characters are letters (the
+           institution code, e.g. ``SBIN``/``HDFC``/``ICIC``).
+        3. **Reserved zero** -- the fifth character is always the digit ``0``
+           (reserved by the RBI for future use). This mandatory zero is the
+           dominant precision lever: almost no coincidental 11-character token
+           carries a ``0`` in exactly the fifth position.
+        4. **Branch code** -- the final six characters are alphanumeric (the
+           branch identifier).
+
+    A run that clears all four gates is a near-certain real IFSC; a coincidental
+    11-character alphanumeric blob fails the reserved-zero or the letter-prefix
+    gate with overwhelming probability. Any malformed input returns ``False`` so
+    the helper is safe to reuse.
+    """
+    code = candidate.strip().upper()
+    if len(code) != _IFSC_LEN:
+        return False
+    if not code[:4].isalpha():
+        return False
+    if code[4] != "0":
+        return False
+    return code[5:].isalnum()
+
+
+def _redact_ifsc(code: str) -> str:
+    """Redact an IFSC, preserving only the four-letter bank code for triage.
+
+    The leading four characters identify the bank (useful context for a report
+    -- ``SBIN`` State Bank of India, ``HDFC``, and so on) while the reserved
+    zero and the six-character branch code -- the part that pins the leak to a
+    specific branch's routing -- are masked.
+    """
+    code = code.upper()
+    return code[:4] + "X" * (len(code) - 4)
 
 
 def _redact_sedol(sedol: str) -> str:
@@ -1405,6 +1482,46 @@ def _scan_text(
                 "discloses the bank/branch routing of an account.",
                 location=location,
                 evidence=_redact_au_bsb(candidate),
+            )
+        )
+
+    # Indian IFSC codes (BBBB0BRANCH) -- the Indian domestic branch-routing code.
+    # An IFSC is an 11-char alphanumeric run that can embed a digit tail in its
+    # branch code, so we check it before the account / card scanners and reserve
+    # those digits so the same leak is never re-reported as a slice. Its
+    # mandatory letter prefix and reserved fifth-position zero make the structure
+    # distinct from the hyphenated routing codes above and from any contiguous
+    # digit run, so the detectors never collide. We gate on the strict structure,
+    # so a coincidental 11-char token is vanishingly unlikely to be reported. An
+    # IFSC echoed into free text discloses the bank/branch routing of an account
+    # -- the Indian-domestic companion to the ABA, UK-sort-code, Canadian-routing,
+    # and Australian-BSB detectors.
+    for m in _IFSC_RE.finditer(text):
+        candidate = m.group(0)
+        if not _ifsc_valid(candidate):
+            continue
+        compact = candidate.upper()
+        key = ("ifsc", compact)
+        if key in seen:
+            continue
+        seen.add(key)
+        # Reserve any digit run inside the IFSC under the account/card/routing
+        # namespaces so the scanners below never re-report a slice of the same
+        # identifier (an IFSC branch code may contain digits).
+        for run in re.findall(r"\d+", compact):
+            seen.add(("account_number", run))
+            seen.add(("credit_card", run))
+            seen.add(("routing_number", run))
+        findings.append(
+            Finding(
+                check="pii",
+                type="ifsc",
+                severity="high",
+                message="Indian Financial System Code (IFSC, valid BBBB0BRANCH "
+                "structure) leaking into a free-text field -- discloses the "
+                "bank/branch routing of an account.",
+                location=location,
+                evidence=_redact_ifsc(compact),
             )
         )
 

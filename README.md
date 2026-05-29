@@ -15,8 +15,9 @@ scanner that treats an OFX file as an attack surface and asks three questions:
   tax IDs), payment-card numbers (PANs), IBANs, securities identifiers
   (ISIN/CUSIP/SEDOL),
   legal-entity identifiers (LEI), bank identifier codes (BIC/SWIFT), UK sort
-  codes, Canadian routing numbers, Australian BSB codes, full account numbers,
-  and routing numbers smuggled into free-text transaction names and memos.
+  codes, Canadian routing numbers, Australian BSB codes, Indian IFSC codes, full
+  account numbers, and routing numbers smuggled into free-text transaction names
+  and memos.
 - **Is this file anomalous?** Out-of-range posting dates, zero / sign-flipped /
   out-of-range transaction amounts, and other signs of tampering or a backend
   that accepts garbage.
@@ -57,8 +58,8 @@ ferryman [--check {malformed,pii,anomaly,all}] [--format {json,text,h1md,sarif}]
     on raw bytes; never parses a hostile file.
   - `pii` &mdash; PII leaking into transaction free-text (email address, SSN,
     ITIN, payment-card number, IBAN, ISIN, CUSIP, SEDOL, LEI, BIC/SWIFT, UK sort
-    code, Canadian routing number, Australian BSB code, account number, routing
-    number), including investment memos and security ids.
+    code, Canadian routing number, Australian BSB code, Indian IFSC code, account
+    number, routing number), including investment memos and security ids.
     Evidence is always redacted before it leaves the tool.
   - `anomaly` &mdash; structurally valid but suspicious transactions
     (out-of-range dates; zero, sign-contradicting, or out-of-range transaction
@@ -740,6 +741,46 @@ $ ferryman --check pii --format text leak.ofx
 ```
 
 **Remediation:** never echo a customer's BSB into a statement memo or transaction
+name; keep bank/branch routing identifiers in structured, access-controlled
+fields rather than free text.
+
+### Indian IFSC code leak detection
+
+An [Indian Financial System Code (IFSC)](https://en.wikipedia.org/wiki/Indian_Financial_System_Code)
+is the RBI-defined eleven-character code that identifies a specific bank branch
+&mdash; the value a domestic NEFT / RTGS / IMPS / UPI transfer is routed against,
+the Indian equivalent of an ABA routing number, a UK sort code, an Australian
+BSB, or a Canadian routing number. It is written `BBBB0BRANCH` (e.g. `SBIN0000123`
+= State Bank of India, `HDFC0001234` = HDFC Bank): a four-letter bank code, a
+single reserved character that is **always `0`**, and a six-character
+alphanumeric branch code. An IFSC echoed into a free-text **memo or transaction
+name** discloses the bank/branch routing of an account. The **pii** check flags an
+`ifsc` finding (severity `high`) when a free-text field contains a string that
+clears the public, dependency-free structural gate:
+
+1. **shape** &mdash; exactly eleven characters: four letters (the bank code), the
+   mandatory reserved `0` in the fifth position, and six alphanumeric branch
+   characters. The mandatory zero is the dominant precision lever: almost no
+   coincidental eleven-character token carries a `0` in exactly the fifth
+   position, and the match is restricted to upper case so an ordinary
+   mixed-case word never collides. The letter prefix plus the digit-in-fifth
+   shape is distinct from the hyphenated routing codes (UK sort `2-2-2`,
+   Canadian `5-3`, Australian BSB `3-3`) and from a BIC (first six characters
+   all letters), so the detectors never collide.
+
+Like the other domestic routing codes, an IFSC carries no published,
+self-contained arithmetic check digit, so precision comes from the strict
+structure. A token with the right letter prefix but no `0` in the fifth position
+(e.g. `HDFCX001234`) is never reported. Evidence is redacted to the four-letter
+bank code (`SBINXXXXXXX`); the reserved zero and the branch code never leave the
+tool.
+
+```bash
+$ ferryman --check pii --format text leak.ofx
+  [HIGH] pii/ifsc @ statement[0].transaction[0].memo: Indian Financial System Code (IFSC, valid BBBB0BRANCH structure) leaking into a free-text field -- discloses the bank/branch routing of an account.
+```
+
+**Remediation:** never echo a customer's IFSC into a statement memo or transaction
 name; keep bank/branch routing identifiers in structured, access-controlled
 fields rather than free text.
 
