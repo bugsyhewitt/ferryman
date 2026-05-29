@@ -943,6 +943,55 @@ NEFT / RTGS / IMPS / UPI transfer routes against, paired with an account number.
 
 ---
 
+## Rank 22 — Mexican CLABE Leak Detection, 18-digit structure + mod-10 control-digit gated (HIGH signal, low effort) — ✅ IMPLEMENTED (2026-05-29, Phase 2 Rotation 24)
+
+**Pivot note:** Ranks 1–21 were all shipped. The suggested R24 candidates were
+the **Mexican CLABE** and the **Japanese Zengin** bank codes. A fresh read of
+`checks/pii.py` confirmed neither was present. The CLABE was chosen over the
+Zengin code: a CLABE carries a public, self-contained mod-10 control digit (a
+real arithmetic checksum, on a par with the IBAN / ABA / Luhn-gated detectors
+already shipped), whereas a Japanese Zengin code (4-digit bank + 3-digit branch)
+is short, has no self-contained check digit, and the bare 4/3-digit runs are too
+collision-prone to detect with the precision ferryman holds itself to. The CLABE
+is the highest-value, highest-precision unimplemented item.
+
+**Status:** Shipped. `checks/pii.py` gained `_clabe_valid()` (gates on the
+18-digit shape, a non-zero three-digit bank code — `000` is never assigned — and
+the public mod-10 weighted control digit: each of the first 17 digits times the
+repeating weights `(3, 7, 1)`, each product taken mod 10, summed, control digit
+`(10 - sum mod 10) mod 10`) and `_redact_clabe()` (evidence redacted to the
+leading three-digit bank code, `002XXXXXXXXXXXXXXX`). A new `clabe` (high)
+finding runs in `_scan_text` **before** the credit-card (13–19 digit) and the
+account-number (8+ digit) scanners — a CLABE is a contiguous 18-digit run, so
+unlike the hyphenated routing codes it would otherwise be claimed by those
+scanners — and reserves the run under the `credit_card` / `account_number` /
+`routing_number` dedupe namespaces so the same leak is never double-counted. An
+18-digit run that fails the control digit is not a CLABE but still falls through
+to the `account_number` finding, so no leak is silently dropped. New fixture
+`tests/fixtures/clabe-leak.ofx` (two valid CLABEs in two memos + one
+wrong-control-digit decoy) plus 25 new test cases cover the validator (real-format
+CLABEs across several bank codes, wrong-control-digit / zero-bank-code / all-ones
+/ sequential rejects, wrong-length and garbage guards), free-text detection,
+redaction, the wrong-control-digit and zero-bank-code non-detection guards, the
+no-collision-with-digit-scanners guarantee, the invalid-CLABE-still-an-account
+guarantee, the no-interference-with-other-identifiers guard, per-field dedupe,
+the fixture, and the clean-file guard. README gained a Mexican CLABE section and
+the type lists were updated. The SARIF mapping auto-generates the `pii/clabe`
+rule with no changes. No new dependencies (stdlib `re` only). Test count
+496 → 521.
+
+**Research grounding:** Banxico CLABE specification — an 18-digit code,
+`BBBPPPNNNNNNNNNNNC`: a three-digit bank/institution code, a three-digit
+branch/plaza code, an eleven-digit account number, and one control digit. The
+control digit is a public mod-10 weighted check (weights `3,7,1` repeating, each
+product reduced mod 10) — public, dependency-free, ~12 lines of Python. It is the
+single value needed to route a domestic SPEI transfer into an account, so a
+free-text CLABE echo is a reportable Mexican bank-account disclosure.
+
+**Estimated tokens:** 30–50K
+
+---
+
 ## Research notes
 
 **Sources consulted:**

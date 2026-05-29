@@ -114,6 +114,12 @@ def ifsc_file() -> Path:
 
 
 @pytest.fixture
+def clabe_file() -> Path:
+    """A bank statement leaking valid Mexican CLABE numbers (18-digit) in free text."""
+    return FIXTURES / "clabe-leak.ofx"
+
+
+@pytest.fixture
 def entity_bomb_file() -> Path:
     return FIXTURES / "entity-bomb.ofx"
 
