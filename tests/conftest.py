@@ -156,6 +156,12 @@ def tr_tckn_file() -> Path:
 
 
 @pytest.fixture
+def no_fnr_file() -> Path:
+    """A bank statement leaking valid Norwegian fødselsnummer (11-digit IDs)."""
+    return FIXTURES / "no-fnr-leak.ofx"
+
+
+@pytest.fixture
 def entity_bomb_file() -> Path:
     return FIXTURES / "entity-bomb.ofx"
 
