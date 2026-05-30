@@ -21,7 +21,8 @@ scanner that treats an OFX file as an attack surface and asks three questions:
   identity keys), South Korean RRNs (resident-registration identity numbers),
   Turkish TCKNs (national identification numbers), Norwegian fødselsnummer
   (national identity numbers), Finnish HETUs (henkilötunnus personal identity
-  codes), Swedish personnummer (national identification numbers), full
+  codes), Swedish personnummer (national identification numbers), Swiss AHV / AVS
+  social-security numbers, full
   account numbers, and routing numbers smuggled into free-text transaction names
   and memos.
 - **Is this file anomalous?** Out-of-range posting dates, zero / sign-flipped /
@@ -67,7 +68,7 @@ ferryman [--check {malformed,pii,anomaly,all}] [--format {json,text,h1md,sarif}]
     code, Canadian routing number, Australian BSB code, Indian IFSC code, Mexican
     CLABE, South Korean Giro number, Thai national ID, Brazilian CPF, Mexican
     CURP, South Korean RRN, Turkish TCKN, Norwegian fødselsnummer, Finnish
-    HETU, Swedish personnummer, account number, routing number), including
+    HETU, Swedish personnummer, Swiss AHV, account number, routing number), including
     investment memos and security ids.
     Evidence is always redacted before it leaves the tool.
   - `anomaly` &mdash; structurally valid but suspicious transactions
@@ -1285,6 +1286,63 @@ $ ferryman --check pii --format text leak.ofx
 
 **Remediation:** never echo a customer's personnummer into a statement memo
 or transaction name; keep national identity codes in structured,
+access-controlled fields rather than free text.
+
+### Swiss AHV / AVS social-security number leak detection
+
+A [Swiss AHV / AVS number](https://en.wikipedia.org/wiki/Swiss_social_security_card)
+(Alters- und Hinterlassenenversicherung / assurance-vieillesse et survivants)
+is the 13-digit national social-insurance number every Swiss resident is
+issued &mdash; the master personal identifier keying AHV/AVS old-age and
+survivors insurance, tax, healthcare, and government services, on a par with
+the Norwegian fødselsnummer, the Finnish HETU, the Swedish personnummer, and
+the Turkish TCKN. An AHV echoed into free text discloses a named individual
+(the value keys the AHV social-insurance register, the tax register, and
+healthcare records). Its canonical printed form is `756.XXXX.XXXX.XX`: a
+mandatory three-digit Swiss country prefix `756` (the only assigned AHV
+country code), four digits, four digits, and a two-digit tail whose second
+digit is the public EAN-13 mod-10 check digit over the first twelve. A Swiss
+AHV echoed into a free-text **memo or transaction name** is a direct Swiss
+identity-PII leak. The **pii** check flags a `ch_ahv` finding (severity
+`high`) when a free-text field contains a string that clears three public,
+dependency-free gates:
+
+1. **shape** &mdash; exactly `756.XXXX.XXXX.XX`: thirteen decimal digits in
+   the 3.4.4.2 dotted grouping. The dotted layout is itself a precision
+   lever: the only other `.`-separated detector in this module is the
+   Brazilian CPF (`NNN.NNN.NNN-NN`, 3.3.3-2 dotted-and-dashed), so the two
+   never collide; the dotted shape is otherwise distinct from every
+   hyphenated detector and from any contiguous digit run.
+2. **mandatory `756` country prefix** &mdash; the first three digits must be
+   `756` (the Swiss country code; no other prefix is assigned in the AHV
+   register). A token with any other leading triple is never a live AHV
+   &mdash; the dominant precision lever, mirroring the BIC's ISO 3166-1
+   country gate and the IFSC's mandatory `0` in position 5.
+3. **EAN-13 check digit** &mdash; multiply each of the first twelve digits
+   by the repeating weights `(1, 3, 1, 3, ...)`, sum the products, and the
+   thirteenth digit must equal `(10 - (sum mod 10)) mod 10`.
+
+Unlike the contiguous TCKN / fødselsnummer, the AHV's dotted shape plus the
+mandatory `756` prefix plus the EAN-13 check gives roughly a 1/10000
+random-token pass rate &mdash; tighter than the Swedish personnummer's
+Luhn-only ~1/1000 &mdash; so a coincidental token is vanishingly unlikely
+to be reported. The 13-digit compact form (after stripping dots) sits
+exactly on the credit-card scanner's 13-digit floor, so the AHV scan runs
+**before** the card / account / routing scanners and reserves the run under
+those namespaces &mdash; the same pattern the CLABE / TCKN / Thai national
+ID scans use to guarantee a valid AHV is reported once as the identity it
+is rather than being double-counted as a card or a plain account-number
+run. Evidence is redacted to the `756` country prefix only
+(`756.XXXX.XXXX.XX`); the ten identity-bearing digits and the check digit
+never leave the tool.
+
+```bash
+$ ferryman --check pii --format text leak.ofx
+  [HIGH] pii/ch_ahv @ statement[0].transaction[0].memo: Swiss AHV / AVS social-security number (valid 756.XXXX.XXXX.XX structure, mandatory 756 country prefix, and EAN-13 mod-10 check digit) leaking into a free-text field -- discloses a named individual's identity.
+```
+
+**Remediation:** never echo a customer's AHV / AVS number into a statement
+memo or transaction name; keep social-insurance identifiers in structured,
 access-controlled fields rather than free text.
 
 ## From finding to HackerOne report

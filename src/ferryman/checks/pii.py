@@ -232,6 +232,29 @@ Detection classes:
                                 never both fire on the same token. The Luhn +
                                 date + non-zero-NNN triple gate gives roughly
                                 a 1/1000 random-token pass rate.
+- ``ch_ahv``                  : a Swiss AHV / AVS social-security number -- the
+                                13-digit national social-insurance number every
+                                Swiss resident is issued (used for AHV/AVS
+                                old-age and survivors insurance, tax, healthcare,
+                                and government services), in its canonical
+                                ``756.XXXX.XXXX.XX`` (3.4.4.2 dotted) form
+                                (mandatory ``756`` country prefix -- the Swiss
+                                ISO 6166-style code -- followed by ten digits,
+                                the last of which is the public EAN-13 mod-10
+                                check digit) -- whose dotted structure, ``756``
+                                country prefix, and EAN-13 check digit all
+                                validate, a near-certain Swiss identity-PII
+                                leak. The 3.4.4.2 dotted shape uses ``.``
+                                separators in a layout distinct from the
+                                Brazilian CPF's 3.3.3-2 dotted-and-dashed form
+                                (the only other ``.``-separated detector in
+                                this module), so the two never collide; the
+                                mandatory ``756`` prefix gates out any other
+                                13-digit dotted token. The compact 13-digit
+                                run is reserved under the card / account /
+                                routing namespaces so a valid AHV is reported
+                                once as the identity it is rather than being
+                                double-counted as a card or generic digit run.
 - ``tr_tckn``                 : a Turkish T.C. Kimlik Numarasi (TCKN) -- the
                                 11-digit national identification number every
                                 Turkish citizen carries -- whose non-zero leading
@@ -914,6 +937,38 @@ _SE_PNR_LEN = 11
 # two-symbol set is a structural precision lever; any other character is never
 # a live personnummer.
 _SE_PNR_SEPARATORS = frozenset("-+")
+
+# Swiss AHV (Alters- und Hinterlassenenversicherung) / AVS (assurance-vieillesse
+# et survivants) social-security number candidate -- the 13-digit national
+# social-insurance number every Swiss resident is issued, in its canonical
+# dotted printed form ``756.XXXX.XXXX.XX``: the mandatory three-digit country
+# prefix ``756`` (the Swiss code in the ISO 6166-style numbering system used by
+# the AHV register), then four digits, then four digits, then two digits whose
+# final digit is the public EAN-13 mod-10 check digit computed over the first
+# twelve.
+#
+# The candidate window keys off the dotted 3-4-4-2 shape: ``756`` followed by
+# three dot-separated groups (4, 4, and 2 digits). The mandatory ``756``
+# prefix is the dominant precision lever (only Swiss AHV numbers begin with
+# ``756``); the dotted layout is otherwise distinct from every other detector
+# in this module -- the only other ``.``-separated detector is the Brazilian
+# CPF (``NNN.NNN.NNN-NN``, 3.3.3-2 with a trailing dash, never a 3.4.4.2 all-
+# dotted shape), so the two never collide. The run is bounded by a
+# non-digit/non-dot lookaround so an AHV embedded in a longer digit-and-dot
+# blob is not partially matched. The caller validates the structure, the
+# mandatory ``756`` prefix, AND the public EAN-13 mod-10 check digit before
+# reporting -- a real arithmetic checksum on a par with the CPF / CLABE /
+# Luhn / personnummer-gated identifiers.
+_CH_AHV_RE = re.compile(
+    r"(?<![\d.])756\.\d{4}\.\d{4}\.\d{2}(?![\d.])"
+)
+# A Swiss AHV number is exactly 13 digits.
+_CH_AHV_LEN = 13
+# EAN-13 check-digit weights, applied positionally to the first twelve digits.
+# The thirteenth digit is the check digit being verified.
+_CH_AHV_WEIGHTS = (1, 3, 1, 3, 1, 3, 1, 3, 1, 3, 1, 3)
+# The mandatory Swiss country prefix every AHV begins with.
+_CH_AHV_PREFIX = "756"
 
 
 def _curp_check_digit(first17: str) -> int:
@@ -2115,6 +2170,76 @@ def _redact_se_pnr(code: str) -> str:
     return "XXXXXX" + code[6] + "XXXX"
 
 
+def _ch_ahv_valid(candidate: str) -> bool:
+    """Return ``True`` if a string is a structurally valid Swiss AHV number.
+
+    A Swiss AHV (Alters- und Hinterlassenenversicherung) / AVS
+    (assurance-vieillesse et survivants) number is the 13-digit national
+    social-insurance number every Swiss resident is issued -- the master
+    personal identifier keying social insurance, tax, healthcare, and
+    government services, on a par with the US SSN, Norwegian fødselsnummer,
+    Finnish HETU, Swedish personnummer, and Turkish TCKN. The canonical
+    printed form is ``756.XXXX.XXXX.XX``::
+
+        756                 mandatory Swiss country prefix (the only assigned
+                            prefix in the AHV register)
+            XXXX            four digits (a randomly assigned identity block,
+                            with no embedded date or name information --
+                            unlike the German Steuer-ID this is privacy-
+                            preserving by construction)
+                XXXX        four more random identity digits
+                    XX      two-digit tail, the second of which is the EAN-13
+                            mod-10 check digit over the first twelve digits
+
+    Precision comes from three public, dependency-free gates:
+
+        1. **Shape** -- exactly 13 decimal digits in the 3.4.4.2 dotted
+           printed form. After stripping dots the value is exactly 13 digits.
+        2. **Mandatory country prefix** -- the first three digits must be
+           ``756`` (the Swiss code; no other prefix is assigned). A token with
+           any other leading triple is never a live AHV -- the dominant
+           precision lever, mirroring the BIC's ISO 3166-1 country gate and
+           the IFSC's mandatory ``0`` in position 5.
+        3. **EAN-13 mod-10 check digit** -- multiply each of the first twelve
+           digits by the repeating weights ``(1, 3, 1, 3, ...)``, sum the
+           products, and the thirteenth digit must equal
+           ``(10 - (sum mod 10)) mod 10``. The EAN-13 check has a ~1/10
+           random-token pass rate on its own, so the combination of the
+           ``756`` gate and the EAN-13 gives roughly a 1/10000 random-token
+           pass rate -- tighter than the Swedish personnummer's Luhn-only
+           ~1/1000.
+
+    A run that clears all three gates is a near-certain real AHV; a
+    coincidental ``756.NNNN.NNNN.NN`` token fails the EAN-13 check with
+    overwhelming probability. Any malformed input returns ``False`` so the
+    helper is safe to reuse.
+    """
+    ahv = candidate.strip()
+    digits = ahv.replace(".", "")
+    if len(digits) != _CH_AHV_LEN or not digits.isdigit():
+        return False
+    if not digits.startswith(_CH_AHV_PREFIX):
+        return False
+    total = sum(w * int(d) for w, d in zip(_CH_AHV_WEIGHTS, digits[:12]))
+    expected = (10 - (total % 10)) % 10
+    return int(digits[12]) == expected
+
+
+def _redact_ch_ahv(code: str) -> str:
+    """Redact a Swiss AHV number, preserving only the ``756`` country prefix.
+
+    The leading three-digit country prefix survives so a report retains a
+    coarse jurisdictional triage hint (every AHV begins with ``756``, so
+    this leaks nothing identifying), while the ten identity digits and the
+    EAN-13 check digit -- the part that pins the leak to a specific
+    identified person -- are masked. The dotted 3.4.4.2 shape is preserved
+    so the masked form still reads as an AHV::
+
+        756.1234.5678.97 -> 756.XXXX.XXXX.XX
+    """
+    return "756.XXXX.XXXX.XX"
+
+
 def _tr_tckn_valid(candidate: str) -> bool:
     """Return ``True`` if a string is a structurally valid Turkish TCKN.
 
@@ -3138,6 +3263,62 @@ def _scan_text(
                 "named individual's identity and birth date.",
                 location=location,
                 evidence=_redact_se_pnr(candidate),
+            )
+        )
+
+    # Swiss AHV / AVS social-security numbers (756.XXXX.XXXX.XX, the canonical
+    # 13-digit dotted form with a mandatory 756 country prefix and a trailing
+    # EAN-13 mod-10 check digit) -- the master Swiss personal identifier and a
+    # direct, high-value identity-PII leak class on a par with the SSN,
+    # personnummer, fødselsnummer, HETU, TCKN, RRN, CURP, and CPF detectors.
+    # The dotted 3-4-4-2 shape with a mandatory 756 prefix is structurally
+    # distinct from every other detector: the only other ``.``-separated
+    # detector is the Brazilian CPF (3.3.3-2 with a trailing dash), so the
+    # two never collide; the 756 prefix gates out any other 13-digit dotted
+    # token. The compact 13-digit run inside the AHV would also be claimed by
+    # the credit-card scanner (the card scanner's 13-digit floor matches), so
+    # we run the AHV scan BEFORE the card scanner and reserve the underlying
+    # digit run under the account / card / routing namespaces -- the same
+    # pattern the CLABE / TCKN / Thai national ID scans use to guarantee a
+    # valid AHV is reported once as the identity it is rather than double-
+    # counted as a card or a plain account number. A Swiss AHV echoed into
+    # free text discloses a named individual's identity (the value keys the
+    # AHV social-insurance register, the tax register, and healthcare
+    # records), reportable on its own.
+    for m in _CH_AHV_RE.finditer(text):
+        candidate = m.group(0)
+        if not _ch_ahv_valid(candidate):
+            continue
+        key = ("ch_ahv", candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        # Reserve the underlying 13-digit run (and every contiguous digit run
+        # inside the dotted token) under the account / card / routing
+        # namespaces so the scanners below never re-report a slice of the same
+        # AHV. The 13-digit compact form sits exactly on the card scanner's
+        # 13-digit floor, so this reservation is load-bearing -- without it a
+        # valid AHV would also be reported as a Luhn-passing credit_card on
+        # the (rare) tokens where the compact digits happen to pass Luhn.
+        compact = candidate.replace(".", "")
+        seen.add(("account_number", compact))
+        seen.add(("credit_card", compact))
+        seen.add(("routing_number", compact))
+        for run in re.findall(r"\d+", candidate):
+            seen.add(("account_number", run))
+            seen.add(("credit_card", run))
+            seen.add(("routing_number", run))
+        findings.append(
+            Finding(
+                check="pii",
+                type="ch_ahv",
+                severity="high",
+                message="Swiss AHV / AVS social-security number (valid "
+                "756.XXXX.XXXX.XX structure, mandatory 756 country prefix, "
+                "and EAN-13 mod-10 check digit) leaking into a free-text "
+                "field -- discloses a named individual's identity.",
+                location=location,
+                evidence=_redact_ch_ahv(candidate),
             )
         )
 
