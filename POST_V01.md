@@ -1523,3 +1523,101 @@ birth date.
   two fintech vulnerability classes — maps directly to ferryman's PII and malformed checks.
 - Fintech PII API breach case studies (2025): confirms that account numbers in API responses /
   transaction exports are the most common leak class in active bug-bounty programs.
+
+---
+
+## Rank 30 — Finnish HETU Leak Detection, DDMMYYCNNNK structure + century separator + mod-31 check-character gated (HIGH signal, low effort) — ✅ IMPLEMENTED (2026-05-29, Phase 2 Rotation 32)
+
+**Pivot note:** Ranks 1–29 were all shipped. The R30 rotation brief named the
+**Swedish personnummer** and the **Finnish HETU** as the two national-ID
+candidates (the Argentine DNI re-confirmed deferred on the no-checksum
+precision bar from R28/R29, the Danish CPR deferred on the post-2007 abolished
+checksum from R29). A fresh read of `checks/pii.py` confirmed neither
+`fi_hetu` nor `personnummer` was present. Both carry a verifiable checksum
+and both are direct identity PII, so the choice came down to ferryman's
+dominant precision criterion — **checksum and structural distinctiveness**:
+
+- **Swedish personnummer** carries a single Luhn check digit (the same scheme
+  the credit-card detector uses) on the nine digits of `YYMMDD-NNNC`, giving
+  roughly a 1/100 random-token pass rate when combined with the embedded
+  birth date. The hyphenated 6-4 split is distinct from the other hyphenated
+  detectors (the SSN's 3-2-4, the UK sort code's 2-2-2, the CA routing 5-3,
+  the AU BSB 3-3, the KR Giro 5-2, the KR RRN 6-7, the TH national ID
+  1-4-5-2-1), so the shape clears the structural precision lever — but the
+  Luhn checksum is the weaker of the two arithmetic gates available in this
+  rotation.
+- **Finnish HETU was chosen.** It carries a **mod-31** check character (a
+  31-symbol alphabet drawn from `0123456789ABCDEFHJKLMNPRSTUVWXY`, with `G`,
+  `I`, `O`, `Q`, `Z` deliberately omitted to avoid visual confusion) — a
+  stricter arithmetic gate than the personnummer's Luhn (1/31 ≈ 3.2% vs
+  1/10 ≈ 10% pass rate before the date gate). On top of that the HETU has
+  TWO additional structural levers neither the personnummer nor the
+  fødselsnummer / TCKN have: a **non-digit century separator** in position 7
+  (`+` for the 1800s, `-` / `Y` / `X` / `W` / `V` / `U` for the 1900s,
+  `A` / `B` / `C` / `D` / `E` / `F` for the 2000s — every other character
+  is rejected outright) and a **mostly-letter check character** in
+  position 11. The non-digit separator makes the candidate window
+  structurally disjoint from any contiguous-digit detector, so the HETU never
+  competes with the card / account / routing scanners and the three identity
+  detectors (`no_fnr`, `tr_tckn`, `fi_hetu`) never collide. Triple structural
+  gate (shape + date + assigned separator) plus the mod-31 check gives
+  roughly a 1/300 random-token pass rate — strictly stronger than the
+  personnummer's ~1/100. Identity-PII value is comparable (the HETU is the
+  master personal identifier in Finland, keying banking, tax, healthcare, and
+  government services).
+
+**Status:** Shipped. `checks/pii.py` gained `_fi_hetu_valid()` (gates on the
+exact `DDMMYYCNNNK` 11-character shape; a real embedded `DD`/`MM` birth date;
+the assigned century separator at position 7; and the public mod-31 check
+character — treat the nine `DDMMYY + NNN` digits as a single integer, the
+trailing check character must be `alphabet[integer mod 31]`) and
+`_redact_fi_hetu()` (evidence redacted to the century separator only,
+`XXXXXX-XXXX` for a 1900s HETU, `XXXXXXAXXXX` for a 2000s one, so a report
+retains a coarse cohort triage hint while the birth date, individual number,
+and check character never leave the tool). A new `fi_hetu` (high) finding
+runs in `_scan_text` immediately before the Turkish TCKN block. Because the
+HETU's century separator is a non-digit, its `_FI_HETU_RE` candidate window
+is structurally disjoint from the contiguous 11-digit `_TR_TCKN_RE` /
+`_no_fnr` candidate window — so no precedence trick is needed, the three
+detectors simply never see each other's tokens. The matcher is **upper-case
+only** (the precision lever, mirroring the BIC / IFSC / CURP gates), so a
+lower-case run in prose is left for the prose. Reservations are made under
+the `account_number` / `credit_card` / `routing_number` namespaces for every
+digit run inside the HETU (defensive, matching how the CURP / IFSC / LEI
+scans reserve their embedded digits), even though the contiguous-digit
+floors (8+/9/13+) cannot match the HETU's short embedded date or individual
+number on their own. New fixture `tests/fixtures/fi-hetu-leak.ofx` (two
+valid HETUs in two memos — one 1900s, one 2000s — plus one
+wrong-check-character `131052-3089` decoy) plus 44 new test cases cover the
+validator (real-structure HETUs across the 1800s/1900s/2000s separator
+classes incl. boundary cases, wrong-check-character / excluded-letter
+(G/I/O/Q/Z) / bad-date / bad-separator / wrong-length rejects, lowercase
+helper acceptance), free-text detection, redaction, the upper-case-only
+detection guarantee, the wrong-check-character non-detection guard, the
+excluded-letter non-detection guard for all five forbidden letters, the
+bad-date non-detection guard, the no-collision-with-digit-scanners guarantee,
+the no-collision-with-fødselsnummer/TCKN guarantee, the
+no-collision-with-other-hyphenated-detectors guarantee, the
+no-interference-with-other-identifiers guard, per-field dedupe, the fixture,
+and the clean-file guard. README gained a Finnish HETU section and the two
+type-summary lists were updated. The SARIF mapping auto-generates the
+`pii/fi_hetu` rule with no changes. No new dependencies (stdlib `re` only).
+Full suite: 726 → 770 passing.
+
+**Research grounding:** Finnish HETU (henkilötunnus, "personal identity
+code") administered by the Digital and Population Data Services Agency
+(Digi- ja väestötietovirasto) — an 11-character national identification code,
+`DDMMYYCNNNK`: a six-digit birth date, a single century separator, a
+three-digit individual number (odd=male, even=female), and a single trailing
+check character drawn from a 31-symbol alphabet. The check character is
+computed via `alphabet[int(DDMMYY + NNN) mod 31]`. The 31-symbol alphabet
+(`0123456789ABCDEFHJKLMNPRSTUVWXY`) and the assigned century separators
+(`+` for 1800s, `-` / `Y` / `X` / `W` / `V` / `U` for 1900s, `A` / `B` / `C`
+/ `D` / `E` / `F` for 2000s — the letter separators were added in 2023 to
+extend the namespace beyond the original `-`/`+`) are publicly documented and
+dependency-free, ~15 lines of Python. The HETU is the master personal
+identifier in Finland, keying banking, tax, healthcare, and government
+services, so a free-text echo is a reportable Finnish PII disclosure that
+names the individual and their exact birth date.
+
+**Estimated tokens:** 30–50K

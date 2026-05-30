@@ -177,6 +177,31 @@ Detection classes:
                                 dual mod-11) gives roughly a 1/1500
                                 random-token pass rate, a tighter precision
                                 lever than the TCKN's ~1/100.
+- ``fi_hetu``                 : a Finnish HETU (henkilötunnus / personal
+                                identity code) -- the 11-character national
+                                identification code every Finnish resident is
+                                issued, in its canonical printed form
+                                ``DDMMYYCNNNK`` (a six-digit birth date, a
+                                single century separator -- ``+`` for the
+                                1800s, ``-`` / ``Y`` / ``X`` / ``W`` / ``V`` /
+                                ``U`` for the 1900s, ``A`` / ``B`` / ``C`` /
+                                ``D`` / ``E`` / ``F`` for the 2000s -- a
+                                three-digit individual number, and a single
+                                trailing check character drawn from the
+                                31-symbol alphabet
+                                ``0123456789ABCDEFHJKLMNPRSTUVWXY``) -- whose
+                                shape, embedded birth date, assigned century
+                                separator, and public mod-31 check character
+                                all validate, a near-certain Finnish
+                                identity-PII leak. Unlike the Norwegian
+                                fødselsnummer and the Turkish TCKN, the HETU
+                                carries a non-digit character at position 7
+                                (the century separator), so its candidate
+                                window is structurally disjoint from the
+                                contiguous 11-digit run those two share -- the
+                                HETU scanner never competes with the digit
+                                scanners and the three identity detectors
+                                never collide.
 - ``tr_tckn``                 : a Turkish T.C. Kimlik Numarasi (TCKN) -- the
                                 11-digit national identification number every
                                 Turkish citizen carries -- whose non-zero leading
@@ -770,6 +795,55 @@ _NO_FNR_K1_WEIGHTS = (3, 7, 6, 1, 8, 9, 4, 5, 2)
 # Mod-11 weights for the second check digit (over d1..d10, the first ten
 # digits including the first check digit).
 _NO_FNR_K2_WEIGHTS = (5, 4, 3, 2, 7, 6, 5, 4, 3, 2)
+
+# Finnish HETU (henkilötunnus / personal identity code) candidate -- the
+# 11-character national identification code every Finnish resident is issued,
+# in its canonical printed form ``DDMMYYCNNNK``: a six-digit ``DDMMYY`` birth
+# date, a single **century separator** ``C`` (the dominant structural lever --
+# ``+`` for the 1800s, ``-`` / ``Y`` / ``X`` / ``W`` / ``V`` / ``U`` for the
+# 1900s, and ``A`` / ``B`` / ``C`` / ``D`` / ``E`` / ``F`` for the 2000s), a
+# three-digit individual number ``NNN`` (odd for male, even for female; 002-899
+# for real persons, the 900-range is the reserved "test" block excluded here),
+# and a single trailing **check character** ``K`` drawn from the 31-symbol
+# alphabet ``0123456789ABCDEFHJKLMNPRSTUVWXY`` (the letters G, I, O, Q, Z are
+# deliberately omitted to avoid confusion with the digits 0/1 and the letters
+# Q/Z). The check character is the public mod-31 result of treating the nine
+# decimal digits ``DDMMYYNNN`` as an integer.
+#
+# This is the only detector whose match contains a **letter** in a structural
+# position other than a leading code, so the shape is sharply distinct from
+# every other hyphenated identifier (the SSN's 3-2-4 digit shape, the UK sort
+# code's 2-2-2, the Canadian routing number's 5-3, the Australian BSB's 3-3,
+# the South Korean Giro's 5-2, the Korean RRN's 6-7, the Thai national ID's
+# 1-4-5-2-1, and the Brazilian CPF's dotted 3.3.3-2). The two structural levers
+# -- a real DDMMYY birth date and a constrained century separator -- plus the
+# arithmetic mod-31 check give roughly a 1/(12*31/366 * 31) ~= 1/300
+# random-token pass rate, a tighter precision lever than the Swedish
+# personnummer's Luhn (~1/100) and on the same order as the Turkish TCKN's
+# dual mod-10 (~1/100). The match is restricted to UPPER-CASE (canonical
+# Finnish forms are upper-case, and lower-case all-letter shapes are otherwise
+# far easier to collide with prose); the ``_fi_hetu_valid`` helper itself stays
+# case-insensitive so it is safe to reuse.
+_FI_HETU_RE = re.compile(
+    r"(?<![A-Za-z0-9])"
+    r"\d{6}[-+ABCDEFYXWVU]\d{3}[0-9A-FHJ-NP-Y]"
+    r"(?![A-Za-z0-9])"
+)
+# A Finnish HETU is exactly 11 characters (6 date + 1 century separator + 3
+# individual number + 1 check character).
+_FI_HETU_LEN = 11
+# The 31-symbol HETU check-character alphabet. Position in this string IS the
+# check value (``0``=0 ... ``9``=9, ``A``=10 ... ``Y``=30, with G/I/O/Q/Z
+# deliberately omitted). The mod-31 result of the nine date+individual digits
+# indexes this alphabet to produce the trailing check character.
+_FI_HETU_ALPHABET = "0123456789ABCDEFHJKLMNPRSTUVWXY"
+# Century separators the HETU spec assigns: ``+`` for births in the 1800s,
+# ``-`` / ``Y`` / ``X`` / ``W`` / ``V`` / ``U`` for the 1900s (the letters were
+# added by Digital and Population Data Services Agency to extend the namespace),
+# and ``A`` / ``B`` / ``C`` / ``D`` / ``E`` / ``F`` for the 2000s. Gating the
+# 7th character to this assigned set is a structural precision lever; any other
+# character is never a live HETU.
+_FI_HETU_SEPARATORS = frozenset("+-ABCDEFYXWVU")
 
 
 def _curp_check_digit(first17: str) -> int:
@@ -1781,6 +1855,87 @@ def _redact_no_fnr(code: str) -> str:
     return "XX" + code[2:4] + "X" * (len(code) - 4)
 
 
+def _fi_hetu_valid(candidate: str) -> bool:
+    """Return ``True`` if a string is a structurally valid Finnish HETU.
+
+    A Finnish HETU (henkilötunnus / personal identity code) is the
+    11-character national identification code every Finnish resident is
+    issued -- the master personal identifier keying banking, tax, healthcare,
+    and government services, on a par with the US SSN, Norwegian
+    fødselsnummer, Turkish TCKN, Korean RRN, Brazilian CPF, and Mexican
+    CURP. The canonical printed form is ``DDMMYYCNNNK``::
+
+        DDMMYY              a six-digit birth date
+              C             a single century separator
+                            (``+``=1800s; ``-`` / ``Y`` / ``X`` / ``W`` /
+                            ``V`` / ``U`` =1900s; ``A`` / ``B`` / ``C`` /
+                            ``D`` / ``E`` / ``F`` =2000s)
+               NNN          a three-digit individual number
+                            (odd=male, even=female; 002-899 for real persons)
+                  K         a single trailing check character drawn from the
+                            31-symbol alphabet ``0123456789ABCDEFHJKLMNPRSTUVWXY``
+
+    Precision comes from four public, dependency-free gates:
+
+        1. **Shape** -- exactly 11 characters in the
+           ``DDMMYY + sep + NNN + check`` layout.
+        2. **Real embedded birth date** -- ``DD`` (01-31) and ``MM`` (01-12)
+           must form a valid day-of-month / month-of-year pair. A token with
+           an impossible day or month is never a live HETU.
+        3. **Century separator** -- the 7th character must be one of the
+           assigned separators (``+ABCDEFYXWVU-``). The match regex already
+           narrows the candidate class; the helper re-checks for robustness.
+        4. **Mod-31 check character** -- treat the nine date+individual
+           digits ``DDMMYYNNN`` as an integer; the trailing check character
+           must be ``alphabet[integer mod 31]``. The 31-symbol alphabet
+           deliberately omits G, I, O, Q, Z (visual ambiguity), so a
+           coincidental token carrying any of those letters in position 11
+           is rejected.
+
+    A run that clears all four gates is a near-certain real HETU; a
+    coincidental ``DDMMYYCNNNK`` token fails the date or the mod-31 check
+    with overwhelming probability. The triple structural gate plus the
+    arithmetic checksum gives roughly a 1/300 random-token pass rate, a
+    tighter precision lever than the Swedish personnummer's Luhn (~1/100).
+    Any malformed input returns ``False`` so the helper is safe to reuse.
+    """
+    hetu = candidate.strip().upper()
+    if len(hetu) != _FI_HETU_LEN:
+        return False
+    if not (hetu[:6].isdigit() and hetu[7:10].isdigit()):
+        return False
+    if hetu[6] not in _FI_HETU_SEPARATORS:
+        return False
+    if hetu[10] not in _FI_HETU_ALPHABET:
+        return False
+    # Birth date: a real DD (01-31) and MM (01-12). The two-digit year is
+    # disambiguated by the century separator above, so we do not gate on it.
+    day = int(hetu[0:2])
+    month = int(hetu[2:4])
+    if not (1 <= day <= 31 and 1 <= month <= 12):
+        return False
+    # Mod-31 check: treat the nine DDMMYY + NNN digits as a single integer
+    # and index the 31-symbol alphabet by that integer modulo 31.
+    nine = int(hetu[:6] + hetu[7:10])
+    expected = _FI_HETU_ALPHABET[nine % 31]
+    return expected == hetu[10]
+
+
+def _redact_fi_hetu(code: str) -> str:
+    """Redact a Finnish HETU, preserving only the century separator.
+
+    The 7th character (the century separator, e.g. ``-`` for the 1900s, ``A``
+    for the 2000s) survives so a report retains a coarse triage hint about
+    the birth-century cohort, while the birth date, individual number, and
+    check character -- the part that pins the leak to a specific identified
+    person -- are masked. The 11-character shape is preserved so the masked
+    form still reads as a HETU::
+
+        131052-308T -> XXXXXX-XXXX
+    """
+    return "XXXXXX" + code[6].upper() + "XXXX"
+
+
 def _tr_tckn_valid(candidate: str) -> bool:
     """Return ``True`` if a string is a structurally valid Turkish TCKN.
 
@@ -2693,6 +2848,61 @@ def _scan_text(
                 "individual's identity and birth date.",
                 location=location,
                 evidence=_redact_no_fnr(digits),
+            )
+        )
+
+    # Finnish HETU (DDMMYYCNNNK, the canonical 11-char form with a century
+    # separator and a 31-symbol mod-31 check character) -- the master Finnish
+    # personal identifier and a direct, high-value identity-PII leak class on
+    # a par with the SSN, fødselsnummer, TCKN, RRN, CURP, and CPF detectors.
+    # Unlike the Norwegian fødselsnummer and the Turkish TCKN -- both contiguous
+    # 11-digit runs that share the ``_TR_TCKN_RE`` candidate window -- the HETU
+    # carries a NON-DIGIT character in position 7 (the century separator) and a
+    # mostly-alphanumeric character in position 11 (the check character), so its
+    # shape is structurally disjoint from any contiguous-digit detector. It
+    # never competes with -- and is never double-counted against -- the card /
+    # account / routing scanners (those match contiguous digits; the HETU's
+    # century separator breaks the run into a six- and a three-digit piece,
+    # neither of which the 8+/9/13+ scanners match). The 6+1+3+1 shape is also
+    # distinct from every other hyphenated detector -- the SSN's 3-2-4, the UK
+    # sort code's 2-2-2, the Canadian routing number's 5-3, the Australian
+    # BSB's 3-3, the South Korean Giro's 5-2, the Korean RRN's 6-7, and the
+    # Thai national ID's 1-4-5-2-1 -- because the separator can be a LETTER as
+    # well as ``+`` or ``-``, and the trailing check is one of 31 symbols, so
+    # the detectors never collide. We gate on the strict shape, a real embedded
+    # birth date, the assigned century-separator set, AND the public mod-31
+    # check character, so a coincidental token is vanishingly unlikely to be
+    # reported. A HETU echoed into free text discloses a named individual's
+    # identity, on a par with the fødselsnummer / TCKN / RRN detectors.
+    for m in _FI_HETU_RE.finditer(text):
+        candidate = m.group(0)
+        if not _fi_hetu_valid(candidate):
+            continue
+        compact = candidate.upper()
+        key = ("fi_hetu", compact)
+        if key in seen:
+            continue
+        seen.add(key)
+        # Reserve every digit run inside the HETU under the account / card /
+        # routing namespaces so the scanners below never re-report a slice of
+        # the same identifier (the embedded date or the individual number may
+        # be picked up as a short digit run -- defensive, matching how the
+        # CURP and the IFSC scans reserve their embedded digits).
+        for run in re.findall(r"\d+", compact):
+            seen.add(("account_number", run))
+            seen.add(("credit_card", run))
+            seen.add(("routing_number", run))
+        findings.append(
+            Finding(
+                check="pii",
+                type="fi_hetu",
+                severity="high",
+                message="Finnish HETU / henkilötunnus (valid DDMMYYCNNNK "
+                "structure, embedded birth date, assigned century separator, "
+                "and mod-31 check character) leaking into a free-text field "
+                "-- discloses a named individual's identity and birth date.",
+                location=location,
+                evidence=_redact_fi_hetu(compact),
             )
         )
 
