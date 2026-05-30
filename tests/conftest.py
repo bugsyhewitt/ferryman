@@ -174,6 +174,12 @@ def se_pnr_file() -> Path:
 
 
 @pytest.fixture
+def ch_ahv_file() -> Path:
+    """A bank statement leaking valid Swiss AHV / AVS numbers (756.XXXX.XXXX.XX)."""
+    return FIXTURES / "ch-ahv-leak.ofx"
+
+
+@pytest.fixture
 def entity_bomb_file() -> Path:
     return FIXTURES / "entity-bomb.ofx"
 

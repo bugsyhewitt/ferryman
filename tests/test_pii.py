@@ -14,6 +14,7 @@ from ferryman.checks.pii import (
     _bic_valid,
     _br_cpf_valid,
     _ca_routing_valid,
+    _ch_ahv_valid,
     _clabe_valid,
     _curp_valid,
     _cusip_valid,
@@ -3481,3 +3482,157 @@ def test_se_pnr_leak_fixture(se_pnr_file):
 def test_clean_file_no_se_pnr(clean_file):
     findings = check_pii(clean_file.read_bytes())
     assert "personnummer" not in {f.type for f in findings}
+
+
+# --- Swiss AHV / AVS social-security number --------------------------------
+
+# Each VALID_CH_AHV value is a structurally complete 13-digit AHV in its
+# canonical 756.XXXX.XXXX.XX dotted form whose trailing EAN-13 mod-10 check
+# digit verifies. These are synthetic, fictitious values constructed only to
+# satisfy the public EAN-13 check, not real AHV numbers of identified people.
+VALID_CH_AHV = [
+    "756.1234.5678.97",
+    "756.9217.0769.85",
+    "756.3047.5009.62",
+    "756.1111.1111.13",
+    "756.9876.5432.17",
+    "756.0000.0000.57",
+]
+
+INVALID_CH_AHV = [
+    "756.1234.5678.90",  # wrong EAN-13 check digit (correct is 7)
+    "756.1234.5678.91",
+    "756.1234.5678.96",
+    "756.1234.5678.98",
+    "123.1234.5678.97",  # wrong country prefix -- not Swiss
+    "757.1234.5678.97",  # wrong country prefix -- off-by-one from 756
+    "000.0000.0000.00",  # all zeros: wrong prefix AND wrong check
+    "756.1234.5678.9",   # too short (12 digits)
+    "756.1234.5678.971", # too long (14 digits)
+    "756-1234-5678-97",  # hyphens instead of the canonical dots
+    "75612345678 97",    # no separators, then a space -- never canonical
+    "756.abcd.5678.97",  # non-digit in body
+]
+
+
+@pytest.mark.parametrize("ahv", VALID_CH_AHV)
+def test_ch_ahv_accepts_real_structure(ahv):
+    assert _ch_ahv_valid(ahv) is True
+
+
+@pytest.mark.parametrize("ahv", INVALID_CH_AHV)
+def test_ch_ahv_rejects_invalid(ahv):
+    assert _ch_ahv_valid(ahv) is False
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "",
+        "  ",
+        "756",
+        "756.1234.5678",      # missing tail
+        "abcdefghijklm",      # all letters
+        "756.....",           # only dots, no digits
+        "...1234.5678.97",    # missing 756 prefix block
+    ],
+)
+def test_ch_ahv_rejects_garbage(bad):
+    assert _ch_ahv_valid(bad) is False
+
+
+def test_ch_ahv_in_memo_detected():
+    findings = _scan("Verified holder AHV 756.1234.5678.97 on file")
+    codes = [f for f in findings if f.type == "ch_ahv"]
+    assert len(codes) == 1
+    assert codes[0].severity == "high"
+    assert codes[0].check == "pii"
+    # Only the Swiss 756 country prefix survives for triage; the rest is masked.
+    assert codes[0].evidence == "756.XXXX.XXXX.XX"
+
+
+def test_ch_ahv_redaction_masks_identity():
+    findings = _scan("Verified 756.9217.0769.85 on file")
+    codes = [f for f in findings if f.type == "ch_ahv"]
+    assert len(codes) == 1
+    # The identity-bearing digits and the check digit never leave the tool.
+    assert "9217" not in codes[0].evidence
+    assert "0769" not in codes[0].evidence
+    assert "85" not in codes[0].evidence
+
+
+def test_ch_ahv_wrong_check_digit_not_reported():
+    # An AHV-shaped token with a wrong EAN-13 check digit fails the gate.
+    findings = _scan("decoy reference 756.1234.5678.90 ignored")
+    assert "ch_ahv" not in {f.type for f in findings}
+
+
+def test_ch_ahv_wrong_country_prefix_not_reported():
+    # A 3.4.4.2 dotted 13-digit token whose first triple is not 756 is never
+    # a Swiss AHV.
+    findings = _scan("decoy 123.1234.5678.97 ignored")
+    assert "ch_ahv" not in {f.type for f in findings}
+
+
+def test_ch_ahv_does_not_collide_with_digit_scanners():
+    # The dotted AHV is structurally distinct from any contiguous digit run,
+    # and the underlying 13-digit compact form is reserved under the
+    # account / card / routing namespaces so a valid AHV is reported once
+    # as the identity it is rather than being double-counted as a card or a
+    # plain account-number run.
+    findings = _scan("holder 756.1234.5678.97 file")
+    types = [f.type for f in findings]
+    assert types.count("ch_ahv") == 1
+    assert "account_number" not in types
+    assert "credit_card" not in types
+    assert "routing_number" not in types
+
+
+def test_ch_ahv_does_not_collide_with_cpf():
+    # The only other ``.``-separated detector in this module is the
+    # Brazilian CPF (NNN.NNN.NNN-NN), whose layout (3.3.3 with a trailing
+    # dash) is structurally disjoint from the AHV's 3.4.4.2 all-dotted form.
+    # A pure CPF never trips ch_ahv and a pure AHV never trips br_cpf.
+    findings = _scan("cpf 111.444.777-35 here")
+    types = {f.type for f in findings}
+    assert "br_cpf" in types
+    assert "ch_ahv" not in types
+    findings = _scan("ahv 756.1234.5678.97 here")
+    types = {f.type for f in findings}
+    assert "ch_ahv" in types
+    assert "br_cpf" not in types
+
+
+def test_ch_ahv_does_not_break_other_identifiers():
+    # The AHV scan must not interfere with other identifiers on the same
+    # statement; an SSN in the same memo is still flagged.
+    findings = _scan("ssn 123-45-6789 and ahv 756.1234.5678.97")
+    types = {f.type for f in findings}
+    assert "ch_ahv" in types
+    assert "ssn" in types
+
+
+def test_same_ch_ahv_deduped_per_field():
+    # The same AHV written twice in the same field collapses to one finding.
+    findings = _scan("ahv 756.1234.5678.97 and 756.1234.5678.97 again")
+    codes = [f for f in findings if f.type == "ch_ahv"]
+    assert len(codes) == 1
+
+
+def test_ch_ahv_leak_fixture(ch_ahv_file):
+    findings = check_pii(ch_ahv_file.read_bytes())
+    codes = [f for f in findings if f.type == "ch_ahv"]
+    types = {f.type for f in findings}
+    assert "ch_ahv" in types, f"expected ch_ahv, got: {types}"
+    # The fixture leaks two valid AHVs in memos; the wrong-check-digit decoy
+    # (756.1234.5678.90) must NOT be reported as an AHV.
+    assert len(codes) == 2
+    assert all(c.severity == "high" for c in codes)
+    for c in codes:
+        assert c.evidence == "756.XXXX.XXXX.XX"
+        assert c.type == "ch_ahv"
+
+
+def test_clean_file_no_ch_ahv(clean_file):
+    findings = check_pii(clean_file.read_bytes())
+    assert "ch_ahv" not in {f.type for f in findings}
