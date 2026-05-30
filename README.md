@@ -21,7 +21,7 @@ scanner that treats an OFX file as an attack surface and asks three questions:
   identity keys), South Korean RRNs (resident-registration identity numbers),
   Turkish TCKNs (national identification numbers), Norwegian fødselsnummer
   (national identity numbers), Finnish HETUs (henkilötunnus personal identity
-  codes), full
+  codes), Swedish personnummer (national identification numbers), full
   account numbers, and routing numbers smuggled into free-text transaction names
   and memos.
 - **Is this file anomalous?** Out-of-range posting dates, zero / sign-flipped /
@@ -67,8 +67,8 @@ ferryman [--check {malformed,pii,anomaly,all}] [--format {json,text,h1md,sarif}]
     code, Canadian routing number, Australian BSB code, Indian IFSC code, Mexican
     CLABE, South Korean Giro number, Thai national ID, Brazilian CPF, Mexican
     CURP, South Korean RRN, Turkish TCKN, Norwegian fødselsnummer, Finnish
-    HETU, account number, routing number), including investment memos and
-    security ids.
+    HETU, Swedish personnummer, account number, routing number), including
+    investment memos and security ids.
     Evidence is always redacted before it leaves the tool.
   - `anomaly` &mdash; structurally valid but suspicious transactions
     (out-of-range dates; zero, sign-contradicting, or out-of-range transaction
@@ -1227,6 +1227,64 @@ $ ferryman --check pii --format text leak.ofx
 
 **Remediation:** never echo a customer's HETU into a statement memo or
 transaction name; keep national identity codes in structured,
+access-controlled fields rather than free text.
+
+### Swedish personnummer leak detection
+
+A [Swedish personnummer](https://en.wikipedia.org/wiki/Personal_identity_number_(Sweden))
+is the 10-digit national identification number every Swedish resident is
+issued &mdash; the master personal identifier keying banking, tax (the
+personnummer doubles as the tax id), healthcare, and government services, on
+a par with the Norwegian fødselsnummer, the Finnish HETU, the Turkish TCKN,
+and the South Korean RRN. A personnummer echoed into free text discloses a
+named individual (and their exact birth date), not merely an account. Its
+canonical printed form is `YYMMDD-NNNC`: a six-digit `YYMMDD` birth date
+(ISO year-month-day ordering), a single **century separator** `C` (`-` for
+residents under 100 years old, `+` for residents 100 years old and over), a
+three-digit individual number `NNN` (odd for male, even for female; `000`
+was never assigned), and a single trailing **Luhn check digit** `C` computed
+over the nine `YYMMDDNNN` digits. A personnummer echoed into a free-text
+**memo or transaction name** is a direct Swedish identity-PII leak. The
+**pii** check flags a `personnummer` finding (severity `high`) when a
+free-text token clears four public, dependency-free gates:
+
+1. **shape** &mdash; exactly 11 characters in the
+   `YYMMDD + sep + NNN + check` layout (no internal spaces).
+2. **real embedded birth date** &mdash; the `YYMMDD` block must form a valid
+   month-of-year / day-of-month pair (`MM` in 01-12, `DD` in 01-31). A token
+   with an impossible day or month is never a live personnummer.
+3. **non-zero individual number** &mdash; the `NNN` block was never assigned
+   `000` by Skatteverket / Statistiska centralbyrån, so a token with `NNN ==
+   000` is rejected as a structural impossibility.
+4. **Luhn check digit** &mdash; the trailing `C` must equal the mod-10 Luhn
+   check digit computed over the nine `YYMMDDNNN` digits. The Luhn check has
+   a ~1/10 random-token pass rate on its own, so the combination of the date
+   gate, the non-zero NNN gate, and the Luhn gives roughly a 1/1000
+   random-token pass rate.
+
+The personnummer shares its `\d{6}[-+]\d{4}` candidate window with the
+Finnish HETU (which also runs over a `YYMMDDC...` shape when the HETU's 11th
+check character happens to be a decimal digit), but the two validators are
+arithmetically independent: a token that clears the Luhn-over-nine-digits
+check almost never clears the HETU's mod-31 alphabet check, and vice versa,
+so the two detectors never both fire on the same token. The 6-4 hyphenated
+split is otherwise distinct from every other hyphenated detector in this
+module (the SSN's 3-2-4, the UK sort code's 2-2-2, the Canadian routing's
+5-3, the Australian BSB's 3-3, the South Korean Giro's 5-2, the Korean RRN's
+6-7, the Thai national ID's 1-4-5-2-1, and the Brazilian CPF's dotted
+3.3.3-2), so the personnummer never competes with &mdash; and is never
+double-counted against &mdash; those identifiers either. Evidence is
+redacted to the century separator only (`XXXXXX-XXXX` for residents under
+100 years old, `XXXXXX+XXXX` for residents 100 years old and over); the
+birth date, individual number, and check digit never leave the tool.
+
+```bash
+$ ferryman --check pii --format text leak.ofx
+  [HIGH] pii/personnummer @ statement[0].transaction[0].memo: Swedish personnummer (valid YYMMDD-NNNC structure, embedded birth date, non-zero individual number, and Luhn check digit) leaking into a free-text field -- discloses a named individual's identity and birth date.
+```
+
+**Remediation:** never echo a customer's personnummer into a statement memo
+or transaction name; keep national identity codes in structured,
 access-controlled fields rather than free text.
 
 ## From finding to HackerOne report

@@ -168,6 +168,12 @@ def fi_hetu_file() -> Path:
 
 
 @pytest.fixture
+def se_pnr_file() -> Path:
+    """A bank statement leaking valid Swedish personnummer (YYMMDD-NNNC identity codes)."""
+    return FIXTURES / "se-pnr-leak.ofx"
+
+
+@pytest.fixture
 def entity_bomb_file() -> Path:
     return FIXTURES / "entity-bomb.ofx"
 

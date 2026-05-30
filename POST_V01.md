@@ -1621,3 +1621,93 @@ services, so a free-text echo is a reportable Finnish PII disclosure that
 names the individual and their exact birth date.
 
 **Estimated tokens:** 30–50K
+
+---
+
+## Rank 31 — Swedish Personnummer Leak Detection, YYMMDD-NNNC structure + ISO birth date + non-zero NNN + Luhn check-digit gated (HIGH signal, low effort) — ✅ IMPLEMENTED (2026-05-29, Phase 2 Rotation 33)
+
+**Pivot note:** Ranks 1–30 were all shipped (R30 = Finnish HETU, just landed
+at HEAD `7f092bb`). The R31 rotation brief named the **Swedish personnummer**
+and the **Danish CPR** as the two remaining national-ID candidates. A fresh
+read of `checks/pii.py` confirmed neither `personnummer` nor `dk_cpr` was
+present. The choice came down to ferryman's dominant precision criterion —
+**checksum and structural distinctiveness**:
+
+- **Swedish personnummer** carries a single Luhn check digit on the nine
+  `YYMMDDNNN` digits, giving roughly a 1/10 random-token pass rate before
+  the date gate and a ~1/1000 rate after the date + non-zero-NNN + Luhn
+  triple gate. The hyphenated 6-4 split (with `-` for under-100 residents
+  and `+` for 100+ residents) is distinct from every other hyphenated
+  detector in the module.
+- **Danish CPR** was deferred. The Danish authorities **abolished the
+  CPR check digit in October 2007** to extend the issuance namespace; new
+  CPRs issued after 2007 do not satisfy the old mod-11 check. A detector
+  that gates on the mod-11 would miss every post-2007 CPR (and so miss
+  the dominant in-circulation cohort going forward), while a detector
+  that does *not* gate on the checksum would have a ~1/30 random-token
+  pass rate (date gate only) — far below ferryman's precision floor and
+  inconsistent with the dual-check / mod-11 / mod-31 levers every other
+  national-ID detector in this module relies on. The Swedish personnummer,
+  whose Luhn check has not been deprecated and remains the precision lever
+  every in-circulation number carries, is therefore the higher-precision
+  ship for this rotation. Identity-PII value is comparable between the two
+  (both are the master personal identifier in their respective countries,
+  keying banking, tax, healthcare, and government services).
+
+**Status:** Shipped. `checks/pii.py` gained `_se_pnr_check_digit()` (the
+nine-digit left-to-right Luhn with weights `2 1 2 1 2 1 2 1 2`, sum the
+decimal digits of any doubled value greater than 9, check digit is
+`(10 - (total mod 10)) mod 10`), `_se_pnr_valid()` (gates on the exact
+`YYMMDD-NNNC` 11-character shape; a real embedded `MM`/`DD` birth date in
+ISO order; the assigned century separator at position 7 (`-` or `+`); a
+non-zero `NNN` individual number; and the Luhn check digit), and
+`_redact_se_pnr()` (evidence redacted to the century separator only,
+`XXXXXX-XXXX` for an under-100 personnummer, `XXXXXX+XXXX` for a 100+
+one, so a report retains a coarse cohort triage hint while the birth date,
+individual number, and check digit never leave the tool). A new
+`personnummer` (high) finding runs in `_scan_text` immediately before the
+Turkish TCKN block, sharing the candidate-generation regex shape with the
+Finnish HETU (`\d{6}[-+]\d{4}` overlaps `\d{6}[-+ABCDEFYXWVU]\d{3}[0-9A-FHJ-NP-Y]`
+when the HETU's 11th check character is a decimal digit), but the two
+validators are arithmetically independent (Luhn-over-nine-digits is
+disjoint from mod-31-alphabet-index in practice), so the two detectors
+never both fire on the same token. Reservations are made under the
+`account_number` / `credit_card` / `routing_number` namespaces for every
+digit run inside the personnummer (defensive, matching how the HETU /
+CURP / IFSC scans reserve their embedded digits), even though the
+contiguous-digit floors (8+/9/13+) cannot match the personnummer's short
+embedded date or four-digit tail on their own. New fixture
+`tests/fixtures/se-pnr-leak.ofx` (two valid personnummer in two memos —
+one `-` separator, one `+` separator — plus one wrong-Luhn `890101-3490`
+decoy) plus 43 new test cases cover the Luhn helper, the validator (real
+personnummer with both separator classes, wrong-Luhn / bad-date / wrong-NNN
+(`000`) / bad-separator / wrong-length rejects), free-text detection,
+redaction, the wrong-check-digit non-detection guard, the bad-date
+non-detection guard, the zero-NNN non-detection guard, the
+no-collision-with-digit-scanners guarantee, the no-collision-with-HETU
+guarantee, the no-collision-with-fødselsnummer/TCKN guarantee, the
+no-collision-with-other-hyphenated-detectors guarantee, the
+no-interference-with-other-identifiers guard, per-field dedupe, the
+fixture, and the clean-file guard. README gained a Swedish personnummer
+section and the two type-summary lists were updated. The SARIF mapping
+auto-generates the `pii/personnummer` rule with no changes. No new
+dependencies (stdlib `re` only). Full suite: 770 → 813 passing.
+
+**Research grounding:** Swedish personnummer administered by Skatteverket
+(the Swedish Tax Agency) with statistical oversight from Statistiska
+centralbyrån — a 10-digit national identification number,
+`YYMMDD-NNNC`: a six-digit ISO birth date, a single century separator
+(`-` for residents under 100, `+` for residents 100 or older), a
+three-digit individual number (odd=male, even=female; the third NNN digit
+was historically a county code, removed since 1990 but still embedded in
+older numbers), and a single trailing Luhn check digit computed over the
+nine `YYMMDDNNN` digits using the left-to-right `2 1 2 1 2 1 2 1 2`
+weighting (equivalent to the right-to-left card-form Luhn because nine
+has odd parity). The Luhn algorithm and the century-separator semantics
+are publicly documented and dependency-free, ~15 lines of Python. The
+personnummer is the master personal identifier in Sweden, keying banking,
+tax (it doubles as the tax id), healthcare, and government services, so a
+free-text echo is a reportable Swedish PII disclosure that names the
+individual and their exact birth date.
+
+**Estimated tokens:** 30–50K
