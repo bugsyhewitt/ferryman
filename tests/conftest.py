@@ -162,6 +162,12 @@ def no_fnr_file() -> Path:
 
 
 @pytest.fixture
+def fi_hetu_file() -> Path:
+    """A bank statement leaking valid Finnish HETUs (DDMMYYCNNNK identity codes)."""
+    return FIXTURES / "fi-hetu-leak.ofx"
+
+
+@pytest.fixture
 def entity_bomb_file() -> Path:
     return FIXTURES / "entity-bomb.ofx"
 

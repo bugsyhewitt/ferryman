@@ -17,6 +17,7 @@ from ferryman.checks.pii import (
     _clabe_valid,
     _curp_valid,
     _cusip_valid,
+    _fi_hetu_valid,
     _iban_valid,
     _ifsc_valid,
     _isin_valid,
@@ -3051,3 +3052,215 @@ def test_no_fnr_leak_fixture(no_fnr_file):
 def test_clean_file_no_no_fnr(clean_file):
     findings = check_pii(clean_file.read_bytes())
     assert "no_fnr" not in {f.type for f in findings}
+
+
+# --- Finnish HETU (henkilötunnus / personal identity code) -----------------
+
+# Each VALID_FI_HETU value is a structurally complete 11-character HETU: a
+# six-digit DDMMYY birth date, a single century separator, a three-digit
+# individual number, and a trailing mod-31 check character drawn from the
+# 31-symbol alphabet ``0123456789ABCDEFHJKLMNPRSTUVWXY``. The check character
+# is computed via ``alphabet[int(DDMMYY + NNN) mod 31]``. These are synthetic,
+# fictitious values constructed only to satisfy the public mod-31 check, not
+# real HETUs of identified people. INVALID_FI_HETU collects near-miss tokens
+# that must fail the validator.
+VALID_FI_HETU = [
+    "131052-308T",   # 1900s, woman (NNN even); separator ``-``
+    "010187-123V",   # 1900s, man (NNN odd); separator ``-``
+    "290200A102L",   # 2000s; separator ``A``
+    "100575-459M",   # 1900s, man
+    "150892-247U",   # 1900s, man
+    "110375-432T",   # 1900s, woman
+    "151278+4566",   # 1800s separator ``+``; check is a digit (``6``)
+    "010100A8883",   # 2000s; check is a digit (``3``)
+]
+
+INVALID_FI_HETU = [
+    "131052-3089",   # wrong check char (correct is ``T``)
+    "131052-308G",   # ``G`` is excluded from the check alphabet
+    "131052-308I",   # ``I`` is excluded from the check alphabet
+    "131052-308O",   # ``O`` is excluded from the check alphabet
+    "131052-308Q",   # ``Q`` is excluded from the check alphabet
+    "131052-308Z",   # ``Z`` is excluded from the check alphabet
+    "320152-308T",   # day=32 -- impossible date
+    "011352-308T",   # month=13 -- impossible date
+    "131052/308T",   # ``/`` is not an assigned century separator
+    "131052*308T",   # ``*`` is not an assigned century separator
+    "131052H308T",   # ``H`` is not in the separator set
+    "131052-30T",    # too short (10 chars)
+    "131052-3081T",  # too long (12 chars)
+    "abc052-308T",   # non-digit in date
+    "131052-30aT",   # non-digit in individual number
+]
+
+
+@pytest.mark.parametrize("hetu", VALID_FI_HETU)
+def test_fi_hetu_accepts_real_structure(hetu):
+    assert _fi_hetu_valid(hetu) is True
+
+
+@pytest.mark.parametrize("hetu", INVALID_FI_HETU)
+def test_fi_hetu_rejects_invalid(hetu):
+    assert _fi_hetu_valid(hetu) is False
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "",
+        "  ",
+        "131052-308",       # missing check char
+        "131052308T",       # missing separator (10 chars)
+        "abcdefghijk",      # all letters
+        "12345678901",      # all digits -- a TCKN-shaped contiguous run
+    ],
+)
+def test_fi_hetu_rejects_garbage(bad):
+    # Defensive: empty / wrong-length / structurally-wrong input is never a
+    # valid HETU.
+    assert _fi_hetu_valid(bad) is False
+
+
+def test_fi_hetu_validator_accepts_lowercase():
+    # The helper is case-insensitive; canonical forms are upper-case but a
+    # lower-case run validates structurally so the helper is safe to reuse.
+    assert _fi_hetu_valid("131052-308t") is True
+    assert _fi_hetu_valid("290200a102l") is True
+
+
+def test_fi_hetu_in_memo_detected():
+    findings = _scan("Verified holder hetu 131052-308T on file")
+    codes = [f for f in findings if f.type == "fi_hetu"]
+    assert len(codes) == 1
+    assert codes[0].severity == "high"
+    assert codes[0].check == "pii"
+    # Only the century separator survives for triage; the rest is masked.
+    assert codes[0].evidence == "XXXXXX-XXXX"
+
+
+def test_fi_hetu_2000s_separator_preserved_in_redaction():
+    # A 2000s HETU uses the ``A`` separator; redaction keeps it as the cohort
+    # triage hint.
+    findings = _scan("Co-signer 290200A102L logged")
+    codes = [f for f in findings if f.type == "fi_hetu"]
+    assert len(codes) == 1
+    assert codes[0].evidence == "XXXXXXAXXXX"
+
+
+def test_fi_hetu_redaction_masks_identity():
+    findings = _scan("Verified 010187-123V on file")
+    codes = [f for f in findings if f.type == "fi_hetu"]
+    assert len(codes) == 1
+    # The full HETU, the birth date, the individual number, and the check
+    # character never leave the tool.
+    assert "010187" not in codes[0].evidence
+    assert "123" not in codes[0].evidence
+    assert "V" not in codes[0].evidence
+
+
+def test_fi_hetu_uppercase_only_in_memo():
+    # The detection regex is UPPER-CASE-only (the precision lever, mirroring
+    # the BIC / IFSC gates), so a lower-case HETU in prose is not reported as
+    # a HETU finding.
+    findings = _scan("verified holder 131052-308t on file")
+    assert "fi_hetu" not in {f.type for f in findings}
+
+
+def test_fi_hetu_wrong_check_char_not_reported():
+    # A HETU-shaped token with a wrong check character fails the gate and is
+    # NOT a fi_hetu finding.
+    findings = _scan("decoy reference 131052-3089 ignored")
+    assert "fi_hetu" not in {f.type for f in findings}
+
+
+def test_fi_hetu_excluded_letter_not_reported():
+    # The check-character alphabet deliberately omits G, I, O, Q, Z. A token
+    # whose 11th character is any of those is not a HETU.
+    for bad_check in ("G", "I", "O", "Q", "Z"):
+        findings = _scan(f"decoy 131052-308{bad_check} ignored")
+        assert "fi_hetu" not in {f.type for f in findings}, bad_check
+
+
+def test_fi_hetu_bad_date_not_reported():
+    # A token whose embedded DDMMYY does not form a real date is never a HETU.
+    findings = _scan("malformed 320152-308T ignored")
+    assert "fi_hetu" not in {f.type for f in findings}
+
+
+def test_fi_hetu_does_not_collide_with_digit_scanners():
+    # The HETU's century separator is a non-digit, so the contiguous-digit
+    # scanners (account / routing / card) cannot match the full token. The
+    # six-digit date is too short for the 8+/9/13+ floors, so no digit
+    # scanner ever competes with the HETU.
+    findings = _scan("holder 131052-308T file")
+    types = [f.type for f in findings]
+    assert types.count("fi_hetu") == 1
+    assert "account_number" not in types
+    assert "routing_number" not in types
+    assert "credit_card" not in types
+
+
+def test_fi_hetu_does_not_collide_with_no_fnr_or_tckn():
+    # The fødselsnummer and the TCKN are both contiguous 11-digit runs; the
+    # HETU carries a non-digit separator, so the candidate windows are
+    # disjoint. A pure fødselsnummer / TCKN run never trips fi_hetu, and a
+    # HETU never trips no_fnr / tr_tckn.
+    findings = _scan("fnr 11037543251 here")
+    assert "fi_hetu" not in {f.type for f in findings}
+    findings = _scan("hetu 131052-308T here")
+    types = {f.type for f in findings}
+    assert "fi_hetu" in types
+    assert "no_fnr" not in types
+    assert "tr_tckn" not in types
+
+
+def test_fi_hetu_does_not_collide_with_hyphenated_detectors():
+    # The HETU is structurally distinct from every other hyphenated
+    # detector: a HETU has 6-letter-3-1 layout (with a letter or symbol in
+    # position 7 and a letter or digit in position 11), where the SSN /
+    # sort-code / routing / Giro / RRN / national-ID / CPF detectors all use
+    # digit-only structural shapes.
+    assert "fi_hetu" not in {f.type for f in _scan("ssn 123-45-6789 here")}
+    assert "fi_hetu" not in {f.type for f in _scan("rrn 900101-1123459 here")}
+    assert "fi_hetu" not in {f.type for f in _scan("cpf 111.444.777-35 here")}
+    assert "fi_hetu" not in {f.type for f in _scan("sort 20-00-00 here")}
+
+
+def test_fi_hetu_does_not_break_other_identifiers():
+    # The HETU scan must not interfere with other identifiers on the same
+    # statement; an SSN sitting in the same memo is still flagged.
+    findings = _scan("ssn 123-45-6789 and hetu 131052-308T")
+    types = {f.type for f in findings}
+    assert "fi_hetu" in types
+    assert "ssn" in types
+
+
+def test_same_fi_hetu_deduped_per_field():
+    # The same HETU written twice in the same field collapses to one finding.
+    findings = _scan("hetu 131052-308T and 131052-308T again")
+    codes = [f for f in findings if f.type == "fi_hetu"]
+    assert len(codes) == 1
+
+
+def test_fi_hetu_leak_fixture(fi_hetu_file):
+    findings = check_pii(fi_hetu_file.read_bytes())
+    codes = [f for f in findings if f.type == "fi_hetu"]
+    types = {f.type for f in findings}
+    assert "fi_hetu" in types, f"expected fi_hetu, got: {types}"
+    # The fixture leaks two valid HETUs in memos; the wrong-check-char decoy
+    # (131052-3089) must NOT be reported as a HETU.
+    assert len(codes) == 2
+    assert all(c.severity == "high" for c in codes)
+    for c in codes:
+        assert c.evidence.startswith("XXXXXX")
+        assert c.evidence.endswith("XXXX")
+        assert c.type == "fi_hetu"
+    # The two leaked HETUs have separators ``-`` (1900s) and ``A`` (2000s);
+    # the redaction preserves the separator as the cohort triage hint.
+    separators = {c.evidence[6] for c in codes}
+    assert separators == {"-", "A"}
+
+
+def test_clean_file_no_fi_hetu(clean_file):
+    findings = check_pii(clean_file.read_bytes())
+    assert "fi_hetu" not in {f.type for f in findings}

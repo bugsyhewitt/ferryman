@@ -20,7 +20,8 @@ scanner that treats an OFX file as an attack surface and asks three questions:
   (PromptPay proxy ids), Brazilian CPFs (Pix keys), Mexican CURPs (population
   identity keys), South Korean RRNs (resident-registration identity numbers),
   Turkish TCKNs (national identification numbers), Norwegian fødselsnummer
-  (national identity numbers), full
+  (national identity numbers), Finnish HETUs (henkilötunnus personal identity
+  codes), full
   account numbers, and routing numbers smuggled into free-text transaction names
   and memos.
 - **Is this file anomalous?** Out-of-range posting dates, zero / sign-flipped /
@@ -65,8 +66,9 @@ ferryman [--check {malformed,pii,anomaly,all}] [--format {json,text,h1md,sarif}]
     ITIN, payment-card number, IBAN, ISIN, CUSIP, SEDOL, LEI, BIC/SWIFT, UK sort
     code, Canadian routing number, Australian BSB code, Indian IFSC code, Mexican
     CLABE, South Korean Giro number, Thai national ID, Brazilian CPF, Mexican
-    CURP, South Korean RRN, Turkish TCKN, Norwegian fødselsnummer, account
-    number, routing number), including investment memos and security ids.
+    CURP, South Korean RRN, Turkish TCKN, Norwegian fødselsnummer, Finnish
+    HETU, account number, routing number), including investment memos and
+    security ids.
     Evidence is always redacted before it leaves the tool.
   - `anomaly` &mdash; structurally valid but suspicious transactions
     (out-of-range dates; zero, sign-contradicting, or out-of-range transaction
@@ -1165,6 +1167,66 @@ $ ferryman --check pii --format text leak.ofx
 
 **Remediation:** never echo a customer's fødselsnummer into a statement memo
 or transaction name; keep national identity numbers in structured,
+access-controlled fields rather than free text.
+
+### Finnish HETU leak detection
+
+A [Finnish HETU](https://en.wikipedia.org/wiki/National_identification_number#Finland)
+(henkilötunnus, "personal identity code") is the 11-character national
+identification code every Finnish resident is issued &mdash; the master
+personal identifier keying banking, tax, healthcare, and government services,
+on a par with the Norwegian fødselsnummer, the Turkish TCKN, and the South
+Korean RRN. A HETU echoed into free text discloses a named individual (and
+their exact birth date), not merely an account. Its canonical printed form is
+`DDMMYYCNNNK`: a six-digit `DD MM YY` birth date, a single **century
+separator** `C` (`+` for the 1800s, `-` / `Y` / `X` / `W` / `V` / `U` for the
+1900s, `A` / `B` / `C` / `D` / `E` / `F` for the 2000s), a three-digit
+individual number `NNN` (odd for male, even for female), and a single trailing
+**check character** `K` drawn from the 31-symbol alphabet
+`0123456789ABCDEFHJKLMNPRSTUVWXY` (the letters `G`, `I`, `O`, `Q`, `Z` are
+deliberately omitted to avoid visual confusion). A HETU echoed into a free-text
+**memo or transaction name** is a direct Finnish identity-PII leak. The
+**pii** check flags an `fi_hetu` finding (severity `high`) when a free-text
+token clears four public, dependency-free gates:
+
+1. **shape** &mdash; exactly 11 characters in the
+   `DDMMYY + sep + NNN + check` layout.
+2. **real embedded birth date** &mdash; `DD` (01-31) and `MM` (01-12) must
+   form a valid day-of-month / month-of-year pair. A token with an impossible
+   day or month is never a live HETU.
+3. **century separator** &mdash; the 7th character must be one of the
+   assigned separators (`+ABCDEFYXWVU-`). Any other character is never a live
+   HETU. The match regex is UPPER-CASE only (the precision lever, mirroring
+   the BIC and IFSC gates), so a lower-case run in prose is left for the
+   prose.
+4. **mod-31 check character** &mdash; treat the nine `DDMMYY + NNN` digits as
+   a single integer; the trailing check character must be
+   `alphabet[integer mod 31]`. The 31-symbol alphabet deliberately omits
+   `G`, `I`, `O`, `Q`, `Z`, so a coincidental token carrying any of those
+   letters in position 11 is rejected outright.
+
+Unlike the Norwegian fødselsnummer and the Turkish TCKN &mdash; both
+contiguous 11-digit runs that share the same candidate window &mdash; the HETU
+carries a **non-digit** character at position 7 (the century separator) and a
+mostly-alphanumeric character at position 11 (the check character), so its
+shape is structurally disjoint from any contiguous-digit detector. It never
+competes with &mdash; and is never double-counted against &mdash; the card /
+account / routing scanners, and the three identity detectors (`no_fnr`,
+`tr_tckn`, `fi_hetu`) never collide. The triple structural gate plus the
+arithmetic mod-31 check gives roughly a 1/300 random-token pass rate &mdash; a
+tighter precision lever than the Swedish personnummer's Luhn (~1/100) and on
+the same order as the TCKN's dual mod-10. Evidence is redacted to the century
+separator only (`XXXXXX-XXXX` for a 1900s HETU, `XXXXXXAXXXX` for a 2000s
+one); the birth date, individual number, and check character never leave the
+tool.
+
+```bash
+$ ferryman --check pii --format text leak.ofx
+  [HIGH] pii/fi_hetu @ statement[0].transaction[0].memo: Finnish HETU / henkilötunnus (valid DDMMYYCNNNK structure, embedded birth date, assigned century separator, and mod-31 check character) leaking into a free-text field -- discloses a named individual's identity and birth date.
+```
+
+**Remediation:** never echo a customer's HETU into a statement memo or
+transaction name; keep national identity codes in structured,
 access-controlled fields rather than free text.
 
 ## From finding to HackerOne report
