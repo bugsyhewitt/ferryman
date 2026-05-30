@@ -28,6 +28,7 @@ from ferryman.checks.pii import (
     _luhn_valid,
     _no_fnr_valid,
     _redact_email,
+    _se_pnr_valid,
     _sedol_valid,
     _th_natid_valid,
     _tr_tckn_valid,
@@ -3264,3 +3265,219 @@ def test_fi_hetu_leak_fixture(fi_hetu_file):
 def test_clean_file_no_fi_hetu(clean_file):
     findings = check_pii(clean_file.read_bytes())
     assert "fi_hetu" not in {f.type for f in findings}
+
+
+# --- Swedish personnummer ---------------------------------------------------
+
+# Each VALID_SE_PNR value is a structurally complete 11-character personnummer:
+# a six-digit YYMMDD birth date, a single century separator (``-`` for
+# residents under 100, ``+`` for residents 100+), a three-digit individual
+# number, and a trailing Luhn check digit over the nine YYMMDDNNN digits.
+# These are synthetic, fictitious values constructed only to satisfy the
+# public Luhn check, not real personnummer of identified people.
+VALID_SE_PNR = [
+    "890101-3493",  # under 100, ``-`` separator
+    "890214-3323",
+    "140101-1018",  # under 100, ``-`` separator (2014 birth)
+    "850716-1233",
+    "720101-1017",
+    "950302-0076",
+    "460104-0886",
+    "140101+1018",  # 100+, ``+`` separator -- same digits as above
+    "600616-3056",
+    "730411-5178",
+    "690913-7546",
+]
+
+INVALID_SE_PNR = [
+    "890101-3490",  # wrong Luhn check digit (correct is ``3``)
+    "890101-3491",
+    "890101-3492",
+    "891332-3493",  # day=32 -- impossible date (positions 5-6 of YYMMDD)
+    "891301-3493",  # month=13 -- impossible date
+    "890101/3493",  # ``/`` is not an assigned century separator
+    "890101A3493",  # ``A`` is not an assigned personnummer separator
+    "890101-0008",  # NNN=000 -- never assigned (the Luhn would compute 8)
+    "890101-349",   # too short (10 chars)
+    "890101-34931", # too long (12 chars)
+    "abc101-3493",  # non-digit in date
+    "890101-34a3",  # non-digit in tail
+]
+
+
+@pytest.mark.parametrize("pnr", VALID_SE_PNR)
+def test_se_pnr_accepts_real_structure(pnr):
+    assert _se_pnr_valid(pnr) is True
+
+
+@pytest.mark.parametrize("pnr", INVALID_SE_PNR)
+def test_se_pnr_rejects_invalid(pnr):
+    assert _se_pnr_valid(pnr) is False
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "",
+        "  ",
+        "890101-349",       # missing check digit
+        "8901013493",       # missing separator (10 chars contiguous)
+        "abcdefghijk",      # all letters
+        "12345678901",      # all digits -- a TCKN-shaped contiguous run
+    ],
+)
+def test_se_pnr_rejects_garbage(bad):
+    # Defensive: empty / wrong-length / structurally-wrong input is never a
+    # valid personnummer.
+    assert _se_pnr_valid(bad) is False
+
+
+def test_se_pnr_in_memo_detected():
+    findings = _scan("Verified holder personnummer 890101-3493 on file")
+    codes = [f for f in findings if f.type == "personnummer"]
+    assert len(codes) == 1
+    assert codes[0].severity == "high"
+    assert codes[0].check == "pii"
+    # Only the century separator survives for triage; the rest is masked.
+    assert codes[0].evidence == "XXXXXX-XXXX"
+
+
+def test_se_pnr_plus_separator_preserved_in_redaction():
+    # A 100+ years old personnummer uses the ``+`` separator; redaction keeps
+    # it as the cohort triage hint.
+    findings = _scan("Co-signer 140101+1018 logged")
+    codes = [f for f in findings if f.type == "personnummer"]
+    assert len(codes) == 1
+    assert codes[0].evidence == "XXXXXX+XXXX"
+
+
+def test_se_pnr_redaction_masks_identity():
+    findings = _scan("Verified 720101-1017 on file")
+    codes = [f for f in findings if f.type == "personnummer"]
+    assert len(codes) == 1
+    # The full personnummer, the birth date, the individual number, and the
+    # check digit never leave the tool.
+    assert "720101" not in codes[0].evidence
+    assert "101" not in codes[0].evidence
+    assert "1017" not in codes[0].evidence
+
+
+def test_se_pnr_wrong_check_digit_not_reported():
+    # A personnummer-shaped token with a wrong Luhn check digit fails the
+    # gate and is NOT a personnummer finding.
+    findings = _scan("decoy reference 890101-3490 ignored")
+    assert "personnummer" not in {f.type for f in findings}
+
+
+def test_se_pnr_bad_date_not_reported():
+    # A token whose embedded YYMMDD does not form a real date is never a
+    # personnummer.
+    findings = _scan("malformed 891332-3493 ignored")
+    assert "personnummer" not in {f.type for f in findings}
+
+
+def test_se_pnr_zero_nnn_not_reported():
+    # The NNN block was never assigned ``000``; the validator rejects it as a
+    # structural impossibility.
+    findings = _scan("decoy 890101-0008 ignored")
+    assert "personnummer" not in {f.type for f in findings}
+
+
+def test_se_pnr_does_not_collide_with_digit_scanners():
+    # The personnummer's century separator is a non-digit, so the
+    # contiguous-digit scanners (account / routing / card) cannot match the
+    # full token. The six-digit date and the four-digit tail are too short
+    # for the 8+/9/13+ floors, so no digit scanner ever competes with the
+    # personnummer.
+    findings = _scan("holder 890101-3493 file")
+    types = [f.type for f in findings]
+    assert types.count("personnummer") == 1
+    assert "account_number" not in types
+    assert "routing_number" not in types
+    assert "credit_card" not in types
+
+
+def test_se_pnr_does_not_collide_with_fi_hetu():
+    # The personnummer and the HETU share the ``\d{6}[-+]\d{4}`` candidate
+    # window when the HETU's 11th check character happens to be a decimal
+    # digit, but the validators are arithmetically independent: a token that
+    # clears the Luhn-over-nine-digits check almost never clears the HETU's
+    # mod-31 alphabet check, and vice versa. A pure HETU never trips
+    # personnummer, and a pure personnummer never trips fi_hetu.
+    findings = _scan("hetu 131052-308T here")
+    types = {f.type for f in findings}
+    assert "fi_hetu" in types
+    assert "personnummer" not in types
+    findings = _scan("pnr 890101-3493 here")
+    types = {f.type for f in findings}
+    assert "personnummer" in types
+    assert "fi_hetu" not in types
+
+
+def test_se_pnr_does_not_collide_with_no_fnr_or_tckn():
+    # The fødselsnummer and the TCKN are both contiguous 11-digit runs; the
+    # personnummer carries a non-digit separator, so the candidate windows
+    # are disjoint. A pure fødselsnummer / TCKN run never trips personnummer,
+    # and a personnummer never trips no_fnr / tr_tckn.
+    findings = _scan("fnr 11037543251 here")
+    assert "personnummer" not in {f.type for f in findings}
+    findings = _scan("pnr 890101-3493 here")
+    types = {f.type for f in findings}
+    assert "personnummer" in types
+    assert "no_fnr" not in types
+    assert "tr_tckn" not in types
+
+
+def test_se_pnr_does_not_collide_with_hyphenated_detectors():
+    # The personnummer is structurally distinct from every other hyphenated
+    # detector: a personnummer has a 6-1-3-1 layout, where the SSN /
+    # sort-code / routing / Giro / RRN / national-ID / CPF detectors all use
+    # different digit-grouping shapes.
+    assert "personnummer" not in {f.type for f in _scan("ssn 123-45-6789 here")}
+    assert "personnummer" not in {f.type for f in _scan("rrn 900101-1123459 here")}
+    assert "personnummer" not in {f.type for f in _scan("cpf 111.444.777-35 here")}
+    assert "personnummer" not in {f.type for f in _scan("sort 20-00-00 here")}
+
+
+def test_se_pnr_does_not_break_other_identifiers():
+    # The personnummer scan must not interfere with other identifiers on the
+    # same statement; an SSN sitting in the same memo is still flagged.
+    findings = _scan("ssn 123-45-6789 and pnr 890101-3493")
+    types = {f.type for f in findings}
+    assert "personnummer" in types
+    assert "ssn" in types
+    # A credit card in the same memo is still flagged.
+    card_findings = _scan("card 4111111111111111 today")
+    assert [f.type for f in card_findings] == ["credit_card"]
+
+
+def test_same_se_pnr_deduped_per_field():
+    # The same personnummer written twice in the same field collapses to one
+    # finding.
+    findings = _scan("pnr 890101-3493 and 890101-3493 again")
+    codes = [f for f in findings if f.type == "personnummer"]
+    assert len(codes) == 1
+
+
+def test_se_pnr_leak_fixture(se_pnr_file):
+    findings = check_pii(se_pnr_file.read_bytes())
+    codes = [f for f in findings if f.type == "personnummer"]
+    types = {f.type for f in findings}
+    assert "personnummer" in types, f"expected personnummer, got: {types}"
+    # The fixture leaks two valid personnummer in memos; the wrong-Luhn decoy
+    # (890101-3490) must NOT be reported as a personnummer.
+    assert len(codes) == 2
+    assert all(c.severity == "high" for c in codes)
+    for c in codes:
+        assert c.evidence.startswith("XXXXXX")
+        assert c.evidence.endswith("XXXX")
+        assert c.type == "personnummer"
+    # The two leaked personnummer have separators ``-`` (under 100) and ``+``
+    # (100+); the redaction preserves the separator as the cohort triage hint.
+    separators = {c.evidence[6] for c in codes}
+    assert separators == {"-", "+"}
+
+
+def test_clean_file_no_se_pnr(clean_file):
+    findings = check_pii(clean_file.read_bytes())
+    assert "personnummer" not in {f.type for f in findings}

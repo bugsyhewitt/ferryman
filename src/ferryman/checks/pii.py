@@ -202,6 +202,36 @@ Detection classes:
                                 HETU scanner never competes with the digit
                                 scanners and the three identity detectors
                                 never collide.
+- ``personnummer``            : a Swedish personnummer -- the 10-digit national
+                                identification number every Swedish resident is
+                                issued, in its canonical hyphenated
+                                ``YYMMDD-NNNC`` form (a six-digit ``YYMMDD``
+                                birth date, a single century separator ``-``
+                                for residents under 100 years old or ``+`` for
+                                residents 100+ years old, a three-digit
+                                individual number ``NNN`` -- odd for male, even
+                                for female -- and a single trailing Luhn check
+                                digit ``C``) -- whose shape, embedded birth
+                                date, non-zero individual number, and Luhn
+                                check digit (computed over the nine
+                                ``YYMMDDNNN`` digits) all validate, a
+                                near-certain Swedish identity-PII leak. The
+                                hyphenated 6-4 shape is structurally disjoint
+                                from every other hyphenated detector (the
+                                SSN's 3-2-4, the UK sort code's 2-2-2, the
+                                Canadian routing 5-3, the Australian BSB's
+                                3-3, the Korean Giro's 5-2, the Korean RRN's
+                                6-7, the Thai national ID's 1-4-5-2-1, and the
+                                Brazilian CPF's dotted 3.3.3-2). The Finnish
+                                HETU shares the same ``YYMMDD[-+]NNNC``
+                                candidate window when the 11th HETU check
+                                character happens to be a decimal digit, but
+                                the validators are independent: a token that
+                                clears Luhn almost never clears the HETU's
+                                mod-31, and vice versa, so the two detectors
+                                never both fire on the same token. The Luhn +
+                                date + non-zero-NNN triple gate gives roughly
+                                a 1/1000 random-token pass rate.
 - ``tr_tckn``                 : a Turkish T.C. Kimlik Numarasi (TCKN) -- the
                                 11-digit national identification number every
                                 Turkish citizen carries -- whose non-zero leading
@@ -844,6 +874,46 @@ _FI_HETU_ALPHABET = "0123456789ABCDEFHJKLMNPRSTUVWXY"
 # 7th character to this assigned set is a structural precision lever; any other
 # character is never a live HETU.
 _FI_HETU_SEPARATORS = frozenset("+-ABCDEFYXWVU")
+
+# Swedish personnummer candidate -- the 10-digit national identification number
+# every Swedish resident is issued, in its canonical hyphenated printed form
+# ``YYMMDD-NNNC``: a six-digit ``YYMMDD`` birth date, a single **century
+# separator** (``-`` for residents under 100 years old, ``+`` for residents 100
+# years old and over), a three-digit individual number ``NNN`` (odd for male,
+# even for female), and a single trailing **Luhn check digit** ``C`` computed
+# over the nine ``YYMMDDNNN`` digits.
+#
+# The candidate window is ``\d{6}[-+]\d{4}`` -- the same six-digit-birth-date
+# plus single-separator plus four-digit-tail shape the Finnish HETU also uses
+# when the HETU's 11th check character happens to be a decimal digit. The two
+# detectors deliberately share the candidate generation (both validators run
+# over the same matches) but they never both fire on the same token because
+# the validators are arithmetically independent: a token that clears the
+# Luhn-over-nine-digits check almost never clears the HETU's mod-31 alphabet
+# check, and vice versa, so the personnummer scan claims the Luhn-valid
+# tokens and the HETU scan claims the mod-31-valid tokens. The 6-4
+# hyphenated split is otherwise distinct from every other hyphenated detector
+# in this module (the SSN's 3-2-4, the UK sort code's 2-2-2, the Canadian
+# routing's 5-3, the Australian BSB's 3-3, the South Korean Giro's 5-2, the
+# Korean RRN's 6-7, the Thai national ID's 1-4-5-2-1, and the Brazilian CPF's
+# dotted 3.3.3-2), so the personnummer scanner never competes with -- and is
+# never double-counted against -- those identifiers either.
+_SE_PNR_RE = re.compile(
+    r"(?<![A-Za-z0-9])"
+    r"\d{6}[-+]\d{4}"
+    r"(?![A-Za-z0-9])"
+)
+# A Swedish personnummer in its canonical hyphenated printed form is exactly
+# 11 characters (6 date + 1 century separator + 3 individual number + 1 check
+# digit). The validator strips the separator before checking arithmetic, so the
+# length gate is over the printed form.
+_SE_PNR_LEN = 11
+# Century separators the Swedish personnummer spec assigns: ``-`` for residents
+# under 100 years old (the overwhelming majority of in-use numbers) and ``+``
+# for residents 100 years old or older. Gating the 7th character to this
+# two-symbol set is a structural precision lever; any other character is never
+# a live personnummer.
+_SE_PNR_SEPARATORS = frozenset("-+")
 
 
 def _curp_check_digit(first17: str) -> int:
@@ -1936,6 +2006,115 @@ def _redact_fi_hetu(code: str) -> str:
     return "XXXXXX" + code[6].upper() + "XXXX"
 
 
+def _se_pnr_check_digit(nine: str) -> int:
+    """Return the Luhn check digit for the nine ``YYMMDDNNN`` digits of a
+    Swedish personnummer.
+
+    The Swedish personnummer uses the same mod-10 Luhn algorithm the
+    credit-card detector uses, but applied left-to-right over exactly nine
+    digits with the leftmost digit weighted ``2`` (rather than right-to-left
+    with the rightmost digit weighted ``2`` as the canonical card form does).
+    The two formulations are equivalent here because nine has odd parity:
+    weights alternate ``2 1 2 1 2 1 2 1 2`` over the digits in order, each
+    product is summed after subtracting 9 from products greater than 9 (i.e.
+    summing the decimal digits of the doubled value), and the check digit is
+    ``(10 - (total mod 10)) mod 10``.
+    """
+    weights = (2, 1, 2, 1, 2, 1, 2, 1, 2)
+    total = 0
+    for d, w in zip(nine, weights):
+        product = int(d) * w
+        if product >= 10:
+            product = (product // 10) + (product % 10)
+        total += product
+    return (10 - (total % 10)) % 10
+
+
+def _se_pnr_valid(candidate: str) -> bool:
+    """Return ``True`` if a string is a structurally valid Swedish personnummer.
+
+    A Swedish personnummer is the 10-digit national identification number
+    every Swedish resident is issued -- the master personal identifier keying
+    banking, tax (the personnummer doubles as the tax id), healthcare, and
+    government services, on a par with the US SSN, Norwegian fødselsnummer,
+    Finnish HETU, Turkish TCKN, Korean RRN, Brazilian CPF, and Mexican CURP.
+    The canonical printed form is ``YYMMDD-NNNC``::
+
+        YYMMDD              a six-digit birth date
+              C             a single century separator
+                            (``-`` = under 100 years old; ``+`` = 100+ years old)
+               NNN          a three-digit individual number
+                            (odd=male, even=female; ``000`` is never assigned)
+                  C         a single trailing Luhn check digit over ``YYMMDDNNN``
+
+    Precision comes from four public, dependency-free gates:
+
+        1. **Shape** -- exactly 11 characters in the
+           ``YYMMDD + sep + NNN + check`` layout (no internal spaces).
+        2. **Real embedded birth date** -- the ``YYMMDD`` block must form a
+           valid month-of-year / day-of-month pair (``MM`` in 01-12, ``DD``
+           in 01-31). The personnummer uses ISO ``YYMMDD`` ordering, unlike
+           the Norwegian fødselsnummer and the Finnish HETU which are both
+           ``DDMMYY``. A token with an impossible day or month is never a
+           live personnummer. (The two-digit year is disambiguated by the
+           century separator above, so we do not gate on it.)
+        3. **Non-zero individual number** -- the ``NNN`` block is assigned
+           ``001``-``999`` in practice and ``000`` was never issued, so a
+           token whose individual number is ``000`` is rejected as a
+           structural impossibility, the same precision lever the TCKN's
+           non-zero leading digit and the CLABE's non-zero bank code give.
+        4. **Luhn check digit** -- the trailing ``C`` must equal the mod-10
+           Luhn check digit computed over the nine ``YYMMDDNNN`` digits. The
+           Luhn check has a ~1/10 random-token pass rate on its own, so the
+           combination of the date gate, the non-zero NNN gate, and the Luhn
+           gives roughly a 1/1000 random-token pass rate.
+
+    A run that clears all four gates is a near-certain real personnummer; a
+    coincidental ``YYMMDD-NNNC`` token fails the date or the Luhn with
+    overwhelming probability. Any malformed input returns ``False`` so the
+    helper is safe to reuse.
+    """
+    pnr = candidate.strip()
+    if len(pnr) != _SE_PNR_LEN:
+        return False
+    if not (pnr[:6].isdigit() and pnr[7:].isdigit()):
+        return False
+    if pnr[6] not in _SE_PNR_SEPARATORS:
+        return False
+    # Birth date: a real MM (01-12) and DD (01-31). The personnummer is
+    # ``YYMMDD`` (year-month-day, ISO order), unlike the Norwegian
+    # fødselsnummer and the Finnish HETU which are both ``DDMMYY``. The
+    # two-digit year is disambiguated by the century separator above, so we
+    # do not gate on it.
+    month = int(pnr[2:4])
+    day = int(pnr[4:6])
+    if not (1 <= month <= 12 and 1 <= day <= 31):
+        return False
+    # The three-digit individual number block must be non-zero (``000`` was
+    # never assigned by Skatteverket / Statistiska centralbyrån).
+    nnn = pnr[7:10]
+    if nnn == "000":
+        return False
+    nine = pnr[:6] + nnn
+    return int(pnr[10]) == _se_pnr_check_digit(nine)
+
+
+def _redact_se_pnr(code: str) -> str:
+    """Redact a Swedish personnummer, preserving only the century separator.
+
+    The 7th character (the century separator, ``-`` for residents under 100
+    years old, ``+`` for residents 100 years old or older) survives so a
+    report retains a coarse triage hint about the birth-century cohort, while
+    the birth date, individual number, and check digit -- the part that pins
+    the leak to a specific identified person -- are masked. The 11-character
+    shape is preserved so the masked form still reads as a personnummer::
+
+        890101-3490 -> XXXXXX-XXXX
+        140101+1018 -> XXXXXX+XXXX
+    """
+    return "XXXXXX" + code[6] + "XXXX"
+
+
 def _tr_tckn_valid(candidate: str) -> bool:
     """Return ``True`` if a string is a structurally valid Turkish TCKN.
 
@@ -2903,6 +3082,62 @@ def _scan_text(
                 "-- discloses a named individual's identity and birth date.",
                 location=location,
                 evidence=_redact_fi_hetu(compact),
+            )
+        )
+
+    # Swedish personnummer (YYMMDD-NNNC, the canonical 10-digit hyphenated form
+    # with a single century separator and a trailing Luhn check digit) -- the
+    # master Swedish personal identifier and a direct, high-value identity-PII
+    # leak class on a par with the SSN, fødselsnummer, HETU, TCKN, RRN, CURP,
+    # and CPF detectors. The personnummer shares its ``\d{6}[-+]\d{4}``
+    # candidate window with the Finnish HETU (which also runs over a
+    # ``YYMMDDC...`` shape when the HETU's 11th check character happens to be a
+    # decimal digit), but the two validators are arithmetically independent --
+    # a token that clears Luhn-over-nine-digits almost never clears the HETU's
+    # mod-31 alphabet check, and vice versa, so the two detectors never both
+    # fire on the same token. We still gate the personnummer scan on the strict
+    # 11-character shape, a real embedded birth date, a non-zero individual
+    # number, AND the public Luhn check digit, so a coincidental token is
+    # vanishingly unlikely to be reported. The 6-4 hyphenated split is
+    # otherwise distinct from every other hyphenated detector in this module
+    # (the SSN's 3-2-4, the UK sort code's 2-2-2, the Canadian routing's 5-3,
+    # the Australian BSB's 3-3, the South Korean Giro's 5-2, the Korean RRN's
+    # 6-7, the Thai national ID's 1-4-5-2-1, and the Brazilian CPF's dotted
+    # 3.3.3-2), so the personnummer never competes with -- and is never
+    # double-counted against -- those identifiers either. A personnummer
+    # echoed into free text discloses a named individual, on a par with the
+    # fødselsnummer / HETU / TCKN / RRN detectors.
+    for m in _SE_PNR_RE.finditer(text):
+        candidate = m.group(0)
+        if not _se_pnr_valid(candidate):
+            continue
+        key = ("personnummer", candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        # Reserve every digit run inside the personnummer under the account /
+        # card / routing namespaces so the scanners below never re-report a
+        # slice of the same identifier (the embedded six-digit date or the
+        # four-digit tail may be picked up as a short digit run -- defensive,
+        # matching how the HETU / CURP / IFSC scans reserve their embedded
+        # digits, even though the contiguous-digit floors (8+/9/13+) cannot
+        # match the personnummer's short embedded date or four-digit tail on
+        # their own).
+        for run in re.findall(r"\d+", candidate):
+            seen.add(("account_number", run))
+            seen.add(("credit_card", run))
+            seen.add(("routing_number", run))
+        findings.append(
+            Finding(
+                check="pii",
+                type="personnummer",
+                severity="high",
+                message="Swedish personnummer (valid YYMMDD-NNNC structure, "
+                "embedded birth date, non-zero individual number, and Luhn "
+                "check digit) leaking into a free-text field -- discloses a "
+                "named individual's identity and birth date.",
+                location=location,
+                evidence=_redact_se_pnr(candidate),
             )
         )
 
