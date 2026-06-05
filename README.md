@@ -22,9 +22,9 @@ scanner that treats an OFX file as an attack surface and asks three questions:
   Turkish TCKNs (national identification numbers), Norwegian fødselsnummer
   (national identity numbers), Finnish HETUs (henkilötunnus personal identity
   codes), Swedish personnummer (national identification numbers), Swiss AHV / AVS
-  social-security numbers, full
-  account numbers, and routing numbers smuggled into free-text transaction names
-  and memos.
+  social-security numbers, Dutch BSNs (Burgerservicenummer citizen-service
+  numbers), full account numbers, and routing numbers smuggled into free-text
+  transaction names and memos.
 - **Is this file anomalous?** Out-of-range posting dates, zero / sign-flipped /
   out-of-range transaction amounts, and other signs of tampering or a backend
   that accepts garbage.
@@ -68,7 +68,7 @@ ferryman [--check {malformed,pii,anomaly,all}] [--format {json,text,h1md,sarif}]
     code, Canadian routing number, Australian BSB code, Indian IFSC code, Mexican
     CLABE, South Korean Giro number, Thai national ID, Brazilian CPF, Mexican
     CURP, South Korean RRN, Turkish TCKN, Norwegian fødselsnummer, Finnish
-    HETU, Swedish personnummer, Swiss AHV, account number, routing number), including
+    HETU, Swedish personnummer, Swiss AHV, Dutch BSN, account number, routing number), including
     investment memos and security ids.
     Evidence is always redacted before it leaves the tool.
   - `anomaly` &mdash; structurally valid but suspicious transactions
@@ -1343,6 +1343,52 @@ $ ferryman --check pii --format text leak.ofx
 
 **Remediation:** never echo a customer's AHV / AVS number into a statement
 memo or transaction name; keep social-insurance identifiers in structured,
+access-controlled fields rather than free text.
+
+### Dutch BSN (Burgerservicenummer) leak detection
+
+A [Dutch BSN](https://en.wikipedia.org/wiki/National_identification_number#Netherlands)
+(Burgerservicenummer, citizen-service number) is the 9-digit master personal
+identifier every Dutch resident is issued &mdash; the key for Dutch tax,
+social insurance, healthcare, and government services, on a par with the
+Norwegian fødselsnummer, the Swiss AHV, and the Turkish TCKN. A BSN echoed
+into free text discloses a named individual (the value keys the DigiD identity
+platform, the BRP population register, and the Dutch tax authority's records).
+Its canonical form is a contiguous 9-digit run whose leading digit is non-zero
+and which passes the public mod-11 "elfproef"
+(`9*d1 + 8*d2 + 7*d3 + 6*d4 + 5*d5 + 4*d6 + 3*d7 + 2*d8 - 1*d9 ≡ 0 mod 11`).
+A BSN echoed into a free-text **memo or transaction name** is a direct Dutch
+identity-PII leak. The **pii** check flags an `nl_bsn` finding (severity
+`high`) when a free-text field contains a string that clears two public,
+dependency-free gates:
+
+1. **leading-digit gate** &mdash; `d1` must be 1-9; a BSN never begins with
+   `0`, so zero-prefixed 9-digit runs are never live national IDs. This gate
+   alone eliminates phone fragments, zip+4-and-one-digit runs, and EIN-like
+   values that start with `0`.
+2. **mod-11 elfproef** &mdash; the Dutch eleven-proof weighted checksum. The
+   subtraction on `d9` (rather than the usual addition) is the published
+   algorithm and is the dominant precision lever: the combined gates give
+   roughly a 1/100 random-token pass rate, comparable to the TCKN's dual
+   check-digit ~1/100.
+
+Because a BSN is a contiguous 9-digit run, its candidate window is shared
+with the ABA routing-number scanner. The BSN scan runs **before** the routing
+and account scanners and reserves any passing run under those namespaces
+&mdash; the same pattern the CLABE / TCKN / Norwegian fødselsnummer scans use
+to guarantee a valid BSN is reported once as the identity it is rather than
+being double-counted as a routing number or a generic account-number run. Any
+9-digit run that fails the elfproef falls through to the routing-number scanner
+as normal. Evidence is fully redacted (`XXXXXXXXX`); no BSN digit survives
+into the report.
+
+```bash
+$ ferryman --check pii --format text leak.ofx
+  [HIGH] pii/nl_bsn @ statement[0].transaction[0].memo: Dutch BSN (Burgerservicenummer, passing the mod-11 elfproef) leaking into a free-text field -- discloses a named individual's identity. Used for Dutch tax, social insurance, and healthcare services.
+```
+
+**Remediation:** never echo a customer's BSN into a statement memo or
+transaction name; keep citizen-service numbers in structured,
 access-controlled fields rather than free text.
 
 ## From finding to HackerOne report

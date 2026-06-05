@@ -186,6 +186,12 @@ def dk_cpr_file() -> Path:
 
 
 @pytest.fixture
+def nl_bsn_file() -> Path:
+    """A bank statement leaking valid Dutch BSNs (9-digit, mod-11 elfproef)."""
+    return FIXTURES / "nl-bsn-leak.ofx"
+
+
+@pytest.fixture
 def entity_bomb_file() -> Path:
     return FIXTURES / "entity-bomb.ofx"
 

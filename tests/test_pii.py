@@ -28,6 +28,7 @@ from ferryman.checks.pii import (
     _kr_rrn_valid,
     _lei_valid,
     _luhn_valid,
+    _nl_bsn_valid,
     _no_fnr_valid,
     _redact_email,
     _se_pnr_valid,
@@ -3776,3 +3777,141 @@ def test_dk_cpr_leak_fixture(dk_cpr_file):
 def test_clean_file_no_dk_cpr(clean_file):
     findings = check_pii(clean_file.read_bytes())
     assert "dk_cpr" not in {f.type for f in findings}
+
+
+# --- Dutch BSN (Burgerservicenummer) ----------------------------------------
+
+# Each VALID_NL_BSN value is a 9-digit Dutch citizen-service number that
+# passes the public mod-11 elfproef and the non-zero leading-digit gate.
+# These are synthetic values constructed to satisfy the public formula only;
+# they are not real BSNs of identified people.
+VALID_NL_BSN = [
+    "123456782",  # 9*1+8*2+7*3+6*4+5*5+4*6+3*7+2*8-2 = 154, 154%11==0
+    "111111110",  # 9+8+7+6+5+4+3+2-0 = 44, 44%11==0
+    "987654329",  # 9*9+8*8+7*7+6*6+5*5+4*4+3*3+2*2-9 = 275, 275%11==0
+    "234567818",  # 9*2+8*3+7*4+6*5+5*6+4*7+3*8+2*1-8 = 176, 176%11==0
+]
+
+# Synthetic BSNs that must NOT pass the elfproef or the structural gates.
+INVALID_NL_BSN = [
+    "123456780",  # elfproef fails (152%11=9)
+    "000000000",  # all-zeros -- also leading-zero gate
+    "012345678",  # leading zero -- valid elfproef but d1==0
+    "12345678",   # 8 digits -- too short
+    "1234567890", # 10 digits -- too long
+    "12345678X",  # non-digit
+    "ABCDEFGHI",  # all letters
+]
+
+
+def _bsn_elfproef(s: str) -> int:
+    """Compute the elfproef weighted sum for a 9-digit string."""
+    d = [int(c) for c in s]
+    return sum([9, 8, 7, 6, 5, 4, 3, 2, -1][i] * d[i] for i in range(9))
+
+
+# Verify our hardcoded VALID_NL_BSN values actually pass the elfproef.
+@pytest.mark.parametrize("bsn", VALID_NL_BSN)
+def test_nl_bsn_elfproef_verified(bsn):
+    """Each VALID_NL_BSN entry must pass the elfproef (this guards the list)."""
+    if not bsn.isdigit() or len(bsn) != 9:
+        pytest.skip("malformed test data")
+    if bsn[0] == "0":
+        pytest.skip("leading-zero entry")
+    assert _bsn_elfproef(bsn) % 11 == 0, f"{bsn} does not pass elfproef"
+
+
+@pytest.mark.parametrize("bsn", ["123456782", "111111110"])
+def test_nl_bsn_accepts_valid(bsn):
+    assert _nl_bsn_valid(bsn) is True
+
+
+@pytest.mark.parametrize("bsn", INVALID_NL_BSN)
+def test_nl_bsn_rejects_invalid(bsn):
+    assert _nl_bsn_valid(bsn) is False
+
+
+def test_nl_bsn_leading_zero_rejected():
+    # A 9-digit run starting with 0 is always rejected, even if the digits
+    # happen to satisfy the elfproef weighted sum.
+    assert _nl_bsn_valid("012345678") is False
+
+
+def test_nl_bsn_in_memo_detected():
+    findings = _scan("Verified holder BSN 123456782 on file")
+    codes = [f for f in findings if f.type == "nl_bsn"]
+    assert len(codes) == 1
+    assert codes[0].severity == "high"
+    assert codes[0].check == "pii"
+    # All 9 digits are masked -- no identifying fragment survives.
+    assert codes[0].evidence == "XXXXXXXXX"
+
+
+def test_nl_bsn_redaction_masks_all_digits():
+    findings = _scan("BSN 111111110 on record")
+    codes = [f for f in findings if f.type == "nl_bsn"]
+    assert len(codes) == 1
+    assert codes[0].evidence == "XXXXXXXXX"
+
+
+def test_nl_bsn_elfproef_failure_not_reported():
+    # A 9-digit run that fails the elfproef must not be reported as nl_bsn.
+    findings = _scan("reference 123456780 skip")
+    assert "nl_bsn" not in {f.type for f in findings}
+
+
+def test_nl_bsn_does_not_collide_with_routing_number():
+    # A BSN that passes the elfproef must be reported as nl_bsn, not as a
+    # routing_number or probable_routing_number -- it is reserved first.
+    findings = _scan("BSN 123456782 on file")
+    types = {f.type for f in findings}
+    assert "nl_bsn" in types
+    assert "routing_number" not in types
+    assert "probable_routing_number" not in types
+
+
+def test_nl_bsn_does_not_collide_with_account_number():
+    # The same 9-digit BSN run must not also appear as an account_number.
+    findings = _scan("BSN 123456782 here")
+    types = {f.type for f in findings}
+    assert "nl_bsn" in types
+    assert "account_number" not in types
+
+
+def test_nl_bsn_does_not_collide_with_credit_card():
+    # The 9-digit BSN is too short for a card but must not be misclassified.
+    findings = _scan("BSN 111111110 in memo")
+    types = {f.type for f in findings}
+    assert "nl_bsn" in types
+    assert "credit_card" not in types
+
+
+def test_same_nl_bsn_deduped_per_field():
+    # The same BSN written twice in the same field collapses to one finding.
+    findings = _scan("bsn 123456782 and 123456782 again")
+    codes = [f for f in findings if f.type == "nl_bsn"]
+    assert len(codes) == 1
+
+
+def test_nl_bsn_does_not_break_other_identifiers():
+    # The BSN scan must not interfere with other identifiers in the same memo.
+    findings = _scan("ssn 123-45-6789 and bsn 123456782")
+    types = {f.type for f in findings}
+    assert "nl_bsn" in types
+    assert "ssn" in types
+
+
+def test_nl_bsn_leak_fixture(nl_bsn_file):
+    findings = check_pii(nl_bsn_file.read_bytes())
+    codes = [f for f in findings if f.type == "nl_bsn"]
+    types = {f.type for f in findings}
+    assert "nl_bsn" in types, f"expected nl_bsn, got: {types}"
+    assert len(codes) >= 1
+    assert all(c.severity == "high" for c in codes)
+    for c in codes:
+        assert c.evidence == "XXXXXXXXX"
+
+
+def test_clean_file_no_nl_bsn(clean_file):
+    findings = check_pii(clean_file.read_bytes())
+    assert "nl_bsn" not in {f.type for f in findings}

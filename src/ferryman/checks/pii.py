@@ -277,6 +277,25 @@ Detection classes:
                                 routing namespaces so a valid AHV is reported
                                 once as the identity it is rather than being
                                 double-counted as a card or generic digit run.
+- ``nl_bsn``                  : a Dutch Burgerservicenummer (BSN) -- the
+                                9-digit Dutch citizen-service number that is the
+                                master personal identifier used for tax, social
+                                insurance, healthcare, and government services --
+                                in its canonical contiguous 9-digit form, whose
+                                public mod-11 "elfproef" check
+                                (``9*d1 + 8*d2 + ... + 2*d8 - 1*d9 ≡ 0 mod 11``)
+                                validates, a near-certain Dutch identity-PII leak.
+                                The BSN is a contiguous 9-digit run, so it must
+                                be detected before the generic ABA routing-number
+                                and account-number scanners; any run that passes
+                                the elfproef is reserved under the routing and
+                                account namespaces so it is never also reported
+                                as a routing number or plain account number.
+                                Zero-padded and all-zero BSNs are rejected by
+                                the leading-zero gate (d1 must be 1-9); the
+                                mod-11 gives roughly a 1/100 random-token pass
+                                rate, comparable to the TCKN's dual-check-digit
+                                precision.
 - ``tr_tckn``                 : a Turkish T.C. Kimlik Numarasi (TCKN) -- the
                                 11-digit national identification number every
                                 Turkish citizen carries -- whose non-zero leading
@@ -1031,6 +1050,14 @@ _DK_CPR_RE = re.compile(r"(?<![A-Za-z0-9])\d{6}-\d{4}(?![A-Za-z0-9])")
 # characters (6 date + 1 hyphen + 4 serial). The validator gates on the
 # printed form so the length check rejects a 10-digit contiguous run.
 _DK_CPR_LEN = 11
+
+# Dutch BSN (Burgerservicenummer): exactly 9 contiguous digits. The same
+# ``\b\d{9}\b`` window as the ABA routing-number scanner; we run BSN first
+# and reserve any passing run so the routing scanner never re-classifies it.
+# Leading-zero gate (d1 must be non-zero) combined with the mod-11 elfproef
+# gives ~1/100 precision -- a coincidental 9-digit run rarely passes both.
+_NL_BSN_RE = re.compile(r"\b\d{9}\b")
+_NL_BSN_LEN = 9
 
 
 def _curp_check_digit(first17: str) -> int:
@@ -2397,6 +2424,49 @@ def _redact_dk_cpr(code: str) -> str:
     return "XX" + code[2:4] + "XX-XXXX"
 
 
+def _nl_bsn_valid(candidate: str) -> bool:
+    """Return ``True`` if *candidate* is a structurally valid Dutch BSN.
+
+    A Dutch Burgerservicenummer (BSN) is a 9-digit national citizen-service
+    number used for tax, social insurance, healthcare, and government
+    services. Precision comes from two public, dependency-free gates:
+
+    1. **Shape** -- exactly 9 decimal digits.
+    2. **Leading-digit gate** -- ``d1`` must be 1-9; a BSN never begins
+       with ``0``, so zero-prefixed runs are rejected outright.
+    3. **Mod-11 elfproef** -- the Dutch "elf-proof" weighted checksum:
+       ``(9*d1 + 8*d2 + 7*d3 + 6*d4 + 5*d5 + 4*d6 + 3*d7 + 2*d8 - 1*d9)
+       mod 11 == 0``.  The subtraction on ``d9`` (rather than the usual
+       addition) is the published algorithm; any malformed input returns
+       ``False`` so the helper is safe to reuse.
+
+    The ~1/100 random-token pass rate (leading-zero gate + mod-11) gives
+    precision comparable to the TCKN's dual-check-digit gate.
+    """
+    bsn = candidate.strip()
+    if len(bsn) != _NL_BSN_LEN or not bsn.isdigit():
+        return False
+    # Leading-digit gate: a BSN never begins with 0.
+    if bsn[0] == "0":
+        return False
+    d = [int(c) for c in bsn]
+    weights = [9, 8, 7, 6, 5, 4, 3, 2, -1]
+    total = sum(w * v for w, v in zip(weights, d))
+    return total % 11 == 0
+
+
+def _redact_nl_bsn(bsn: str) -> str:
+    """Redact a Dutch BSN, masking all 9 digits.
+
+    A BSN carries no non-sensitive structural element suitable for a
+    triage hint (unlike a CPR's birth-month pair), so every digit is
+    masked::
+
+        123456782 -> XXXXXXXXX
+    """
+    return "X" * _NL_BSN_LEN
+
+
 def _tr_tckn_valid(candidate: str) -> bool:
     """Return ``True`` if a string is a structurally valid Turkish TCKN.
 
@@ -3624,6 +3694,50 @@ def _scan_text(
                 "leaking into a free-text field -- PCI-DSS sensitive.",
                 location=location,
                 evidence=_redact_digits(m.group(0)),
+            )
+        )
+
+    # Dutch BSN (Burgerservicenummer) -- exactly 9 contiguous digits whose
+    # first digit is non-zero and which pass the public mod-11 elfproef
+    # ``(9*d1 + 8*d2 + ... + 2*d8 - 1*d9) mod 11 == 0``. The BSN is the
+    # master Dutch personal identifier for tax, social insurance, healthcare,
+    # and government services; a BSN echoed into a free-text field discloses a
+    # named individual's identity -- a reportable Dutch PII disclosure on a par
+    # with the Norwegian fødselsnummer / Turkish TCKN / Swiss AHV.
+    #
+    # The 9-digit candidate window is shared with the ABA routing-number scanner
+    # (``_ROUTING_RE = r"\b\d{9}\b"``). We run the BSN scanner FIRST and reserve
+    # any passing run under the ``("routing_number", digits)`` and
+    # ``("account_number", digits)`` namespaces so that run is never also
+    # reported as a routing number or a generic account-number-shaped value.
+    # Runs that fail the elfproef fall through to the routing-number scanner and
+    # are handled there. The leading-zero gate (d1 must be 1-9) combined with
+    # the mod-11 give roughly a 1/100 random-token pass rate -- comparable to the
+    # TCKN's ~1/100 precision -- so false-positive flooding is not a concern.
+    for m in _NL_BSN_RE.finditer(text):
+        digits = m.group(0)
+        if not _nl_bsn_valid(digits):
+            continue
+        key = ("nl_bsn", digits)
+        if key in seen:
+            continue
+        seen.add(key)
+        # Reserve the 9-digit run so the routing and account scanners below
+        # never re-classify it.
+        seen.add(("routing_number", digits))
+        seen.add(("account_number", digits))
+        seen.add(("credit_card", digits))
+        findings.append(
+            Finding(
+                check="pii",
+                type="nl_bsn",
+                severity="high",
+                message="Dutch BSN (Burgerservicenummer, passing the mod-11 "
+                "elfproef) leaking into a free-text field -- discloses a "
+                "named individual's identity. Used for Dutch tax, social "
+                "insurance, and healthcare services.",
+                location=location,
+                evidence=_redact_nl_bsn(digits),
             )
         )
 
