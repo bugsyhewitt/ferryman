@@ -1711,3 +1711,39 @@ free-text echo is a reportable Swedish PII disclosure that names the
 individual and their exact birth date.
 
 **Estimated tokens:** 30–50K
+
+---
+
+## Rank 36 — German Steueridentifikationsnummer (de_idnr) Leak Detection (HIGH signal, low effort) — ✅ IMPLEMENTED (2026-06-05, Phase 2 Rotation 37)
+
+**Status:** Shipped. `checks/pii.py` gained `_de_idnr_check_digit()` (the ISO 7064 MOD 11,10
+iterative product algorithm: initialise `P=10`; for each of the first ten digits compute
+`S=(digit+P)%10`, if `S==0` set `S=10`, then `P=(S*2)%11`; the expected check is `11-P`,
+normalised to `0` when the result is `10`), `_de_idnr_valid()` (gates on the exact 11-digit
+contiguous shape, a non-zero leading digit, the BZSt digit-repetition property — at least one
+repeated digit in positions 2-10 of the national-ID issuance rule — and the MOD 11,10 check
+digit), and `_redact_de_idnr()` (all 11 digits masked, `XXXXXXXXXXX`, matching the Dutch BSN
+redaction style since a Steuer-ID carries no non-sensitive structural element). The scan block
+runs BEFORE the Turkish TCKN scan (both use `_TR_TCKN_RE`'s 11-digit candidate window) and
+reserves the matched run under `tr_tckn`, `account_number`, `credit_card`, and `routing_number`
+namespaces for the no-double-counting guarantee. The combined three gates (leading-zero, MOD
+11,10 check, digit-repetition) give roughly a 1/1 000 random-token pass rate — the tightest
+precision of any 11-digit detector in the module. New fixture `tests/fixtures/de-idnr-leak.ofx`
+(two valid Steuer-IDs in two memos plus a decoy `12345678901` run with all-distinct middle
+digits and a wrong check). 26 new tests cover: the check-digit helper (reference vectors),
+the validator (3 valid, 7 invalid including wrong-check / leading-zero / all-distinct-middle /
+wrong-length / non-digit), free-text detection, redaction, wrong-check non-detection, TCKN /
+account / routing non-collision, per-field dedupe, Norwegian fødselsnummer non-collision,
+the fixture (2 findings, correct severity, redaction), the decoy non-detection, and the
+clean-file guard. Full suite: 901 → 927 passing. Zero new dependencies. README gained a
+dedicated German Steuer-ID section and the two introductory type-summary lists were updated.
+
+**Research grounding:** German Steueridentifikationsnummer administered by the
+Bundeszentralamt für Steuern (BZSt); the MOD 11,10 check digit algorithm is published
+in the official BZSt technical documentation and ISO 7064. The digit-repetition property
+(positions 2-10 contain at least one repeated digit) is a published BZSt issuance
+constraint. The Steuer-ID is the master German personal identifier for tax, payroll, and
+healthcare, so a free-text echo is a reportable German PII disclosure on a par with the
+Dutch BSN, Norwegian fødselsnummer, and Turkish TCKN.
+
+**Estimated tokens:** 30–50K

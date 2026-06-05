@@ -18,6 +18,8 @@ from ferryman.checks.pii import (
     _clabe_valid,
     _curp_valid,
     _cusip_valid,
+    _de_idnr_check_digit,
+    _de_idnr_valid,
     _dk_cpr_valid,
     _fi_hetu_valid,
     _iban_valid,
@@ -3915,3 +3917,142 @@ def test_nl_bsn_leak_fixture(nl_bsn_file):
 def test_clean_file_no_nl_bsn(clean_file):
     findings = check_pii(clean_file.read_bytes())
     assert "nl_bsn" not in {f.type for f in findings}
+
+
+# ---------------------------------------------------------------------------
+# German Steueridentifikationsnummer (de_idnr) tests
+# ---------------------------------------------------------------------------
+# Published, verifiable reference Steuer-IDs from the BZSt public documentation
+# and test tooling.
+VALID_DE_IDNR = [
+    "86095742719",
+    "47036892816",
+    "65929970489",
+]
+
+# 11-digit strings that must NOT pass the Steuer-ID validator.
+INVALID_DE_IDNR = [
+    "00000000000",   # zero-leading
+    "01234567890",   # zero-leading
+    "12345678901",   # all-distinct d2..d10, fails digit-repetition gate
+    "86095742710",   # valid structure but wrong check digit (off by one)
+    "1234567890",    # 10 digits -- too short
+    "860957427190",  # 12 digits -- too long
+    "8609574271A",   # non-digit character
+]
+
+
+@pytest.mark.parametrize("idnr", VALID_DE_IDNR)
+def test_de_idnr_check_digit_verified(idnr):
+    """Each VALID_DE_IDNR entry must satisfy the ISO 7064 MOD 11,10 check."""
+    assert _de_idnr_check_digit(idnr[:10]) == int(idnr[10]), (
+        f"{idnr} failed the MOD 11,10 check"
+    )
+
+
+@pytest.mark.parametrize("idnr", VALID_DE_IDNR)
+def test_de_idnr_accepts_valid(idnr):
+    assert _de_idnr_valid(idnr) is True
+
+
+@pytest.mark.parametrize("idnr", INVALID_DE_IDNR)
+def test_de_idnr_rejects_invalid(idnr):
+    assert _de_idnr_valid(idnr) is False
+
+
+def test_de_idnr_leading_zero_rejected():
+    assert _de_idnr_valid("01234567899") is False
+
+
+def test_de_idnr_all_distinct_middle_rejected():
+    # A run where positions 2-10 are all distinct (e.g. 123456789) must fail
+    # the digit-repetition gate regardless of the check digit.
+    # 12345678901 has middle=234567890 (9 distinct) and wrong check anyway.
+    assert _de_idnr_valid("12345678901") is False
+
+
+def test_de_idnr_in_memo_detected():
+    findings = _scan("Steuer-ID 86095742719 Steuerbescheid")
+    codes = [f for f in findings if f.type == "de_idnr"]
+    assert len(codes) == 1
+    assert codes[0].severity == "high"
+    assert codes[0].check == "pii"
+    # All 11 digits are masked.
+    assert codes[0].evidence == "XXXXXXXXXXX"
+
+
+def test_de_idnr_redaction_masks_all_digits():
+    findings = _scan("IdNr 47036892816 on record")
+    codes = [f for f in findings if f.type == "de_idnr"]
+    assert len(codes) == 1
+    assert codes[0].evidence == "XXXXXXXXXXX"
+
+
+def test_de_idnr_wrong_check_not_reported():
+    # Off-by-one in the check digit must not fire.
+    findings = _scan("IdNr 86095742710 memo")
+    assert "de_idnr" not in {f.type for f in findings}
+
+
+def test_de_idnr_does_not_collide_with_tckn():
+    # A valid Steuer-ID must be reported as de_idnr, not tr_tckn.
+    findings = _scan("Steuer-ID 86095742719 entry")
+    types = {f.type for f in findings}
+    assert "de_idnr" in types
+    assert "tr_tckn" not in types
+
+
+def test_de_idnr_does_not_collide_with_account_number():
+    findings = _scan("IdNr 86095742719 here")
+    types = {f.type for f in findings}
+    assert "de_idnr" in types
+    assert "account_number" not in types
+
+
+def test_de_idnr_does_not_collide_with_routing_number():
+    findings = _scan("IdNr 86095742719 entry")
+    types = {f.type for f in findings}
+    assert "de_idnr" in types
+    assert "routing_number" not in types
+    assert "probable_routing_number" not in types
+
+
+def test_same_de_idnr_deduped_per_field():
+    findings = _scan("IdNr 86095742719 and 86095742719 again")
+    codes = [f for f in findings if f.type == "de_idnr"]
+    assert len(codes) == 1
+
+
+def test_de_idnr_does_not_collide_with_no_fnr():
+    # Norwegian fødselsnummer is also 11 digits; the two must not both fire on
+    # the same run.  A valid Steuer-ID is very unlikely to also pass the dual
+    # mod-11 Norwegian gate — but the reservation in the scan ensures it.
+    findings = _scan("ref 86095742719 note")
+    types = {f.type for f in findings}
+    # At most one 11-digit identity type fires per run.
+    assert sum(1 for t in ("de_idnr", "no_fnr", "tr_tckn") if t in types) <= 1
+
+
+def test_de_idnr_leak_fixture(de_idnr_file):
+    findings = check_pii(de_idnr_file.read_bytes())
+    codes = [f for f in findings if f.type == "de_idnr"]
+    types = {f.type for f in findings}
+    assert "de_idnr" in types, f"expected de_idnr, got: {types}"
+    assert len(codes) >= 2  # fixture has two valid Steuer-IDs
+    assert all(c.severity == "high" for c in codes)
+    for c in codes:
+        assert c.evidence == "XXXXXXXXXXX"
+
+
+def test_de_idnr_decoy_not_detected(de_idnr_file):
+    # The fixture also contains a decoy 11-digit run (12345678901) that should
+    # NOT produce a de_idnr finding (all-distinct middle + wrong check).
+    findings = check_pii(de_idnr_file.read_bytes())
+    codes = [f for f in findings if f.type == "de_idnr"]
+    # There should be exactly 2 findings (the two valid Steuer-IDs), not 3.
+    assert len(codes) == 2
+
+
+def test_clean_file_no_de_idnr(clean_file):
+    findings = check_pii(clean_file.read_bytes())
+    assert "de_idnr" not in {f.type for f in findings}

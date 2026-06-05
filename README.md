@@ -23,8 +23,8 @@ scanner that treats an OFX file as an attack surface and asks three questions:
   (national identity numbers), Finnish HETUs (henkilötunnus personal identity
   codes), Swedish personnummer (national identification numbers), Swiss AHV / AVS
   social-security numbers, Dutch BSNs (Burgerservicenummer citizen-service
-  numbers), full account numbers, and routing numbers smuggled into free-text
-  transaction names and memos.
+  numbers), German Steueridentifikationsnummern (IdNr), full account numbers,
+  and routing numbers smuggled into free-text transaction names and memos.
 - **Is this file anomalous?** Out-of-range posting dates, zero / sign-flipped /
   out-of-range transaction amounts, and other signs of tampering or a backend
   that accepts garbage.
@@ -68,7 +68,7 @@ ferryman [--check {malformed,pii,anomaly,all}] [--format {json,text,h1md,sarif}]
     code, Canadian routing number, Australian BSB code, Indian IFSC code, Mexican
     CLABE, South Korean Giro number, Thai national ID, Brazilian CPF, Mexican
     CURP, South Korean RRN, Turkish TCKN, Norwegian fødselsnummer, Finnish
-    HETU, Swedish personnummer, Swiss AHV, Dutch BSN, account number, routing number), including
+    HETU, Swedish personnummer, Swiss AHV, Dutch BSN, German Steuer-ID, account number, routing number), including
     investment memos and security ids.
     Evidence is always redacted before it leaves the tool.
   - `anomaly` &mdash; structurally valid but suspicious transactions
@@ -1389,6 +1389,49 @@ $ ferryman --check pii --format text leak.ofx
 
 **Remediation:** never echo a customer's BSN into a statement memo or
 transaction name; keep citizen-service numbers in structured,
+access-controlled fields rather than free text.
+
+### German Steueridentifikationsnummer (Steuer-ID / IdNr) leak detection
+
+A [German Steueridentifikationsnummer](https://en.wikipedia.org/wiki/National_identification_number#Germany)
+(IdNr) is the 11-digit permanent tax identification number issued by the
+Bundeszentralamt für Steuern (BZSt) to every individual resident in Germany
+&mdash; the master German personal identifier for tax, payroll, and government
+services, on a par with the Dutch BSN, the Norwegian fødselsnummer, and the
+Turkish TCKN. A Steuer-ID echoed into free text discloses a named individual
+(the value keys the BZSt tax register and is printed on every payslip and tax
+assessment notice in Germany). Its canonical form is a contiguous 11-digit
+run whose first digit is 1-9, whose digits 2-10 contain at least one repeated
+value (a BZSt-published issuance rule), and which passes the
+[ISO 7064 MOD 11,10](https://en.wikipedia.org/wiki/ISO_7064) iterative product
+check digit. A Steuer-ID echoed into a free-text **memo or transaction name**
+is a direct German identity-PII leak. The **pii** check flags a `de_idnr`
+finding (severity `high`) when a free-text field contains a string that clears
+three public, dependency-free gates:
+
+1. **leading-digit gate** &mdash; `d1` must be 1-9; a Steuer-ID never begins
+   with `0`.
+2. **digit-repetition gate** &mdash; digits 2-10 must contain at least one
+   value that appears twice or more (BZSt issuance guarantee). All-distinct
+   middle-digit runs are rejected outright.
+3. **ISO 7064 MOD 11,10 check digit** &mdash; the iterative product algorithm
+   applied to the first ten digits. The combined three gates give roughly a
+   1/1 000 random-token pass rate &mdash; the tightest precision of any
+   11-digit detector in ferryman.
+
+Because a Steuer-ID is a contiguous 11-digit run, its candidate window is
+shared with the Turkish TCKN scanner. The German scan runs **before** the TCKN
+scan and reserves any passing run under the TCKN and other numeric namespaces
+so a valid Steuer-ID is reported once as the identity it is. Evidence is fully
+redacted (`XXXXXXXXXXX`).
+
+```bash
+$ ferryman --check pii --format text leak.ofx
+  [HIGH] pii/de_idnr @ statement[0].transaction[0].memo: German Steueridentifikationsnummer (IdNr: valid 11-digit structure, non-zero leading digit, ISO 7064 MOD 11,10 check digit, and BZSt digit-repetition property) leaking into a free-text field -- discloses a named German individual's identity.
+```
+
+**Remediation:** never echo a customer's Steuer-ID into a statement memo or
+transaction name; keep tax identification numbers in structured,
 access-controlled fields rather than free text.
 
 ## From finding to HackerOne report
