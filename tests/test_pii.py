@@ -18,6 +18,7 @@ from ferryman.checks.pii import (
     _clabe_valid,
     _curp_valid,
     _cusip_valid,
+    _dk_cpr_valid,
     _fi_hetu_valid,
     _iban_valid,
     _ifsc_valid,
@@ -3636,3 +3637,142 @@ def test_ch_ahv_leak_fixture(ch_ahv_file):
 def test_clean_file_no_ch_ahv(clean_file):
     findings = check_pii(clean_file.read_bytes())
     assert "ch_ahv" not in {f.type for f in findings}
+
+
+# --- Danish CPR (Centrale Personregister) -----------------------------------
+
+# Each VALID_DK_CPR value is a structurally complete 11-character CPR number:
+# a six-digit DDMMYY birth date, a mandatory hyphen separator, and a four-digit
+# serial that must not be 0000. These are synthetic, fictitious values
+# constructed only to satisfy the public structural gates, not real CPR numbers
+# of identified people.
+VALID_DK_CPR = [
+    "110375-4325",  # day=11, month=03, year=75, serial=4325
+    "010180-1234",  # day=01, month=01, year=80, serial=1234
+    "311299-0001",  # day=31, month=12, year=99, serial=0001 (non-zero)
+    "150660-9999",  # day=15, month=06, year=60, serial=9999
+    "280290-5678",  # day=28, month=02, year=90 (a common birth-date format)
+]
+
+INVALID_DK_CPR = [
+    "991399-1234",  # month=13 -- impossible date
+    "320175-4325",  # day=32 -- impossible date
+    "000175-4325",  # day=00 -- impossible date (DD is 1-31)
+    "110075-4325",  # month=00 -- impossible date (MM is 1-12)
+    "110375-0000",  # serial=0000 -- never assigned
+    "110375-432",   # too short (10 chars)
+    "110375-43250", # too long (12 chars)
+    "110375/4325",  # ``/`` not a hyphen
+    "1103754325",   # missing separator (10 chars contiguous)
+    "110375A4325",  # letter in separator position
+    "ab0375-4325",  # non-digit in date
+    "11037X-4325",  # non-digit in date
+    "110375-432X",  # non-digit in serial
+]
+
+
+@pytest.mark.parametrize("cpr", VALID_DK_CPR)
+def test_dk_cpr_accepts_real_structure(cpr):
+    assert _dk_cpr_valid(cpr) is True
+
+
+@pytest.mark.parametrize("cpr", INVALID_DK_CPR)
+def test_dk_cpr_rejects_invalid(cpr):
+    assert _dk_cpr_valid(cpr) is False
+
+
+def test_dk_cpr_in_memo_detected():
+    findings = _scan("Verified holder CPR 110375-4325 on file")
+    codes = [f for f in findings if f.type == "dk_cpr"]
+    assert len(codes) == 1
+    assert codes[0].severity == "high"
+    assert codes[0].check == "pii"
+    # The month digits survive for triage; everything else is masked.
+    assert codes[0].evidence == "XX03XX-XXXX"
+
+
+def test_dk_cpr_redaction_masks_identity():
+    findings = _scan("holder 010180-1234 file")
+    codes = [f for f in findings if f.type == "dk_cpr"]
+    assert len(codes) == 1
+    # Birth day, year, and serial must never leave the tool.
+    assert "01" not in codes[0].evidence[:2]   # day masked
+    assert "80" not in codes[0].evidence[4:6]  # year masked
+    assert "1234" not in codes[0].evidence     # serial masked
+
+
+def test_dk_cpr_bad_date_not_reported():
+    # A token whose embedded DDMMYY does not form a real date is never a CPR.
+    findings = _scan("decoy reference 991399-1234 ignored")
+    assert "dk_cpr" not in {f.type for f in findings}
+
+
+def test_dk_cpr_zero_serial_not_reported():
+    # The serial was never assigned 0000; the validator rejects it.
+    findings = _scan("decoy 110375-0000 ignored")
+    assert "dk_cpr" not in {f.type for f in findings}
+
+
+def test_dk_cpr_does_not_collide_with_personnummer():
+    # The personnummer scan runs before CPR (it's more precise); a token that
+    # passes the Luhn check is claimed as a personnummer and is not also
+    # reported as a dk_cpr.
+    findings = _scan("pnr 890101-3493 here")
+    types = {f.type for f in findings}
+    assert "personnummer" in types
+    assert "dk_cpr" not in types
+
+
+def test_dk_cpr_does_not_collide_with_digit_scanners():
+    # The CPR's mandatory hyphen keeps the six-digit date and four-digit serial
+    # disjoint from the contiguous-digit scanners (account / routing / card).
+    findings = _scan("holder 110375-4325 file")
+    types = [f.type for f in findings]
+    assert types.count("dk_cpr") == 1
+    assert "account_number" not in types
+    assert "routing_number" not in types
+    assert "credit_card" not in types
+
+
+def test_dk_cpr_does_not_collide_with_other_hyphenated_detectors():
+    # The CPR uses a 6-4 hyphenated split -- distinct from SSN (3-2-4), UK
+    # sort code (2-2-2), Canadian routing (5-3), and Australian BSB (3-3).
+    assert "dk_cpr" not in {f.type for f in _scan("ssn 123-45-6789 here")}
+    assert "dk_cpr" not in {f.type for f in _scan("sort 20-00-00 here")}
+
+
+def test_dk_cpr_does_not_break_other_identifiers():
+    # The CPR scan must not interfere with other identifiers in the same memo.
+    findings = _scan("ssn 123-45-6789 and cpr 110375-4325")
+    types = {f.type for f in findings}
+    assert "dk_cpr" in types
+    assert "ssn" in types
+
+
+def test_same_dk_cpr_deduped_per_field():
+    # The same CPR written twice in the same field collapses to one finding.
+    findings = _scan("cpr 110375-4325 and 110375-4325 again")
+    codes = [f for f in findings if f.type == "dk_cpr"]
+    assert len(codes) == 1
+
+
+def test_dk_cpr_leak_fixture(dk_cpr_file):
+    findings = check_pii(dk_cpr_file.read_bytes())
+    codes = [f for f in findings if f.type == "dk_cpr"]
+    types = {f.type for f in findings}
+    assert "dk_cpr" in types, f"expected dk_cpr, got: {types}"
+    # The fixture leaks two valid CPRs in memos; the bad-date decoy
+    # (991399-1234, month=13) must NOT be reported as a dk_cpr.
+    assert len(codes) == 2
+    assert all(c.severity == "high" for c in codes)
+    for c in codes:
+        # Evidence format: XXDDXX-XXXX where month digits survive.
+        assert c.evidence.startswith("XX")
+        assert c.evidence[4:6] == "XX"
+        assert c.evidence.endswith("-XXXX")
+        assert c.type == "dk_cpr"
+
+
+def test_clean_file_no_dk_cpr(clean_file):
+    findings = check_pii(clean_file.read_bytes())
+    assert "dk_cpr" not in {f.type for f in findings}

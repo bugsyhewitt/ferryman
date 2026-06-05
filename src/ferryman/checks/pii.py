@@ -232,6 +232,28 @@ Detection classes:
                                 never both fire on the same token. The Luhn +
                                 date + non-zero-NNN triple gate gives roughly
                                 a 1/1000 random-token pass rate.
+- ``dk_cpr``                  : a Danish CPR (Centrale Personregister) number --
+                                the 10-digit national identification number every
+                                Danish resident is issued, in its canonical
+                                hyphenated ``DDMMYY-XXXX`` form (a six-digit
+                                DDMMYY birth date, a mandatory hyphen, and a
+                                four-digit serial) -- whose shape, embedded
+                                birth date, and non-zero serial all validate, a
+                                Danish identity-PII leak. Detection is
+                                **structure-only**: Det Centrale Personregister
+                                abolished the historical mod-11 check digit in
+                                October 2007 to extend the issuance namespace,
+                                and many post-2007 CPRs do not satisfy the old
+                                check, so a checksum-gated detector would
+                                silently miss the dominant in-circulation
+                                cohort. The CPR shares its ``\\d{6}-\\d{4}``
+                                candidate window with the Swedish personnummer
+                                and is ordered after the personnummer scan;
+                                the personnummer's Luhn check claims any
+                                overlapping token, so the two never both fire.
+                                Looser precision (~1/30 random-token pass) than
+                                the checksum-gated identity detectors, but the
+                                only honest gate available for post-2007 CPRs.
 - ``ch_ahv``                  : a Swiss AHV / AVS social-security number -- the
                                 13-digit national social-insurance number every
                                 Swiss resident is issued (used for AHV/AVS
@@ -969,6 +991,46 @@ _CH_AHV_LEN = 13
 _CH_AHV_WEIGHTS = (1, 3, 1, 3, 1, 3, 1, 3, 1, 3, 1, 3)
 # The mandatory Swiss country prefix every AHV begins with.
 _CH_AHV_PREFIX = "756"
+
+# Danish CPR (Centrale Personregister / Det Centrale Personregister) candidate
+# -- the 10-digit national identification number every Danish resident is
+# issued, in its canonical hyphenated printed form ``DDMMYY-XXXX`` (a six-digit
+# DDMMYY birth date, a hyphen, and a four-digit serial). It is the master
+# personal identifier keying banking, tax, healthcare, and government services
+# in Denmark, on a par with the Norwegian fødselsnummer, the Swedish
+# personnummer, the Finnish HETU, and the Swiss AHV.
+#
+# Detection is **structure-only** -- no arithmetic check digit. The historical
+# mod-11 weighted check on the seventh-through-tenth digits was abolished by
+# Det Centrale Personregister in October 2007 to extend the issuance namespace;
+# many CPRs issued from 2007 onward do NOT satisfy the old mod-11, so a
+# detector that gated on the checksum would silently miss the dominant
+# in-circulation cohort going forward. Precision comes instead from three
+# public structural levers: the strict ``\d{6}-\d{4}`` shape (the only
+# detector in this module whose 6-4 hyphenated split with a mandatory ``-``
+# separator narrows the candidate window beyond the broader personnummer /
+# HETU ``\d{6}[-+]\d{4}`` shape, since the personnummer's ``+`` separator
+# encodes 100+ year-old residents -- which Denmark never used), a real
+# embedded ``DD MM YY`` birth date (DD 01-31, MM 01-12 -- year unconstrained,
+# as a CPR is issued for any year 1858-current), and a non-zero serial
+# (``0000`` was never assigned).
+#
+# The 6-4 split is the same window the Swedish personnummer uses, so the
+# detector is ordered AFTER the personnummer scan in ``_scan_text``: a token
+# that clears the personnummer's Luhn + ISO-date + non-zero-NNN gate is
+# claimed as a personnummer first, and the CPR scan deferentially checks the
+# ``personnummer`` seen-set before firing. (A token can legitimately satisfy
+# both the personnummer YYMMDD and the CPR DDMMYY readings only when the
+# six digits parse as a valid date under both interpretations, which is
+# already rare; the personnummer's Luhn check then narrows the overlap
+# further, and the precedence guarantees no double-counting on the rare
+# overlap that remains.) The bounded lookarounds keep a CPR embedded in a
+# longer digit-and-hyphen blob from being partially matched.
+_DK_CPR_RE = re.compile(r"(?<![A-Za-z0-9])\d{6}-\d{4}(?![A-Za-z0-9])")
+# A Danish CPR in its canonical hyphenated printed form is exactly 11
+# characters (6 date + 1 hyphen + 4 serial). The validator gates on the
+# printed form so the length check rejects a 10-digit contiguous run.
+_DK_CPR_LEN = 11
 
 
 def _curp_check_digit(first17: str) -> int:
@@ -2240,6 +2302,101 @@ def _redact_ch_ahv(code: str) -> str:
     return "756.XXXX.XXXX.XX"
 
 
+def _dk_cpr_valid(candidate: str) -> bool:
+    """Return ``True`` if a string is a structurally valid Danish CPR number.
+
+    A Danish CPR (Centrale Personregister) is the 10-digit national
+    identification number every Danish resident is issued -- the master
+    personal identifier keying banking, tax, healthcare, and government
+    services, on a par with the US SSN, Norwegian fødselsnummer, Swedish
+    personnummer, Finnish HETU, and Swiss AHV. A CPR echoed into a statement
+    memo or transaction name discloses a named individual's identity (and
+    their exact birth date), not merely an account.
+
+    The canonical printed form is ``DDMMYY-XXXX``::
+
+        DDMMYY              a six-digit ``DD MM YY`` birth date
+              -             a single mandatory hyphen separator
+                XXXX        a four-digit serial (the seventh digit historically
+                            encoded the century, the eighth-through-tenth
+                            encoded sex via parity, and the ninth-and-tenth
+                            historically formed a mod-11 weighted check digit
+                            -- abolished by CPR in October 2007 to extend the
+                            issuance namespace)
+
+    Precision is **structure-only** -- the historical mod-11 check digit was
+    abolished by Det Centrale Personregister in October 2007 (many CPRs issued
+    from 2007 onward do not satisfy the old check, so gating on it would miss
+    the dominant in-circulation cohort going forward). Three public,
+    dependency-free gates take its place:
+
+        1. **Shape** -- exactly 11 characters in the ``DDMMYY-XXXX`` layout
+           (6 date + 1 mandatory hyphen + 4 serial), all digits except the
+           single hyphen.
+        2. **Real embedded birth date** -- ``DD`` (01-31) and ``MM`` (01-12)
+           must form a valid day-of-month / month-of-year pair. The detector
+           accepts the standard 1-31 / 1-12 ranges and does NOT enforce the
+           Danish replacement-CPR offsets (a known convention where ``DD`` may
+           be incremented by 60 for replacement numbers issued when the
+           assigned 4-digit serial pool was exhausted) -- accepting only the
+           canonical date is the higher-precision choice and matches what an
+           everyday Danish statement memo contains. Year is unconstrained
+           (a CPR is issued for any year 1858-current; the historical
+           century encoding lived in the seventh digit and is not gated here).
+        3. **Non-zero serial** -- the four-digit ``XXXX`` block was never
+           assigned ``0000``, so a token whose serial is all zeros is rejected
+           as a structural impossibility, the same precision lever the
+           personnummer's non-zero ``NNN``, the CLABE's non-zero bank code,
+           and the TCKN's non-zero leading digit give.
+
+    The 6-4 hyphenated shape plus the date + non-zero-serial gates give
+    roughly a 1/30 random-token pass rate -- a looser precision lever than
+    the checksum-gated identity detectors in this module (the personnummer's
+    Luhn ~1/1000, the fødselsnummer's dual mod-11 ~1/1500, the HETU's mod-31
+    ~1/300), so the detector is ordered AFTER those scans in
+    ``_scan_text`` and deferentially yields the candidate window to them.
+    The trade-off is forced by Denmark's 2007 checksum abolition: the
+    alternative -- gating on the historical mod-11 -- would silently miss
+    every post-2007 CPR, and Danish CPR is too high-value an identity-PII
+    leak (Denmark's master personal identifier) to omit entirely. The looser
+    detector still gates out the overwhelming majority of coincidental
+    ``\\d{6}-\\d{4}`` tokens (random six-digit runs that do not parse as a
+    valid DDMMYY date or whose four-digit tail is ``0000``).
+
+    Any malformed input returns ``False`` so the helper is safe to reuse.
+    """
+    cpr = candidate.strip()
+    if len(cpr) != _DK_CPR_LEN:
+        return False
+    if cpr[6] != "-":
+        return False
+    if not (cpr[:6].isdigit() and cpr[7:].isdigit()):
+        return False
+    # Embedded DDMMYY birth date must parse as a valid day/month pair. Year is
+    # unconstrained -- a CPR is issued for any year 1858-current.
+    day = int(cpr[0:2])
+    month = int(cpr[2:4])
+    if not (1 <= day <= 31 and 1 <= month <= 12):
+        return False
+    # The four-digit serial was never assigned ``0000``.
+    return cpr[7:] != "0000"
+
+
+def _redact_dk_cpr(code: str) -> str:
+    """Redact a Danish CPR, preserving only the birth-month pair for triage.
+
+    The day digits, year digits, and four-digit serial -- everything that
+    pins the leak to a specific identified person and their exact birth
+    date -- are masked. The two birth-month digits survive so a report
+    retains a coarse triage hint (the month a leak refers to) while the
+    11-character hyphenated shape is preserved so the masked form still
+    reads as a CPR::
+
+        110375-4325 -> XX03XX-XXXX
+    """
+    return "XX" + code[2:4] + "XX-XXXX"
+
+
 def _tr_tckn_valid(candidate: str) -> bool:
     """Return ``True`` if a string is a structurally valid Turkish TCKN.
 
@@ -3263,6 +3420,72 @@ def _scan_text(
                 "named individual's identity and birth date.",
                 location=location,
                 evidence=_redact_se_pnr(candidate),
+            )
+        )
+
+    # Danish CPR (DDMMYY-XXXX, the canonical 10-digit hyphenated form: a six-
+    # digit DDMMYY birth date, a mandatory hyphen, and a four-digit serial) --
+    # the master Danish personal identifier and a direct, high-value
+    # identity-PII leak class on a par with the personnummer / fødselsnummer /
+    # HETU / TCKN / RRN detectors. The CPR shares its ``\d{6}-\d{4}`` candidate
+    # window with the Swedish personnummer (whose ``\d{6}[-+]\d{4}`` window
+    # also matches a hyphen-separated 6-4 token); the personnummer has a real
+    # Luhn check digit and so is the more precise detector, so the CPR scan
+    # runs AFTER the personnummer scan and deferentially yields any token the
+    # personnummer block already claimed.
+    #
+    # Detection is **structure-only** -- the historical mod-11 check digit was
+    # abolished by Det Centrale Personregister in October 2007 to extend the
+    # issuance namespace; many post-2007 CPRs do NOT satisfy the old check, so
+    # gating on it would silently miss the dominant in-circulation cohort. We
+    # gate instead on the strict ``DDMMYY-XXXX`` shape, a real embedded DDMMYY
+    # birth date, AND a non-zero four-digit serial -- a ~1/30 random-token
+    # pass rate, looser than the checksum-gated identity detectors but the
+    # only honest detector achievable for post-2007 CPRs. The trade-off is
+    # forced by the 2007 checksum abolition: Danish CPR is too high-value an
+    # identity-PII leak to omit entirely. The 6-4 hyphenated split is
+    # otherwise distinct from every other hyphenated detector in this module
+    # (the SSN's 3-2-4, the UK sort code's 2-2-2, the Canadian routing's 5-3,
+    # the Australian BSB's 3-3, the South Korean Giro's 5-2, the Korean RRN's
+    # 6-7, the Thai national ID's 1-4-5-2-1, the Brazilian CPF's dotted
+    # 3.3.3-2, and the personnummer's ``-``/``+`` separator vs the CPR's
+    # mandatory ``-``). The contiguous-digit floors (8+/9/13+) cannot match
+    # the CPR's short six-digit date or four-digit serial on their own, so
+    # the digit scanners never compete with the CPR; we still defensively
+    # reserve every embedded digit run under the account / card / routing
+    # namespaces (matching how the HETU / personnummer / CURP / IFSC scans
+    # reserve their embedded digits). A CPR echoed into free text discloses
+    # a named individual's identity and birth date -- a reportable Danish
+    # PII disclosure.
+    for m in _DK_CPR_RE.finditer(text):
+        candidate = m.group(0)
+        if not _dk_cpr_valid(candidate):
+            continue
+        # Defer to the more precise personnummer detector when both scans
+        # would fire on the same token (personnummer adds ``("personnummer",
+        # candidate)`` to ``seen`` immediately above).
+        if ("personnummer", candidate) in seen:
+            continue
+        key = ("dk_cpr", candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        for run in re.findall(r"\d+", candidate):
+            seen.add(("account_number", run))
+            seen.add(("credit_card", run))
+            seen.add(("routing_number", run))
+        findings.append(
+            Finding(
+                check="pii",
+                type="dk_cpr",
+                severity="high",
+                message="Danish CPR (valid DDMMYY-XXXX structure, embedded "
+                "birth date, and non-zero serial) leaking into a free-text "
+                "field -- discloses a named individual's identity and birth "
+                "date. Structure-only (Danish CPR abolished its mod-11 check "
+                "digit in October 2007).",
+                location=location,
+                evidence=_redact_dk_cpr(candidate),
             )
         )
 
