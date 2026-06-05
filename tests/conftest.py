@@ -192,6 +192,12 @@ def nl_bsn_file() -> Path:
 
 
 @pytest.fixture
+def de_idnr_file() -> Path:
+    """A bank statement leaking valid German Steuer-IDs (11-digit, MOD 11,10)."""
+    return FIXTURES / "de-idnr-leak.ofx"
+
+
+@pytest.fixture
 def entity_bomb_file() -> Path:
     return FIXTURES / "entity-bomb.ofx"
 
