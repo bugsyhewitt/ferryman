@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ferryman"
-version = "0.1.0"
+version = "1.0.0"
 description = "A security-focused scanner for OFX (Open Financial Exchange) files, built for the bug-bounty fintech surface."
 readme = "README.md"
 requires-python = ">=3.13"

@@ -179,7 +179,7 @@ results:
 $ ferryman --check all --format json --dir ./statements/
 {
   "tool": "ferryman",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "files": [
     { "tool": "ferryman", "file": "statements/a.ofx", "check": "all",
       "summary": { "total": 1, ... }, "findings": [ ... ] },
@@ -196,7 +196,7 @@ $ ferryman --check all --format json --dir ./statements/
 $ ferryman --check malformed --format json suspicious.ofx
 {
   "tool": "ferryman",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "file": "suspicious.ofx",
   "check": "malformed",
   "summary": { "total": 1, "by_severity": { "critical": 1 }, "by_type": { "xxe": 1 } },

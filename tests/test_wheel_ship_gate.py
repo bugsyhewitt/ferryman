@@ -29,8 +29,8 @@ def test_wheel_builds_cleanly(tmp_path):
         [sys.executable, "-m", "build", "--wheel", "--sdist", "--outdir", str(out)],
         cwd=REPO_ROOT,
     )
-    wheels = list(out.glob("ferryman-0.1.0-*.whl"))
-    sdists = list(out.glob("ferryman-0.1.0.tar.gz"))
+    wheels = list(out.glob("ferryman-1.0.0-*.whl"))
+    sdists = list(out.glob("ferryman-1.0.0.tar.gz"))
     assert wheels, f"wheel not built; got: {list(out.iterdir())}"
     assert sdists, f"sdist not built; got: {list(out.iterdir())}"
     test_wheel_builds_cleanly._wheel = wheels[0]
@@ -52,21 +52,21 @@ def test_wheel_installs_into_fresh_venv(tmp_path):
 
     cli = venv_dir / "bin" / "ferryman"
     version_out = _run([str(cli), "--version"]).stdout.strip()
-    assert version_out == "ferryman 0.1.0", f"unexpected --version output: {version_out!r}"
+    assert version_out == "ferryman 1.0.0", f"unexpected --version output: {version_out!r}"
 
     test_wheel_installs_into_fresh_venv._venv_dir = venv_dir
 
 
 @pytest.mark.ship_gate
 def test_wheel_version_importable_in_fresh_venv(tmp_path):
-    """`import ferryman; ferryman.__version__` == '0.1.0' inside the fresh venv."""
+    """`import ferryman; ferryman.__version__` == '1.0.0' inside the fresh venv."""
     venv_dir = getattr(test_wheel_installs_into_fresh_venv, "_venv_dir", None)
     if venv_dir is None:
         pytest.skip("preceding install test did not build a venv")
 
     py = venv_dir / "bin" / "python"
     _run(
-        [str(py), "-c", "import ferryman; assert ferryman.__version__ == '0.1.0'"],
+        [str(py), "-c", "import ferryman; assert ferryman.__version__ == '1.0.0'"],
     )
 
 
@@ -106,3 +106,15 @@ def test_installed_wheel_runs_end_to_end(tmp_path):
         f"unexpected severity for xxe findings: {xxe_severities}"
     )
     assert xxe_severities, f"no xxe findings with severity; findings: {findings}"
+
+
+@pytest.mark.ship_gate
+def test_changelog_exists_with_v1_0_0_entry():
+    """CHANGELOG.md exists at repo root and contains a ## [1.0.0] - 2026-06-20 entry."""
+    changelog = REPO_ROOT / "CHANGELOG.md"
+    assert changelog.is_file(), f"CHANGELOG.md not found at {changelog}"
+    text = changelog.read_text(encoding="utf-8")
+    assert "## [1.0.0] - 2026-06-20" in text, (
+        f"CHANGELOG.md missing v1.0.0 entry; first 20 lines:\n"
+        + "\n".join(text.splitlines()[:20])
+    )
