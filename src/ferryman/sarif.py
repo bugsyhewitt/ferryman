@@ -67,14 +67,6 @@ _DEFAULT_ARTIFACT = "input.ofx"
 _LINE_RE = re.compile(r"\bline\s+(\d+)\b", re.IGNORECASE)
 
 
-def _level_for(severity: str) -> str:
-    return _LEVEL_BY_SEVERITY.get(severity, "warning")
-
-
-def _rank_for(severity: str) -> float:
-    return _RANK_BY_SEVERITY.get(severity, 50.0)
-
-
 def _rule_id(f: Finding) -> str:
     """Stable rule id: ``<check>/<type>`` (e.g. ``malformed/xxe``)."""
     return f"{f.check}/{f.type}"
@@ -121,8 +113,8 @@ def _result_for(f: Finding) -> dict[str, Any]:
 
     result: dict[str, Any] = {
         "ruleId": _rule_id(f),
-        "level": _level_for(f.severity),
-        "rank": _rank_for(f.severity),
+        "level": _LEVEL_BY_SEVERITY.get(f.severity, "warning"),
+        "rank": _RANK_BY_SEVERITY.get(f.severity, 50.0),
         "message": {"text": f.message or _rule_id(f)},
         "locations": [{"physicalLocation": physical}],
         "properties": properties,
@@ -140,9 +132,7 @@ def _result_for(f: Finding) -> dict[str, Any]:
 
 def _rules_for(findings: list[Finding]) -> list[dict[str, Any]]:
     """One SARIF reportingDescriptor per distinct rule id, sorted for stability."""
-    seen: dict[str, Finding] = {}
-    for f in findings:
-        seen.setdefault(_rule_id(f), f)
+    seen = {_rule_id(f): f for f in reversed(findings)}
     rules: list[dict[str, Any]] = []
     for rule_id in sorted(seen):
         f = seen[rule_id]
@@ -151,7 +141,7 @@ def _rules_for(findings: list[Finding]) -> list[dict[str, Any]]:
                 "id": rule_id,
                 "name": rule_id.replace("/", "_"),
                 "shortDescription": {"text": f"{f.check} check: {f.type}"},
-                "defaultConfiguration": {"level": _level_for(f.severity)},
+                "defaultConfiguration": {"level": _LEVEL_BY_SEVERITY.get(f.severity, "warning")},
                 "properties": {"check": f.check, "type": f.type},
             }
         )

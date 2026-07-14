@@ -6,6 +6,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
+from ferryman import __version__
 from ferryman.checks.anomaly import check_anomaly
 from ferryman.checks.malformed import check_malformed
 from ferryman.checks.pii import check_pii
@@ -44,8 +45,6 @@ def scan_file(path: str | Path, check: str) -> dict[str, Any]:
           "findings": [ {finding}, ... ]
         }
     """
-    from ferryman import __version__
-
     path = Path(path)
     raw = path.read_bytes()
     findings = scan_bytes(raw, check)

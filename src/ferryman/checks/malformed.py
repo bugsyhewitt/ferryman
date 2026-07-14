@@ -43,7 +43,6 @@ _OVERSIZED_FIELD_BYTES = 64 * 1024
 # contains ]]>, that means a nested/injected terminator was present before
 # the legitimate close — a CDATA injection attempt.
 _CDATA_BLOCK_RE = re.compile(rb"<!\[CDATA\[(.*?)]]>", re.DOTALL)
-_CDATA_TERMINATOR_RE = re.compile(rb"]]>")
 
 _DOCTYPE_RE = re.compile(rb"<!DOCTYPE", re.IGNORECASE)
 _ENTITY_RE = re.compile(rb"<!ENTITY", re.IGNORECASE)
@@ -144,9 +143,9 @@ def _check_v1_header(raw: bytes) -> list[Finding]:
     Three sub-detections (Rank 5 of POST_V01.md):
       (a) a second ``OFXHEADER:`` block smuggled into the body after the
           header/body separator -> ``header_injection`` (high).
-      (b) an ENCODING/CHARSET value outside the OFX-allowed set
+      (b) non-printable control bytes inside the header section
           -> ``encoding_mismatch`` (medium).
-      (c) non-printable control bytes inside the header section
+      (c) an ENCODING/CHARSET value outside the OFX-allowed set
           -> ``encoding_mismatch`` (medium).
     """
     if not _is_ofx_v1(raw):
@@ -183,30 +182,30 @@ def _check_v1_header(raw: bytes) -> list[Finding]:
             )
         )
 
-    # (c) Non-printable control bytes in the header section. The header is
+    # (b) Non-printable control bytes in the header section. The header is
     # plaintext KEY:VALUE lines; the only legitimate control characters are
     # CR and LF. NUL is handled separately as encoding_trick; here we catch the
     # broader control-byte class confined to the header (a desync attempt).
-    for i, b in enumerate(header):
-        if b < 0x20 and b not in (0x09, 0x0A, 0x0D):
-            findings.append(
-                Finding(
-                    check="malformed",
-                    type="encoding_mismatch",
-                    severity="medium",
-                    message=(
-                        "Non-printable control byte found inside the OFX v1 "
-                        "header section. Headers are plaintext KEY:VALUE lines; "
-                        "control bytes here are an encoding-confusion attempt to "
-                        "desync parsers."
-                    ),
-                    location=f"byte {i} (line {_line_of(raw, i)})",
-                    metadata={"byte_value": b},
-                )
+    ctrl_m = re.search(rb"[\x00-\x08\x0B\x0C\x0E-\x1F]", header)
+    if ctrl_m:
+        i = ctrl_m.start()
+        findings.append(
+            Finding(
+                check="malformed",
+                type="encoding_mismatch",
+                severity="medium",
+                message=(
+                    "Non-printable control byte found inside the OFX v1 "
+                    "header section. Headers are plaintext KEY:VALUE lines; "
+                    "control bytes here are an encoding-confusion attempt to "
+                    "desync parsers."
+                ),
+                location=f"byte {i} (line {_line_of(raw, i)})",
+                metadata={"byte_value": header[i]},
             )
-            break
+        )
 
-    # (b) ENCODING / CHARSET value outside the OFX-allowed set. Parse the
+    # (c) ENCODING / CHARSET value outside the OFX-allowed set. Parse the
     # header lines structurally (no semantic parse of the document).
     for m in _HEADER_LINE_RE.finditer(header):
         key = m.group(1).upper()
@@ -258,6 +257,8 @@ def check_malformed(raw: bytes) -> list[Finding]:
 
     # --- XXE: DOCTYPE + ENTITY, escalating on external SYSTEM entities ---
     sys_match = _SYSTEM_ENTITY_RE.search(raw)
+    doctype_m = _DOCTYPE_RE.search(raw)
+    ent = _ENTITY_RE.search(raw)
     if sys_match:
         findings.append(
             Finding(
@@ -273,8 +274,7 @@ def check_malformed(raw: bytes) -> list[Finding]:
                 evidence=truncate_evidence(sys_match.group(0).decode("latin-1")),
             )
         )
-    elif _DOCTYPE_RE.search(raw) and _ENTITY_RE.search(raw):
-        ent = _ENTITY_RE.search(raw)
+    elif doctype_m and ent:
         findings.append(
             Finding(
                 check="malformed",
@@ -285,11 +285,10 @@ def check_malformed(raw: bytes) -> list[Finding]:
                     "legitimate use for custom entities; this is a parser-"
                     "confusion / entity-expansion vector."
                 ),
-                location=f"line {_line_of(raw, ent.start())}" if ent else None,
+                location=f"line {_line_of(raw, ent.start())}",
             )
         )
-    elif _DOCTYPE_RE.search(raw):
-        dt = _DOCTYPE_RE.search(raw)
+    elif doctype_m:
         findings.append(
             Finding(
                 check="malformed",
@@ -299,7 +298,7 @@ def check_malformed(raw: bytes) -> list[Finding]:
                     "DOCTYPE declaration present in an OFX document. OFX does "
                     "not define a DTD; presence suggests a crafted file."
                 ),
-                location=f"line {_line_of(raw, dt.start())}" if dt else None,
+                location=f"line {_line_of(raw, doctype_m.start())}",
             )
         )
 
@@ -307,11 +306,8 @@ def check_malformed(raw: bytes) -> list[Finding]:
     # A separately-reportable vector from XXE-for-file-read: >=3 entity
     # declarations where at least one entity body references another declared
     # entity (the recursive chain that explodes on expansion).
-    if (
-        _count_entities(raw) >= _ENTITY_EXPANSION_THRESHOLD
-        and _has_nested_entity_reference(raw)
-    ):
-        ent = _ENTITY_RE.search(raw)
+    entity_count = _count_entities(raw)
+    if entity_count >= _ENTITY_EXPANSION_THRESHOLD and _has_nested_entity_reference(raw):
         findings.append(
             Finding(
                 check="malformed",
@@ -324,7 +320,7 @@ def check_malformed(raw: bytes) -> list[Finding]:
                     "no legitimate use for custom entities."
                 ),
                 location=f"line {_line_of(raw, ent.start())}" if ent else None,
-                metadata={"entity_count": _count_entities(raw)},
+                metadata={"entity_count": entity_count},
             )
         )
 
@@ -400,56 +396,16 @@ def check_malformed(raw: bytes) -> list[Finding]:
             break  # one oversized-field finding is enough to triage
 
     # --- CDATA injection (FERRYMAN-MALFORMED-004) ---
-    # A CDATA block whose content contains ]]> prematurely closes the section,
-    # allowing an attacker to inject raw XML markup into the parsed output.
-    # Strategy: use a non-greedy regex to match each <![CDATA[...]]> block.
-    # Because the regex is non-greedy, it captures up to the *first* ]]>.
-    # We then search the raw document for any ]]> that occurs *inside* one of
-    # those blocks -- i.e., before the legitimate close. Since our regex already
-    # consumed up to the first ]]>, any additional ]]> in the surrounding raw
-    # bytes that falls within the block's byte range is the injected terminator.
-    #
-    # Simpler equivalent: scan for every ]]> in the document.  For each one,
-    # check whether it lies between the start of a CDATA opening marker and the
-    # end of a CDATA block match that started before it.  If the CDATA block
-    # match's content (group 1) is non-empty and the match ends *after* a
-    # second ]]> in the raw bytes, injection is present.
-    #
-    # Practical implementation: for every CDATA match, check whether the raw
-    # slice between the opening marker end and the match's ]]> contains
-    # another ]]>.  The non-greedy regex guarantees the captured content is
-    # the minimal prefix up to the first ]]>; any *subsequent* ]]> in the
-    # same logical block is injection.  We find those by scanning forward from
-    # the match end.
+    # The non-greedy regex captures each CDATA block up to its first ]]>.
+    # A ]]> found after that close with no new <![CDATA[ opener in between
+    # is an orphan terminator — the signature of injected XML content.
     cdata_open = b"<![CDATA["
     for cdata_m in _CDATA_BLOCK_RE.finditer(raw):
-        content = cdata_m.group(1)
-        # The content is the bytes between <![CDATA[ and the first ]]>.
-        # If the content itself contains ]]> it would have been consumed by
-        # the non-greedy match before reaching here -- so content is clean.
-        # Instead, look for injection *after* this CDATA close: if the bytes
-        # immediately after the match's ]]> (i.e. what would be "outside" the
-        # CDATA) start with content that logically belongs to the block, the
-        # document is malformed.  The clearest heuristic: check whether the
-        # raw document contains a ]]> that is preceded by a <![CDATA[ with no
-        # intervening ]]> -- but that's exactly what our non-greedy match
-        # already handles.
-        #
-        # Real injection pattern: the raw document has something like:
-        #   <![CDATA[safe]]>injected-xml]]>
-        # The non-greedy RE matches <![CDATA[safe]]> as one block (content="safe").
-        # The *injected-xml* part then sits outside CDATA in the document.
-        # To catch this, we check: is the text between the end of this block
-        # and the *next* ]]> (if any) preceded by NO new <![CDATA[ opener?
-        # If so, there is a free-floating ]]> -- the signature of injection.
         block_end = cdata_m.end()  # byte offset just after this block's ]]>
         next_term = raw.find(b"]]>", block_end)
         if next_term == -1:
             continue
         between = raw[block_end:next_term]
-        # If there is no new <![CDATA[ between the end of this block and the
-        # next ]]>, that next ]]> is an orphan terminator injected after the
-        # CDATA section closed -- CDATA injection confirmed.
         if cdata_open.lower() not in between.lower() and b"<![CDATA[" not in between:
             snippet_start = max(0, cdata_m.start())
             snippet = raw[snippet_start : next_term + 3]

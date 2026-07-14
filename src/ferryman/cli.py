@@ -51,6 +51,12 @@ from ferryman.scanner import CHECK_CHOICES, scan_file
 # Glob pattern used to discover OFX files inside a --dir directory.
 _DIR_GLOB = "*.ofx"
 
+_SEVERITY_RANK: dict[str, int] = {s: i for i, s in enumerate(SEVERITIES)}
+
+_EXIT_OK = 0
+_EXIT_FAIL_ON = 1
+_EXIT_IO_ERROR = 3
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -111,10 +117,9 @@ def _render_text(result: dict) -> str:
     summary = result["summary"]
     lines.append(f"findings: {summary['total']}")
     if summary["total"]:
-        order = {s: i for i, s in enumerate(SEVERITIES)}
         findings = sorted(
             result["findings"],
-            key=lambda f: order.get(f["severity"], -1),
+            key=lambda f: _SEVERITY_RANK.get(f["severity"], -1),
             reverse=True,
         )
         for f in findings:
@@ -146,13 +151,10 @@ def _attribute_findings(result: dict) -> list[Finding]:
     the source file into every finding's location field to preserve attribution.
     """
     file = result["file"]
-    attributed: list[Finding] = []
-    for f in result["findings"]:
-        data = dict(f)
-        loc = data.get("location")
-        data["location"] = f"{file}: {loc}" if loc else file
-        attributed.append(Finding(**data))
-    return attributed
+    return [
+        Finding(**{**f, "location": f"{file}: {f['location']}" if f.get("location") else file})
+        for f in result["findings"]
+    ]
 
 
 def _collect_inputs(args: argparse.Namespace) -> tuple[list[Path], str | None]:
@@ -185,11 +187,10 @@ def _meets_threshold(results: list[dict], threshold: str) -> bool:
 
     Unknown severity strings sort below ``info`` and never trip the gate.
     """
-    rank = {sev: i for i, sev in enumerate(SEVERITIES)}
-    floor = rank[threshold]
+    floor = _SEVERITY_RANK[threshold]
     for result in results:
         for finding in result["findings"]:
-            if rank.get(finding["severity"], -1) >= floor:
+            if _SEVERITY_RANK.get(finding["severity"], -1) >= floor:
                 return True
     return False
 
@@ -201,7 +202,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     paths, error = _collect_inputs(args)
     if error is not None:
         print(error, file=sys.stderr)
-        return 3
+        return _EXIT_IO_ERROR
 
     multi = len(paths) > 1 or args.directory is not None
 
@@ -209,12 +210,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     for path in paths:
         if not path.is_file():
             print(f"ferryman: cannot read file: {path}", file=sys.stderr)
-            return 3
+            return _EXIT_IO_ERROR
         try:
             results.append(scan_file(path, args.check))
         except OSError as exc:
             print(f"ferryman: error reading {path}: {exc}", file=sys.stderr)
-            return 3
+            return _EXIT_IO_ERROR
 
     if not multi:
         # Single-file mode: byte-identical to the pre-batch behaviour.
@@ -223,8 +224,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         _emit_multi(results, args.output_format)
 
     if args.fail_on is not None and _meets_threshold(results, args.fail_on):
-        return 1
-    return 0
+        return _EXIT_FAIL_ON
+    return _EXIT_OK
 
 
 def _emit_single(result: dict, output_format: str) -> None:
@@ -250,16 +251,12 @@ def _emit_multi(results: list[dict], output_format: str) -> None:
             "summary": {"file_count": len(results), "total": total},
         }
         print(json.dumps(envelope, indent=2))
-    elif output_format == "h1md":
-        findings: list[Finding] = []
-        for result in results:
-            findings.extend(_attribute_findings(result))
-        print(to_h1md(findings), end="")
-    elif output_format == "sarif":
-        findings = []
-        for result in results:
-            findings.extend(_attribute_findings(result))
-        print(to_sarif(findings))
+    elif output_format in ("h1md", "sarif"):
+        findings = [f for r in results for f in _attribute_findings(r)]
+        if output_format == "h1md":
+            print(to_h1md(findings), end="")
+        else:
+            print(to_sarif(findings))
     else:
         print(_render_multi_text(results))
 
