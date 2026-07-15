@@ -350,6 +350,29 @@ import re
 from ferryman.findings import Finding
 from ferryman.parsing import parse_statements
 
+# Generic compiled regex helpers used throughout this module.
+# Compiling at module level avoids re-compilation on every call.
+
+# Matches any run of one or more decimal digits -- used to enumerate digit
+# sub-runs inside an already-matched identifier so the numeric scanners never
+# re-report a slice of the same value.
+_DIGIT_RUN_RE = re.compile(r"\d+")
+
+# Matches a single decimal digit -- used in _redact_digits to mask digits.
+_DIGIT_RE = re.compile(r"\d")
+
+# Strips hyphens and whitespace from an SSN/ITIN candidate before validation.
+_SSN_STRIP_RE = re.compile(r"[-\s]")
+
+# Strips space and hyphen separators from a card candidate before Luhn.
+_CARD_STRIP_RE = re.compile(r"[ -]")
+
+# Strips dots and hyphens from a Brazilian CPF candidate.
+_CPF_STRIP_RE = re.compile(r"[.\-]")
+
+# Matches a long (10+) digit run inside a security-id field.
+_SECID_LONG_DIGITS_RE = re.compile(r"\b\d{10,}\b")
+
 # SSN: NNN-NN-NNNN, optionally with spaces. Word-bounded to avoid matching
 # inside longer digit runs.
 _SSN_RE = re.compile(r"\b\d{3}[-\s]\d{2}[-\s]\d{4}\b")
@@ -991,6 +1014,11 @@ _SE_PNR_LEN = 11
 # two-symbol set is a structural precision lever; any other character is never
 # a live personnummer.
 _SE_PNR_SEPARATORS = frozenset("-+")
+# Alternating weights applied left-to-right over the nine ``YYMMDDNNN`` digits
+# of a Swedish personnummer when computing the Luhn-style check digit. The
+# leftmost digit is weighted 2, then 1, then 2, ..., matching the classic Luhn
+# "double every other" rule applied in left-to-right order.
+_SE_PNR_CHECK_WEIGHTS = (2, 1, 2, 1, 2, 1, 2, 1, 2)
 
 # Swiss AHV (Alters- und Hinterlassenenversicherung) / AVS (assurance-vieillesse
 # et survivants) social-security number candidate -- the 13-digit national
@@ -1071,6 +1099,11 @@ _DK_CPR_LEN = 11
 # gives ~1/100 precision -- a coincidental 9-digit run rarely passes both.
 _NL_BSN_RE = re.compile(r"\b\d{9}\b")
 _NL_BSN_LEN = 9
+# Dutch BSN elfproef weights: positional coefficients applied to d1..d9 where
+# d9 carries a **negative** weight (the published BSN algorithm subtracts d9
+# rather than adding it). Using a module-level constant avoids rebuilding this
+# tuple on every validation call.
+_NL_BSN_WEIGHTS = (9, 8, 7, 6, 5, 4, 3, 2, -1)
 
 # German Steueridentifikationsnummer (IdNr) -- the 11-digit permanent tax
 # identification number issued to every German resident.  It is a contiguous
@@ -2186,9 +2219,8 @@ def _se_pnr_check_digit(nine: str) -> int:
     summing the decimal digits of the doubled value), and the check digit is
     ``(10 - (total mod 10)) mod 10``.
     """
-    weights = (2, 1, 2, 1, 2, 1, 2, 1, 2)
     total = 0
-    for d, w in zip(nine, weights):
+    for d, w in zip(nine, _SE_PNR_CHECK_WEIGHTS):
         product = int(d) * w
         if product >= 10:
             product = (product // 10) + (product % 10)
@@ -2472,8 +2504,7 @@ def _nl_bsn_valid(candidate: str) -> bool:
     if bsn[0] == "0":
         return False
     d = [int(c) for c in bsn]
-    weights = [9, 8, 7, 6, 5, 4, 3, 2, -1]
-    total = sum(w * v for w, v in zip(weights, d))
+    total = sum(w * v for w, v in zip(_NL_BSN_WEIGHTS, d))
     return total % 11 == 0
 
 
@@ -2555,11 +2586,9 @@ def _de_idnr_valid(candidate: str) -> bool:
     if idnr[0] == "0":
         return False
     # Digit-repetition gate: at least one digit in positions 2-10 must repeat.
+    # All 9 distinct <=> no repeats; fewer unique digits <=> at least one repeats.
     middle_digits = idnr[1:10]  # d2..d10 (0-indexed: positions 1..9)
-    digit_counts = {}
-    for ch in middle_digits:
-        digit_counts[ch] = digit_counts.get(ch, 0) + 1
-    if not any(v >= 2 for v in digit_counts.values()):
+    if len(set(middle_digits)) == 9:
         return False
     # ISO 7064 MOD 11,10 check digit.
     return _de_idnr_check_digit(idnr[:10]) == int(idnr[10])
@@ -2717,7 +2746,7 @@ def _itin_valid(candidate: str) -> bool:
     group fails one of them and is left to the SSN detector or dropped. Any
     malformed input returns ``False`` so the helper is safe to reuse.
     """
-    digits = re.sub(r"[-\s]", "", candidate.strip())
+    digits = _SSN_STRIP_RE.sub("", candidate.strip())
     if len(digits) != 9 or not digits.isdigit():
         return False
     area = int(digits[:3])
@@ -2736,7 +2765,20 @@ def _redact_ssn(text: str) -> str:
 
 
 def _redact_digits(text: str) -> str:
-    return re.sub(r"\d", "X", text)
+    return _DIGIT_RE.sub("X", text)
+
+
+def _reserve_digit_runs(seen: set[tuple[str, str]], text: str) -> None:
+    """Reserve every digit sub-run inside *text* under the three numeric scan
+    namespaces so the account-number, credit-card, and routing-number scanners
+    never re-report a slice of an already-claimed identifier as a separate
+    finding.  Called after a higher-priority detector claims an alphanumeric or
+    mixed token so the three digit-only scanners skip every embedded run.
+    """
+    for run in _DIGIT_RUN_RE.findall(text):
+        seen.add(("account_number", run))
+        seen.add(("credit_card", run))
+        seen.add(("routing_number", run))
 
 
 def _redact_iban(iban: str) -> str:
@@ -2829,10 +2871,7 @@ def _scan_text(
         # user id) that the account / card / routing scanners below would
         # otherwise re-report as a separate finding. Reserve every digit run in
         # the address so the same leak is counted once, as the email it is.
-        for run in re.findall(r"\d+", email):
-            seen.add(("account_number", run))
-            seen.add(("credit_card", run))
-            seen.add(("routing_number", run))
+        _reserve_digit_runs(seen, email)
         findings.append(
             Finding(
                 check="pii",
@@ -2863,10 +2902,7 @@ def _scan_text(
         # Reserve every digit run inside the IBAN under the account/card/routing
         # namespaces so the scanners below never re-report a slice of the same
         # leak as a separate finding.
-        for run in re.findall(r"\d+", compact):
-            seen.add(("account_number", run))
-            seen.add(("credit_card", run))
-            seen.add(("routing_number", run))
+        _reserve_digit_runs(seen, compact)
         findings.append(
             Finding(
                 check="pii",
@@ -2898,10 +2934,7 @@ def _scan_text(
         # Reserve any digit run inside the LEI under the account/card/routing
         # namespaces so the scanners below never re-report a slice of the same
         # identifier as a separate finding.
-        for run in re.findall(r"\d+", compact):
-            seen.add(("account_number", run))
-            seen.add(("credit_card", run))
-            seen.add(("routing_number", run))
+        _reserve_digit_runs(seen, compact)
         findings.append(
             Finding(
                 check="pii",
@@ -2936,10 +2969,7 @@ def _scan_text(
         # Reserve any digit run inside the BIC under the account/card/routing
         # namespaces so the scanners below never re-report a slice of the same
         # identifier (a BIC's location/branch code may contain digits).
-        for run in re.findall(r"\d+", compact):
-            seen.add(("account_number", run))
-            seen.add(("credit_card", run))
-            seen.add(("routing_number", run))
+        _reserve_digit_runs(seen, compact)
         findings.append(
             Finding(
                 check="pii",
@@ -2970,10 +3000,7 @@ def _scan_text(
         # Reserve any digit run inside the ISIN under the account/card/routing
         # namespaces so the scanners below never re-report a slice of the same
         # identifier as a separate finding.
-        for run in re.findall(r"\d+", compact):
-            seen.add(("account_number", run))
-            seen.add(("credit_card", run))
-            seen.add(("routing_number", run))
+        _reserve_digit_runs(seen, compact)
         findings.append(
             Finding(
                 check="pii",
@@ -3005,10 +3032,7 @@ def _scan_text(
         # Reserve any digit run inside the CUSIP under the account/card/routing
         # namespaces so the scanners below never re-report a slice of the same
         # identifier as a separate finding.
-        for run in re.findall(r"\d+", compact):
-            seen.add(("account_number", run))
-            seen.add(("credit_card", run))
-            seen.add(("routing_number", run))
+        _reserve_digit_runs(seen, compact)
         findings.append(
             Finding(
                 check="pii",
@@ -3041,10 +3065,7 @@ def _scan_text(
         # Reserve any digit run inside the SEDOL under the account/card/routing
         # namespaces so the scanners below never re-report a slice of the same
         # identifier as a separate finding.
-        for run in re.findall(r"\d+", compact):
-            seen.add(("account_number", run))
-            seen.add(("credit_card", run))
-            seen.add(("routing_number", run))
+        _reserve_digit_runs(seen, compact)
         findings.append(
             Finding(
                 check="pii",
@@ -3179,10 +3200,7 @@ def _scan_text(
         # Reserve any digit run inside the IFSC under the account/card/routing
         # namespaces so the scanners below never re-report a slice of the same
         # identifier (an IFSC branch code may contain digits).
-        for run in re.findall(r"\d+", compact):
-            seen.add(("account_number", run))
-            seen.add(("credit_card", run))
-            seen.add(("routing_number", run))
+        _reserve_digit_runs(seen, compact)
         findings.append(
             Finding(
                 check="pii",
@@ -3256,10 +3274,7 @@ def _scan_text(
         # Reserve any digit run inside the CURP under the account/card/routing
         # namespaces so the scanners below never re-report a slice of the same
         # identifier (the embedded birth date and the homoclave may be digits).
-        for run in re.findall(r"\d+", compact):
-            seen.add(("account_number", run))
-            seen.add(("credit_card", run))
-            seen.add(("routing_number", run))
+        _reserve_digit_runs(seen, compact)
         findings.append(
             Finding(
                 check="pii",
@@ -3422,7 +3437,7 @@ def _scan_text(
         if key in seen:
             continue
         seen.add(key)
-        compact = re.sub(r"[.\-]", "", candidate)
+        compact = _CPF_STRIP_RE.sub("", candidate)
         seen.add(("account_number", compact))
         seen.add(("routing_number", compact))
         findings.append(
@@ -3528,10 +3543,7 @@ def _scan_text(
         # the same identifier (the embedded date or the individual number may
         # be picked up as a short digit run -- defensive, matching how the
         # CURP and the IFSC scans reserve their embedded digits).
-        for run in re.findall(r"\d+", compact):
-            seen.add(("account_number", run))
-            seen.add(("credit_card", run))
-            seen.add(("routing_number", run))
+        _reserve_digit_runs(seen, compact)
         findings.append(
             Finding(
                 check="pii",
@@ -3584,10 +3596,7 @@ def _scan_text(
         # digits, even though the contiguous-digit floors (8+/9/13+) cannot
         # match the personnummer's short embedded date or four-digit tail on
         # their own).
-        for run in re.findall(r"\d+", candidate):
-            seen.add(("account_number", run))
-            seen.add(("credit_card", run))
-            seen.add(("routing_number", run))
+        _reserve_digit_runs(seen, candidate)
         findings.append(
             Finding(
                 check="pii",
@@ -3649,10 +3658,7 @@ def _scan_text(
         if key in seen:
             continue
         seen.add(key)
-        for run in re.findall(r"\d+", candidate):
-            seen.add(("account_number", run))
-            seen.add(("credit_card", run))
-            seen.add(("routing_number", run))
+        _reserve_digit_runs(seen, candidate)
         findings.append(
             Finding(
                 check="pii",
@@ -3706,10 +3712,7 @@ def _scan_text(
         seen.add(("account_number", compact))
         seen.add(("credit_card", compact))
         seen.add(("routing_number", compact))
-        for run in re.findall(r"\d+", candidate):
-            seen.add(("account_number", run))
-            seen.add(("credit_card", run))
-            seen.add(("routing_number", run))
+        _reserve_digit_runs(seen, candidate)
         findings.append(
             Finding(
                 check="pii",
@@ -3821,7 +3824,7 @@ def _scan_text(
     # fail Luhn are left untouched here and fall through to the account-number /
     # routing-number scanners below.
     for m in _CARD_RE.finditer(text):
-        compact = re.sub(r"[ -]", "", m.group(0))
+        compact = _CARD_STRIP_RE.sub("", m.group(0))
         if not (_CARD_MIN_LEN <= len(compact) <= _CARD_MAX_LEN):
             continue
         if not _luhn_valid(compact):
@@ -4017,7 +4020,7 @@ def _scan_secid(
             )
         )
 
-    for m in re.finditer(r"\b\d{10,}\b", secid):
+    for m in _SECID_LONG_DIGITS_RE.finditer(secid):
         key = ("account_number", m.group(0))
         if key in seen:
             continue
