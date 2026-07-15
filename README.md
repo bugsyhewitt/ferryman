@@ -1,5 +1,9 @@
 # ferryman
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/bugsyhewitt/bugsyhewitt.github.io/main/public/cards/ferryman.jpg" alt="ferryman" width="680">
+</p>
+
 A security-focused scanner for **OFX (Open Financial Exchange)** files, built
 for the bug-bounty fintech surface.
 
